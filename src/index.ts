@@ -4,7 +4,6 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { EditorBridge } from "./bridge.js";
 import { ProjectContext } from "./project.js";
-import { attach, attachSummary } from "./deployer.js";
 import { SERVER_INSTRUCTIONS } from "./instructions.js";
 import { isDirectiveResponse, type ToolDef, type ToolContext } from "./types.js";
 import { McpError } from "./errors.js";
@@ -137,10 +136,9 @@ async function main() {
       project.setProject(projectArg);
       console.error(`[ue-mcp] Project loaded: ${project.projectName} (engine ${project.engineAssociation ?? "unknown"})`);
 
-      // Non-destructive attach — never overwrites local bridge source.
-      // Source deployment is reserved for `ue-mcp init` / `ue-mcp update`.
-      const result = attach(project);
-      console.error(`[ue-mcp] ${attachSummary(result)}`);
+      // attach() was disabled: it writes PythonScriptPlugin / UE_MCP_Bridge
+      // into .uproject on every startup, producing churn in version control.
+      // Run `ue-mcp init` / `ue-mcp update` explicitly when bridge setup is needed.
     } catch (e) {
       console.error(`[ue-mcp] Failed to initialize project: ${e instanceof Error ? e.message : e}`);
     }
