@@ -16,6 +16,9 @@
 #include "PCGGraph.h"
 // PCGGraphInterface.h may not be directly includable in 5.7
 #include "PCGComponent.h"
+// W3: graph user parameters (FInstancedPropertyBag + helpers)
+#include "Helpers/PCGGraphParametersHelpers.h"
+#include "StructUtils/PropertyBag.h"
 #include "PCGNode.h"
 #include "PCGSettings.h"
 #include "PCGPin.h"
@@ -293,6 +296,10 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// #213: bulk JSON-driven graph authoring (mirrors material.import_graph).
 	Registry.RegisterHandler(TEXT("import_pcg_graph"), &ImportGraph);
 	Registry.RegisterHandler(TEXT("export_pcg_graph"), &ExportGraph);
+
+	// W3: PCG graph user parameters (FInstancedPropertyBag).
+	Registry.RegisterHandler(TEXT("set_pcg_graph_parameter"),  &SetGraphParameter);
+	Registry.RegisterHandler(TEXT("get_pcg_graph_parameters"), &GetGraphParameters);
 }
 
 TSharedPtr<FJsonValue> FPCGHandlers::ListPCGGraphs(const TSharedPtr<FJsonObject>& Params)
@@ -355,6 +362,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::CreatePCGGraph(const TSharedPtr<FJsonObject
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/PCG"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("PCGGraph")))
@@ -2057,5 +2065,246 @@ TSharedPtr<FJsonValue> FPCGHandlers::ExportGraph(const TSharedPtr<FJsonObject>& 
 	Result->SetArrayField(TEXT("connections"), ConnsArr);
 	Result->SetNumberField(TEXT("nodeCount"), NodesArr.Num());
 	Result->SetNumberField(TEXT("connectionCount"), ConnsArr.Num());
+	return MCPResult(Result);
+}
+
+
+// ─── W3: PCG graph user parameters ────────────────────────────────────────────
+//
+// FInstancedPropertyBag-backed user parameters exposed on UPCGGraph. The
+// canonical authoring path is:
+//   1. AddUserParameters({Desc}) creates the entry (engine source PCGGraph.h:630)
+//   2. UPCGGraphParametersHelpers::Set*Parameter writes the value
+//
+// The 5 primitive types we support map to EPropertyBagPropertyType as follows:
+//   double / int / bool / string / name  →  Double / Int32 / Bool / String / Name
+//
+// Notes
+// - Helpers do NOT MarkPackageDirty (Task 0 §3), so we mark explicitly.
+// - Silent overwrite of an existing parameter with a different declared type
+//   is rejected — callers must pick a fresh name or recreate manually.
+// - GetUserParametersStruct() returns a const FInstancedPropertyBag*; the
+//   PropertyDescs live one indirection deeper on UPropertyBag (Task 0 §2).
+
+namespace
+{
+	static bool PCGW3_BagTypeFromString(const FString& TypeStr, EPropertyBagPropertyType& OutType)
+	{
+		if (TypeStr == TEXT("double")) { OutType = EPropertyBagPropertyType::Double; return true; }
+		if (TypeStr == TEXT("int"))    { OutType = EPropertyBagPropertyType::Int32;  return true; }
+		if (TypeStr == TEXT("bool"))   { OutType = EPropertyBagPropertyType::Bool;   return true; }
+		if (TypeStr == TEXT("string")) { OutType = EPropertyBagPropertyType::String; return true; }
+		if (TypeStr == TEXT("name"))   { OutType = EPropertyBagPropertyType::Name;   return true; }
+		return false;
+	}
+
+	static FString PCGW3_StringFromBagType(EPropertyBagPropertyType Type)
+	{
+		switch (Type)
+		{
+		case EPropertyBagPropertyType::Double: return TEXT("double");
+		case EPropertyBagPropertyType::Int32:  return TEXT("int");
+		case EPropertyBagPropertyType::Bool:   return TEXT("bool");
+		case EPropertyBagPropertyType::String: return TEXT("string");
+		case EPropertyBagPropertyType::Name:   return TEXT("name");
+		default:                               return TEXT("unsupported");
+		}
+	}
+}
+
+TSharedPtr<FJsonValue> FPCGHandlers::SetGraphParameter(const TSharedPtr<FJsonObject>& Params)
+{
+	MCP_CHECK_GAME_THREAD();
+
+	FString AssetPath, ParamNameStr, TypeStr;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+	if (auto Err = RequireString(Params, TEXT("name"), ParamNameStr)) return Err;
+	if (auto Err = RequireString(Params, TEXT("type"), TypeStr)) return Err;
+
+	const TSharedPtr<FJsonValue> ValueField = Params->TryGetField(TEXT("value"));
+	if (!ValueField.IsValid())
+	{
+		return MCPError(TEXT("Missing required parameter: value"));
+	}
+
+	UPCGGraph* Graph = LoadObject<UPCGGraph>(nullptr, *AssetPath);
+	if (!Graph)
+	{
+		return MCPError(FString::Printf(TEXT("PCGGraph not found: %s"), *AssetPath));
+	}
+
+	EPropertyBagPropertyType BagType = EPropertyBagPropertyType::None;
+	if (!PCGW3_BagTypeFromString(TypeStr, BagType))
+	{
+		return MCPError(FString::Printf(
+			TEXT("Unknown type '%s'. Expected one of: double, int, bool, string, name."),
+			*TypeStr));
+	}
+
+	// Validate that the JSON value's runtime type matches the declared type. Without
+	// this guard, e.g. AsNumber() on a JSON string silently returns 0.0 and the
+	// caller's bug becomes a silent data corruption inside the asset.
+	const EJson JsonType = ValueField->Type;
+	bool bTypeMatch = false;
+	switch (BagType)
+	{
+	case EPropertyBagPropertyType::Double:
+	case EPropertyBagPropertyType::Int32:
+		bTypeMatch = (JsonType == EJson::Number);
+		break;
+	case EPropertyBagPropertyType::Bool:
+		bTypeMatch = (JsonType == EJson::Boolean);
+		break;
+	case EPropertyBagPropertyType::String:
+	case EPropertyBagPropertyType::Name:
+		bTypeMatch = (JsonType == EJson::String);
+		break;
+	default:
+		break;
+	}
+	if (!bTypeMatch)
+	{
+		return MCPError(FString::Printf(
+			TEXT("Value JSON type does not match declared type '%s' for parameter '%s'."),
+			*TypeStr, *ParamNameStr));
+	}
+
+	// Detect existing entry + reject silent type mutation. We never reassign an
+	// existing user parameter to a different declared type — the engine's
+	// AddUserParameters({Desc}) is destructive in that case and callers should
+	// explicitly recreate via a separate workflow.
+	const FName ParamName(*ParamNameStr);
+	const FInstancedPropertyBag* Bag = Graph->GetUserParametersStruct();
+	const FPropertyBagPropertyDesc* ExistingDesc = Bag ? Bag->FindPropertyDescByName(ParamName) : nullptr;
+	const bool bExisted = (ExistingDesc != nullptr);
+
+	if (bExisted && ExistingDesc->ValueType != BagType)
+	{
+		const FString ExistingTypeStr = PCGW3_StringFromBagType(ExistingDesc->ValueType);
+		return MCPError(FString::Printf(
+			TEXT("Parameter '%s' already exists with type '%s' and cannot be reassigned as type '%s'. ")
+			TEXT("Use a different name or recreate the graph parameter manually."),
+			*ParamNameStr, *ExistingTypeStr, *TypeStr));
+	}
+
+	Graph->Modify();
+
+	// Create if absent. Helpers do not auto-create on Set*; PCGGraph.h:630 is the
+	// canonical entry point.
+	if (!bExisted)
+	{
+		const FPropertyBagPropertyDesc NewDesc(ParamName, BagType);
+		const EPropertyBagAlterationResult AddResult = Graph->AddUserParameters({NewDesc});
+		if (AddResult != EPropertyBagAlterationResult::Success)
+		{
+			return MCPError(FString::Printf(
+				TEXT("AddUserParameters failed for '%s' (EPropertyBagAlterationResult=%d)"),
+				*ParamNameStr, static_cast<int32>(AddResult)));
+		}
+	}
+
+	// Write the value via the engine's Set* helpers.
+	switch (BagType)
+	{
+	case EPropertyBagPropertyType::Double:
+		UPCGGraphParametersHelpers::SetDoubleParameter(Graph, ParamName, ValueField->AsNumber());
+		break;
+	case EPropertyBagPropertyType::Int32:
+		UPCGGraphParametersHelpers::SetInt32Parameter(Graph, ParamName, static_cast<int32>(ValueField->AsNumber()));
+		break;
+	case EPropertyBagPropertyType::Bool:
+		UPCGGraphParametersHelpers::SetBoolParameter(Graph, ParamName, ValueField->AsBool());
+		break;
+	case EPropertyBagPropertyType::String:
+		UPCGGraphParametersHelpers::SetStringParameter(Graph, ParamName, ValueField->AsString());
+		break;
+	case EPropertyBagPropertyType::Name:
+		UPCGGraphParametersHelpers::SetNameParameter(Graph, ParamName, FName(*ValueField->AsString()));
+		break;
+	default:
+		break;
+	}
+
+	// Task 0 §3: the Helpers' Set* path does NOT mark the package dirty, so we do
+	// it ourselves to ensure the change survives the next save and the editor
+	// "asset modified" badge actually appears.
+	if (UPackage* Pkg = Graph->GetOutermost()) { Pkg->MarkPackageDirty(); }
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetStringField(TEXT("name"), ParamNameStr);
+	Result->SetStringField(TEXT("type"), TypeStr);
+	Result->SetField(TEXT("value"), ValueField);
+	if (bExisted) { MCPSetUpdated(Result); } else { MCPSetCreated(Result); }
+	return MCPResult(Result);
+}
+
+TSharedPtr<FJsonValue> FPCGHandlers::GetGraphParameters(const TSharedPtr<FJsonObject>& Params)
+{
+	MCP_CHECK_GAME_THREAD();
+
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	UPCGGraph* Graph = LoadObject<UPCGGraph>(nullptr, *AssetPath);
+	if (!Graph)
+	{
+		return MCPError(FString::Printf(TEXT("PCGGraph not found: %s"), *AssetPath));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ParamsArr;
+	const FInstancedPropertyBag* Bag = Graph->GetUserParametersStruct();
+	if (Bag)
+	{
+		// Task 0 §2: FInstancedPropertyBag has no GetPropertyDescs(); the desc
+		// list lives on UPropertyBag (the inner UScriptStruct).
+		const UPropertyBag* BagStruct = Bag->GetPropertyBagStruct();
+		if (BagStruct)
+		{
+			for (const FPropertyBagPropertyDesc& Desc : BagStruct->GetPropertyDescs())
+			{
+				TSharedPtr<FJsonObject> P = MakeShared<FJsonObject>();
+				P->SetStringField(TEXT("name"), Desc.Name.ToString());
+
+				const FString TypeStr = PCGW3_StringFromBagType(Desc.ValueType);
+				P->SetStringField(TEXT("type"), TypeStr);
+
+				switch (Desc.ValueType)
+				{
+				case EPropertyBagPropertyType::Double:
+					P->SetNumberField(TEXT("value"),
+						UPCGGraphParametersHelpers::GetDoubleParameter(Graph, Desc.Name));
+					break;
+				case EPropertyBagPropertyType::Int32:
+					P->SetNumberField(TEXT("value"),
+						UPCGGraphParametersHelpers::GetInt32Parameter(Graph, Desc.Name));
+					break;
+				case EPropertyBagPropertyType::Bool:
+					P->SetBoolField(TEXT("value"),
+						UPCGGraphParametersHelpers::GetBoolParameter(Graph, Desc.Name));
+					break;
+				case EPropertyBagPropertyType::String:
+					P->SetStringField(TEXT("value"),
+						UPCGGraphParametersHelpers::GetStringParameter(Graph, Desc.Name));
+					break;
+				case EPropertyBagPropertyType::Name:
+					P->SetStringField(TEXT("value"),
+						UPCGGraphParametersHelpers::GetNameParameter(Graph, Desc.Name).ToString());
+					break;
+				default:
+					// Leave 'value' unset for unsupported types so callers can
+					// detect them without having to translate a sentinel.
+					break;
+				}
+
+				ParamsArr.Add(MakeShared<FJsonValueObject>(P));
+			}
+		}
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetNumberField(TEXT("count"), ParamsArr.Num());
+	Result->SetArrayField(TEXT("parameters"), ParamsArr);
 	return MCPResult(Result);
 }
