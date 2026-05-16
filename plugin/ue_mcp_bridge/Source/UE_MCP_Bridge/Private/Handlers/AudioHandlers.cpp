@@ -70,6 +70,7 @@ TSharedPtr<FJsonValue> FAudioHandlers::CreateSoundCue(const TSharedPtr<FJsonObje
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Audio/SoundCues"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	const FString ProbePath = PackagePath + TEXT("/") + Name + TEXT(".") + Name;
@@ -116,6 +117,7 @@ TSharedPtr<FJsonValue> FAudioHandlers::CreateMetaSoundSource(const TSharedPtr<FJ
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Audio/MetaSounds"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	UClass* MetaSoundSourceClass = FindObject<UClass>(nullptr, TEXT("/Script/MetasoundEngine.MetaSoundSource"));

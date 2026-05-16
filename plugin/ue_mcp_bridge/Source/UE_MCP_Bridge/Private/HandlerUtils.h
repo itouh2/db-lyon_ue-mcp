@@ -70,6 +70,33 @@ inline void MCPSetUpdated(TSharedPtr<FJsonObject> Result)
 	Result->SetBoolField(TEXT("updated"), true);
 }
 
+/** Normalize a /Game/... package path:
+ *   - strip ALL trailing '/'  ("/Game/PCG//" → "/Game/PCG")
+ *   - reject empty (after trim) with MCPError
+ *   - reject internal "//" with MCPError (silent collapse は caller 意図を上書きするリスク)
+ *  Idempotent on already-normalized input.
+ *  Returns: empty TSharedPtr<FJsonValue> on success (PackagePath normalized in-place),
+ *  or fully-formed MCPError JSON value on rejection (caller must return it). */
+inline TSharedPtr<FJsonValue> MCPNormalizePackagePath(FString& PackagePath)
+{
+	while (PackagePath.EndsWith(TEXT("/")))
+	{
+		PackagePath.LeftChopInline(1, EAllowShrinking::No);
+	}
+	if (PackagePath.IsEmpty())
+	{
+		return MCPError(TEXT("Invalid packagePath: empty (after trim)."));
+	}
+	if (PackagePath.Contains(TEXT("//")))
+	{
+		return MCPError(FString::Printf(
+			TEXT("Invalid packagePath '%s': contains internal '//'. ")
+			TEXT("Use single '/' between segments."),
+			*PackagePath));
+	}
+	return TSharedPtr<FJsonValue>();
+}
+
 /** Check for an existing asset at `PackagePath/Name`. Returns a fully-formed
  *  "already existed" result on hit (caller can return it directly), or an
  *  unset pointer on miss so the caller proceeds to create. Also honors an

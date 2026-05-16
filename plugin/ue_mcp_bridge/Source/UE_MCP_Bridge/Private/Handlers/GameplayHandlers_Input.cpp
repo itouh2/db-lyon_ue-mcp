@@ -47,6 +47,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::CreateInputAction(const TSharedPtr<FJs
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Input"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("InputAction")))
@@ -125,6 +126,7 @@ TSharedPtr<FJsonValue> FGameplayHandlers::CreateInputMappingContext(const TShare
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Input"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("InputMappingContext")))

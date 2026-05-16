@@ -141,6 +141,7 @@ TSharedPtr<FJsonValue> FWidgetHandlers::CreateWidgetBlueprint(const TSharedPtr<F
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/UI/Widgets"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 	FString ParentClassName = OptionalString(Params, TEXT("parentClass"), TEXT("UserWidget"));
 
@@ -262,6 +263,7 @@ TSharedPtr<FJsonValue> FWidgetHandlers::CreateEditorUtilityWidget(const TSharedP
 	{
 		return MCPError(TEXT("Invalid path format. Expected '/Game/.../AssetName'"));
 	}
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 	if (auto Existing = MCPCheckAssetExists(PackagePath, AssetName, OnConflict, TEXT("EditorUtilityWidgetBlueprint")))
@@ -311,6 +313,7 @@ TSharedPtr<FJsonValue> FWidgetHandlers::CreateEditorUtilityBlueprint(const TShar
 	{
 		return MCPError(TEXT("Invalid path format. Expected '/Game/.../AssetName'"));
 	}
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 	if (auto Existing = MCPCheckAssetExists(PackagePath, AssetName, OnConflict, TEXT("EditorUtilityBlueprint")))

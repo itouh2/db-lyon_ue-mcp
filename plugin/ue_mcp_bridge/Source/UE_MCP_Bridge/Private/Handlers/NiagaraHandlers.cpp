@@ -141,6 +141,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraSystem(const TSharedPtr<FJ
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/VFX"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	const FString ProbePath = PackagePath + TEXT("/") + Name + TEXT(".") + Name;
@@ -251,6 +252,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraEmitter(const TSharedPtr<F
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/VFX"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("NiagaraEmitter")))
@@ -516,6 +518,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraSystemFromEmitter(const TS
 	if (auto Err = RequireString(Params, TEXT("emitterPath"), EmitterPath)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/VFX"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, SystemName, OnConflict, TEXT("NiagaraSystem")))
@@ -1070,6 +1073,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraSystemFromSpec(const TShar
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/VFX"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 
 	const TArray<TSharedPtr<FJsonValue>>* EmittersArr = nullptr;
 	Params->TryGetArrayField(TEXT("emitters"), EmittersArr);
@@ -1542,6 +1546,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateModuleFromHlsl(const TSharedPtr<F
 	FString Hlsl;
 	if (auto Err = RequireString(Params, TEXT("hlsl"), Hlsl)) return Err;
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/VFX/Modules"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 
 	if (auto Hit = MCPCheckAssetExists(PackagePath, Name, OptionalString(Params, TEXT("onConflict"), TEXT("skip")), TEXT("NiagaraScript")))
 	{
@@ -1608,6 +1613,7 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateScratchModule(const TSharedPtr<FJ
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/VFX"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 
 	if (auto Hit = MCPCheckAssetExists(PackagePath, Name, OptionalString(Params, TEXT("onConflict"), TEXT("skip")), TEXT("NiagaraScript")))
 	{

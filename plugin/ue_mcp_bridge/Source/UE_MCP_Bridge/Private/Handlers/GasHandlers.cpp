@@ -46,7 +46,8 @@ TSharedPtr<FJsonValue> FGasHandlers::CreateGasBlueprint(
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
-	const FString PackagePath = OptionalString(Params, TEXT("packagePath"), DefaultPackagePath);
+	FString PackagePath = OptionalString(Params, TEXT("packagePath"), DefaultPackagePath);
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, FriendlyType))

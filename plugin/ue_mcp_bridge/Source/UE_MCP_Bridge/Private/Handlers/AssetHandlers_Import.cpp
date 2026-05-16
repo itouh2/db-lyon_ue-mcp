@@ -144,6 +144,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportStaticMesh(const TSharedPtr<FJsonOb
 		FString PkgPath = OptionalString(Params, TEXT("packagePath"));
 		if (!PkgPath.IsEmpty()) DestinationPath = PkgPath;
 	}
+	if (auto Err = MCPNormalizePackagePath(DestinationPath)) return Err;
 
 	if (!FPaths::FileExists(FileName))
 	{
@@ -258,6 +259,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportSkeletalMesh(const TSharedPtr<FJson
 		FString PkgPath = OptionalString(Params, TEXT("packagePath"));
 		if (!PkgPath.IsEmpty()) DestinationPath = PkgPath;
 	}
+	if (auto Err = MCPNormalizePackagePath(DestinationPath)) return Err;
 
 	if (!FPaths::FileExists(FileName))
 	{
@@ -381,6 +383,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportAnimation(const TSharedPtr<FJsonObj
 		FString PkgPath = OptionalString(Params, TEXT("packagePath"));
 		if (!PkgPath.IsEmpty()) DestinationPath = PkgPath;
 	}
+	if (auto Err = MCPNormalizePackagePath(DestinationPath)) return Err;
 
 	if (!FPaths::FileExists(FileName))
 	{
@@ -730,6 +733,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ImportTexture(const TSharedPtr<FJsonObjec
 		FString PkgPath = OptionalString(Params, TEXT("packagePath"));
 		if (!PkgPath.IsEmpty()) DestinationPath = PkgPath;
 	}
+	if (auto Err = MCPNormalizePackagePath(DestinationPath)) return Err;
 
 	if (!FPaths::FileExists(FileName))
 	{
@@ -825,6 +829,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataTable(const TSharedPtr<FJsonObj
 	if (auto Err = RequireString(Params, TEXT("rowStruct"), RowStruct)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/DataTables"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	// Idempotency: check if the DataTable already exists at the target path.

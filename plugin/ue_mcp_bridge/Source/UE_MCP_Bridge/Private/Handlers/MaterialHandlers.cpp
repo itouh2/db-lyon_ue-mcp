@@ -261,6 +261,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterial(const TSharedPtr<FJsonO
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Materials"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	UE_LOG(LogMCPBridge, Log, TEXT("[UE-MCP] CreateMaterial: name=%s packagePath=%s"), *Name, *PackagePath);
@@ -1155,6 +1156,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterialInstance(const TSharedPt
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Materials"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("MaterialInstance")))
@@ -2787,7 +2789,8 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterialSimple(const TSharedPtr<
 {
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
-	const FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Materials"));
+	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Materials"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 
 	const FString FullPath = PackagePath + TEXT("/") + Name;
 	if (UEditorAssetLibrary::DoesAssetExist(FullPath))

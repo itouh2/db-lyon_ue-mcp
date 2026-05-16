@@ -588,6 +588,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateAnimBlueprint(const TSharedPtr<
 	if (auto Err = RequireString(Params, TEXT("skeletonPath"), SkeletonPath)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Animations"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	FString ParentClassName = OptionalString(Params, TEXT("parentClass"));
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
@@ -648,6 +649,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateMontage(const TSharedPtr<FJsonO
 	if (auto Err = RequireString(Params, TEXT("animSequencePath"), AnimSequencePath)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Animations"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("AnimMontage")))
@@ -868,6 +870,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateBlendspace(const TSharedPtr<FJs
 	if (auto Err = RequireString(Params, TEXT("skeletonPath"), SkeletonPath)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Animations"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	FString AxisHorizontal = OptionalString(Params, TEXT("axisHorizontal"), TEXT("Speed"));
 	FString AxisVertical = OptionalString(Params, TEXT("axisVertical"), TEXT("Direction"));
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
@@ -1096,6 +1099,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateSequence(const TSharedPtr<FJson
 	if (auto Err = RequireString(Params, TEXT("skeletonPath"), SkeletonPath)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Animations"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	double FrameRate = OptionalNumber(Params, TEXT("frameRate"), 30.0);
 	double NumFrames = OptionalNumber(Params, TEXT("numFrames"), 30.0);
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
@@ -2032,6 +2036,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateAnimComposite(const TSharedPtr<
 	FString SkeletonPath;
 	if (auto Err = RequireString(Params, TEXT("skeletonPath"), SkeletonPath)) return Err;
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Animations"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 
 	if (auto Hit = MCPCheckAssetExists(PackagePath, Name, OptionalString(Params, TEXT("onConflict"), TEXT("skip")), TEXT("AnimComposite")))
 	{

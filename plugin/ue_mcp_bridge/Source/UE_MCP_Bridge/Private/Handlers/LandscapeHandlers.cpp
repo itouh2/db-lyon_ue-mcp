@@ -730,6 +730,7 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::AddLandscapeLayerInfo(const TSharedPt
 
 	// Create a new ULandscapeLayerInfoObject asset
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Landscape/LayerInfos"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 
 	FString AssetName = FString::Printf(TEXT("LI_%s"), *LayerName);
 	FString PackageFullPath = PackagePath / AssetName;
@@ -947,7 +948,8 @@ TSharedPtr<FJsonValue> FLandscapeHandlers::CreateLandscapeLayerInfo(const TShare
 	if (auto Err = RequireString(Params, TEXT("layerName"), LayerName)) return Err;
 
 	const FString Name = OptionalString(Params, TEXT("name"), FString::Printf(TEXT("LI_%s"), *LayerName));
-	const FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Landscape/LayerInfos"));
+	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Landscape/LayerInfos"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	TSharedPtr<FJsonValue> Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("LandscapeLayerInfoObject"));

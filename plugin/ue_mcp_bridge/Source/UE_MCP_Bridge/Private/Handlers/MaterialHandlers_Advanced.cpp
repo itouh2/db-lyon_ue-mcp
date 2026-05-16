@@ -57,6 +57,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterialFromTexture(const TShare
 	}
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Materials"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, MaterialName, OnConflict, TEXT("Material")))

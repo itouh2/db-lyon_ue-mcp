@@ -466,7 +466,8 @@ TSharedPtr<FJsonValue> FReflectionHandlers::CreateEnum(const TSharedPtr<FJsonObj
 {
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
-	const FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game"));
+	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Hit = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("UserDefinedEnum"))) return Hit;

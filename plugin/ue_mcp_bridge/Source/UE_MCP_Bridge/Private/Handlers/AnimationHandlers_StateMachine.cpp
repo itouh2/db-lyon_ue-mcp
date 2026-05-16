@@ -733,6 +733,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateIKRig(const TSharedPtr<FJsonObj
 	if (auto Err = RequireString(Params, TEXT("skeletalMeshPath"), SkeletalMeshPath)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Hit = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("IKRigDefinition")))
@@ -924,6 +925,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateIKRetargeter(const TSharedPtr<F
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	FString SourceRigPath = OptionalString(Params, TEXT("sourceRig"));
 	FString TargetRigPath = OptionalString(Params, TEXT("targetRig"));
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
@@ -1087,7 +1089,8 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreatePoseSearchDatabase(const TShare
 {
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
-	const FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/MotionMatching"));
+	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/MotionMatching"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString SchemaPath = OptionalString(Params, TEXT("schemaPath"), TEXT(""));
 
 	if (auto Hit = MCPCheckAssetExists(PackagePath, Name, OptionalString(Params, TEXT("onConflict"), TEXT("skip")), TEXT("PoseSearchDatabase")))

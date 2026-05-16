@@ -35,4 +35,8 @@ private:
 	// issue #213 — bulk graph authoring via JSON spec.
 	static TSharedPtr<FJsonValue> ImportGraph(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ExportGraph(const TSharedPtr<FJsonObject>& Params);
+
+	// W3 — PCG graph user parameters (FInstancedPropertyBag).
+	static TSharedPtr<FJsonValue> SetGraphParameter(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GetGraphParameters(const TSharedPtr<FJsonObject>& Params);
 };

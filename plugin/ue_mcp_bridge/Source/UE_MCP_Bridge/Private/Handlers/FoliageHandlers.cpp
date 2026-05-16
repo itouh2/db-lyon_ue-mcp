@@ -463,6 +463,7 @@ TSharedPtr<FJsonValue> FFoliageHandlers::CreateFoliageLayer(const TSharedPtr<FJs
 	if (auto Err = RequireString(Params, TEXT("name"), AssetName)) return Err;
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Foliage"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	FString MeshPath = OptionalString(Params, TEXT("meshPath"));
 	FString AssetType = OptionalString(Params, TEXT("assetType"), TEXT("FoliageType"));
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
@@ -729,6 +730,7 @@ TSharedPtr<FJsonValue> FFoliageHandlers::CreateFoliageType(const TSharedPtr<FJso
 	}
 
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Foliage"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	if (auto Existing = MCPCheckAssetExists(PackagePath, AssetName, OnConflict, TEXT("FoliageType")))

@@ -1565,6 +1565,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataAsset(const TSharedPtr<FJsonObj
 	FString Name;
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game"));
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	FString ClassName;
 	if (auto Err = RequireStringAlt(Params, TEXT("className"), TEXT("class"), ClassName)) return Err;
 
@@ -2563,6 +2564,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::DiagnoseRegistry(const TSharedPtr<FJsonOb
 {
 	FString Path;
 	if (auto Err = RequireString(Params, TEXT("path"), Path)) return Err;
+	if (auto Err = MCPNormalizePackagePath(Path)) return Err;
 
 	const bool bReconcile = OptionalBool(Params, TEXT("reconcile"), false);
 	const bool bRecursive = OptionalBool(Params, TEXT("recursive"), true);
@@ -3328,6 +3330,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateInterchangePipeline(const TSharedPt
 		Name = AssetName;
 		PackagePath = FPaths::GetPath(Package);
 	}
+	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString MeshType = OptionalString(Params, TEXT("meshType"), TEXT("skeletal")).ToLower();
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
