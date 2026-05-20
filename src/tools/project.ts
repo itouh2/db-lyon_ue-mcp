@@ -1,123 +1,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
-import { categoryTool, bp, type ToolDef, type ToolContext } from "../types.js";
+import { categoryTool, bp, type ToolDef } from "../types.js";
 import { deploy, deploySummary, findEngineInstall } from "../deployer.js";
-
-function resolveConfigPath(configDir: string, configName: string): string {
-  if (path.isAbsolute(configName)) return configName;
-  if (!configName.endsWith(".ini")) configName += ".ini";
-  if (!configName.startsWith("Default")) {
-    const defaultPath = path.join(configDir, `Default${configName}`);
-    if (fs.existsSync(defaultPath)) return defaultPath;
-  }
-  return path.join(configDir, configName);
-}
-
-function findIniFiles(dir: string): string[] {
-  const results: string[] = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) results.push(...findIniFiles(full));
-    else if (entry.name.endsWith(".ini")) results.push(full);
-  }
-  return results;
-}
-
-function parseIni(content: string): Record<string, Record<string, string>> {
-  const sections: Record<string, Record<string, string>> = {};
-  let current = "Global";
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith(";") || trimmed.startsWith("#")) continue;
-    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-      current = trimmed.slice(1, -1);
-      if (!sections[current]) sections[current] = {};
-      continue;
-    }
-    if (!sections[current]) sections[current] = {};
-    const eq = trimmed.indexOf("=");
-    if (eq > 0) {
-      const key = trimmed.slice(0, eq).replace(/^[+\-.]/, "");
-      sections[current][key] = trimmed.slice(eq + 1);
-    }
-  }
-  return sections;
-}
-
-function buildTagTree(tags: string[]): Record<string, unknown> {
-  const tree: Record<string, unknown> = {};
-  for (const tag of tags) {
-    let current = tree;
-    for (const part of tag.split(".")) {
-      if (!current[part]) current[part] = {};
-      current = current[part] as Record<string, unknown>;
-    }
-  }
-  return tree;
-}
-
-const UCLASS_RE = /UCLASS\(([^)]*)\)\s*class\s+(?:\w+_API\s+)?(\w+)\s*(?::\s*public\s+([\w:,\s]+))?\s*\{/g;
-const USTRUCT_RE = /USTRUCT\(([^)]*)\)\s*struct\s+(?:\w+_API\s+)?(\w+)\s*(?::\s*public\s+(\w+))?\s*\{/g;
-const UENUM_RE = /UENUM\(([^)]*)\)\s*enum\s+(?:class\s+)?(\w+)/g;
-const UPROPERTY_RE = /UPROPERTY\(([^)]*)\)\s*(?:(?:TArray|TMap|TSet|TSubclassOf|TSoftObjectPtr|TObjectPtr|TWeakObjectPtr)<[^>]+>|[\w:*&]+)\s+(\w+)/g;
-const UFUNCTION_RE = /UFUNCTION\(([^)]*)\)\s*(?:virtual\s+)?(?:static\s+)?([\w:*&<>]+)\s+(\w+)\s*\(/g;
-const ENUM_VALUE_RE = /(\w+)\s*(?:=\s*[^,]+)?\s*(?:UMETA\(([^)]*)\))?\s*,?/g;
-
-function parseHeader(content: string, filePath: string) {
-  const classes: unknown[] = [], structs: unknown[] = [], enums: unknown[] = [];
-  for (const m of content.matchAll(UCLASS_RE)) classes.push({ name: m[2], specifiers: m[1].trim(), parent: m[3]?.trim() ?? null });
-  for (const m of content.matchAll(USTRUCT_RE)) structs.push({ name: m[2], specifiers: m[1].trim(), parent: m[3]?.trim() ?? null });
-  for (const m of content.matchAll(UENUM_RE)) {
-    const enumName = m[2]; const afterEnum = content.slice(m.index! + m[0].length);
-    const braceStart = afterEnum.indexOf("{"); const braceEnd = afterEnum.indexOf("}");
-    const values: Array<{ name: string; meta?: string }> = [];
-    if (braceStart >= 0 && braceEnd > braceStart) {
-      for (const vm of afterEnum.slice(braceStart + 1, braceEnd).matchAll(ENUM_VALUE_RE))
-        if (vm[1] && !vm[1].startsWith("//")) values.push({ name: vm[1], meta: vm[2]?.trim() || undefined });
-    }
-    enums.push({ name: enumName, specifiers: m[1].trim(), values });
-  }
-  const properties: unknown[] = [], functions: unknown[] = [];
-  for (const m of content.matchAll(UPROPERTY_RE)) properties.push({ name: m[2], specifiers: m[1].trim() });
-  for (const m of content.matchAll(UFUNCTION_RE)) functions.push({ name: m[3], returnType: m[2], specifiers: m[1].trim() });
-  return { path: filePath, classes, structs, enums, properties, functions };
-}
-
-function collectFiles(dir: string, headers: string[], sources: string[]): void {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) collectFiles(full, headers, sources);
-    else if (entry.name.endsWith(".h")) headers.push(full);
-    else if (entry.name.endsWith(".cpp")) sources.push(full);
-  }
-}
-
-/**
- * Returns every Source/ directory under projectDir that holds at least one
- * <Module>.Build.cs file. Handles both the standard <ProjectDir>/Source/
- * layout and the nested <ProjectDir>/<ProjectName>/Source/ layout (#257).
- */
-function findSourceRoots(projectDir: string, projectName: string | null): string[] {
-  const roots: string[] = [];
-  const candidates = [
-    path.join(projectDir, "Source"),
-    projectName ? path.join(projectDir, projectName, "Source") : null,
-  ].filter((c): c is string => c !== null);
-  for (const c of candidates) {
-    if (fs.existsSync(c) && fs.statSync(c).isDirectory()) roots.push(c);
-  }
-  return roots;
-}
-
-/** Find the source root that owns a given moduleName (a subdir holding <module>.Build.cs). */
-function resolveModuleDir(projectDir: string, projectName: string | null, moduleName: string): string | null {
-  for (const root of findSourceRoots(projectDir, projectName)) {
-    const modDir = path.join(root, moduleName);
-    if (fs.existsSync(path.join(modDir, `${moduleName}.Build.cs`))) return modDir;
-  }
-  return null;
-}
+import { resolveConfigPath, findIniFiles, parseIni, buildTagTree } from "../config-parser.js";
+import { parseHeader, collectFiles, findSourceRoots, resolveModuleDir } from "../cpp-parser.js";
 
 export const projectTool: ToolDef = categoryTool(
   "project",
@@ -559,6 +446,95 @@ export const projectTool: ToolDef = categoryTool(
         };
       },
     },
+
+    add_cpp_member: {
+      // #423: append a UPROPERTY / UFUNCTION declaration to an existing UCLASS
+      // header in the right access-specifier block. The recurring trap is that
+      // raw appending lands the declaration in whatever access section the
+      // class happened to end in (often private:), which makes UHT reject
+      // BlueprintReadWrite ("should not be used on private members"). This
+      // handler inserts the requested access specifier before the declaration
+      // and restores the previous one after, so the caller doesn't need to
+      // know what section was active at the end of the class body.
+      description:
+        "Append a UPROPERTY/UFUNCTION declaration to an existing UCLASS header inside the access specifier you choose. Idempotent: if a declaration containing the same memberName is already present, returns existed:true. Params: headerPath (relative to Source/ or absolute), declaration (full multi-line UPROPERTY(...) / UFUNCTION(...) block plus its single-line member or function signature), memberName (the identifier the declaration introduces - used for idempotency), access? ('public'|'protected'|'private', default 'public').",
+      handler: async (ctx, p) => {
+        ctx.project.ensureLoaded();
+        const headerPath = p.headerPath as string;
+        const declaration = p.declaration as string;
+        const memberName = p.memberName as string;
+        const access = (((p.access as string) || "public").toLowerCase()) as "public" | "protected" | "private";
+        if (!headerPath) throw new Error("Missing 'headerPath'");
+        if (!declaration) throw new Error("Missing 'declaration'");
+        if (!memberName) throw new Error("Missing 'memberName'");
+        if (access !== "public" && access !== "protected" && access !== "private") {
+          throw new Error("'access' must be 'public' | 'protected' | 'private'");
+        }
+        const sourceDir = path.join(ctx.project.projectDir!, "Source");
+        const resolved = path.isAbsolute(headerPath) ? path.resolve(headerPath) : path.resolve(sourceDir, headerPath);
+        const sourceAbs = path.resolve(sourceDir);
+        if (!resolved.startsWith(sourceAbs + path.sep) && resolved !== sourceAbs) {
+          throw new Error(`Refusing to write outside project Source/: ${resolved}`);
+        }
+        if (!/\.h$/i.test(resolved)) {
+          throw new Error(`add_cpp_member only accepts .h files (got '${path.extname(resolved)}')`);
+        }
+        if (!fs.existsSync(resolved)) throw new Error(`Header not found: ${resolved}`);
+
+        const original = fs.readFileSync(resolved, "utf-8");
+
+        // Idempotency: does a declaration with this memberName already exist?
+        // Match identifier as a whole word - tolerant of pointer/ref/const sigils.
+        const wordRe = new RegExp(`\\b${memberName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+        if (wordRe.test(original)) {
+          return { status: "existed", path: resolved, memberName };
+        }
+
+        // Find the class's terminating "};" - last occurrence in the file is
+        // the conservative choice; UCLASS headers rarely have nested types.
+        const closeIdx = original.lastIndexOf("};");
+        if (closeIdx < 0) {
+          throw new Error(`Could not find class closing '};' in ${resolved}`);
+        }
+
+        // Walk backward from closeIdx to find the most recent access specifier.
+        // Default to "private" if none found (C++ class default).
+        const before = original.slice(0, closeIdx);
+        const accessRe = /(^|\n)\s*(public|protected|private)\s*:\s*(\/\/[^\n]*)?\s*(?=\n)/g;
+        let lastAccess: "public" | "protected" | "private" = "private";
+        let m: RegExpExecArray | null;
+        while ((m = accessRe.exec(before)) !== null) {
+          lastAccess = m[2] as "public" | "protected" | "private";
+        }
+
+        // Indent the declaration to match the class body (one tab is the
+        // convention used by UE templates).
+        const indented = declaration
+          .replace(/\r\n/g, "\n")
+          .split("\n")
+          .map(line => (line.length === 0 ? line : (line.startsWith("\t") ? line : `\t${line}`)))
+          .join("\n");
+
+        // If the requested access section already exists and is the most recent
+        // one before the closing brace, we can append the declaration directly
+        // without restoring a different prior access.
+        const sameAsPrior = access === lastAccess;
+        const insertion = sameAsPrior
+          ? `\n${indented}\n`
+          : `\n${access}:\n${indented}\n${lastAccess}:\n`;
+
+        const updated = `${original.slice(0, closeIdx)}${insertion}${original.slice(closeIdx)}`;
+        fs.writeFileSync(resolved, updated, "utf-8");
+        return {
+          status: "added",
+          path: resolved,
+          memberName,
+          access,
+          restoredPrior: sameAsPrior ? null : lastAccess,
+          hint: "Call live_coding_compile to hot-reload, or build_project for a full rebuild.",
+        };
+      },
+    },
   },
   undefined,
   {
@@ -589,6 +565,8 @@ export const projectTool: ToolDef = categoryTool(
     content: z.string().optional().describe("For write_cpp_file: full file contents."),
     sourcePath: z.string().optional().describe("For read_cpp_source: path to .cpp (relative to Source/ or absolute)."),
     dependency: z.string().optional().describe("For add_module_dependency: module name to add (e.g. 'UMG')."),
+    declaration: z.string().optional().describe("For add_cpp_member: full UPROPERTY(...) / UFUNCTION(...) block plus the member or function signature."),
+    memberName: z.string().optional().describe("For add_cpp_member: the identifier the declaration introduces (used for idempotency)."),
     access: z.enum(["public", "private"]).optional().describe("For add_module_dependency: 'public' (PublicDependencyModuleNames) or 'private' (default)."),
   },
 );

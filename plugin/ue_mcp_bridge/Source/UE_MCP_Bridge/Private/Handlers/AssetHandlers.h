@@ -24,11 +24,11 @@ private:
 	static TSharedPtr<FJsonValue> BulkRename(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateDataAsset(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SaveAsset(const TSharedPtr<FJsonObject>& Params);
+	// #429: bulk save of every dirty package - one-shot end-of-workflow flush.
+	static TSharedPtr<FJsonValue> SaveAllDirty(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ListTextures(const TSharedPtr<FJsonObject>& Params);
 
 	// DataTable handlers
-	static TSharedPtr<FJsonValue> ImportDataTableJson(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> ExportDataTableJson(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateDataTable(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadDataTable(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReimportDataTable(const TSharedPtr<FJsonObject>& Params);
@@ -48,6 +48,8 @@ private:
 	static TSharedPtr<FJsonValue> ListTextureProperties(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetTextureProperties(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ImportTexture(const TSharedPtr<FJsonObject>& Params);
+	// #430: one-call batch of texture imports - loops AssetImportTasks inside the editor.
+	static TSharedPtr<FJsonValue> ImportTextureBatch(const TSharedPtr<FJsonObject>& Params);
 
 	// Export
 	static TSharedPtr<FJsonValue> ExportAsset(const TSharedPtr<FJsonObject>& Params);
@@ -84,6 +86,8 @@ private:
 
 	// v1.0.0-rc.3 — #177, #192, #193
 	static TSharedPtr<FJsonValue> GetMeshBounds(const TSharedPtr<FJsonObject>& Params);
+	// #431: one-call mesh QA - bounds + materials + LOD/vertex/skeleton.
+	static TSharedPtr<FJsonValue> GetMeshInfo(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetMeshCollision(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> MoveFolder(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetMeshNav(const TSharedPtr<FJsonObject>& Params);

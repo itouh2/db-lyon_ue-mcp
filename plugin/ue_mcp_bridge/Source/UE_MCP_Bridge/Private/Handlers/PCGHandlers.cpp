@@ -1,6 +1,7 @@
 #include "PCGHandlers.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+#include "HandlerAssetCreate.h"
 #include "VolumeHelpers_Internal.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
@@ -26,7 +27,13 @@
 #include "PCGVolume.h"
 #include "Elements/PCGStaticMeshSpawner.h"
 #include "MeshSelectors/PCGMeshSelectorWeighted.h"
+// UPCGEditorGraphNodeBase ships in the PCGEditor module starting in UE 5.5.
+// On 5.4 the editor-node-position round-trip is unavailable; we fall back to
+// the runtime UPCGNode::PositionX/Y instead (only populated when this bridge
+// authored the node).
+#if UE_MCP_HAS_5_5_API
 #include "Nodes/PCGEditorGraphNodeBase.h"
+#endif
 #include "UObject/UObjectIterator.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Brush.h"
@@ -283,7 +290,6 @@ void FPCGHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("remove_pcg_node"), &RemovePCGNode);
 	Registry.RegisterHandler(TEXT("set_pcg_node_settings"), &SetPCGNodeSettings);
 	Registry.RegisterHandler(TEXT("execute_pcg_graph"), &ExecutePCGGraph);
-	Registry.RegisterHandler(TEXT("spawn_pcg_volume"), &SpawnPCGVolume);
 	Registry.RegisterHandler(TEXT("add_pcg_volume"), &SpawnPCGVolume);
 	Registry.RegisterHandler(TEXT("read_pcg_node_settings"), &ReadPCGNodeSettings);
 	Registry.RegisterHandler(TEXT("get_pcg_component_details"), &GetPCGComponentDetails);
@@ -365,27 +371,16 @@ TSharedPtr<FJsonValue> FPCGHandlers::CreatePCGGraph(const TSharedPtr<FJsonObject
 	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
-	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("PCGGraph")))
-	{
-		return Existing;
-	}
+	auto Created = MCPCreateAssetIdempotent<UPCGGraph>(Name, PackagePath, OnConflict, TEXT("PCGGraph"), nullptr);
+	if (Created.EarlyReturn) return Created.EarlyReturn;
 
-	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-	IAssetTools& AssetTools = AssetToolsModule.Get();
-
-	UObject* NewAsset = AssetTools.CreateAsset(Name, PackagePath, UPCGGraph::StaticClass(), nullptr);
-	if (!NewAsset)
-	{
-		return MCPError(TEXT("Failed to create PCGGraph"));
-	}
-
-	UEditorAssetLibrary::SaveLoadedAsset(NewAsset, /*bOnlyIfIsDirty=*/false);
+	UEditorAssetLibrary::SaveLoadedAsset(Created.Asset, /*bOnlyIfIsDirty=*/false);
 
 	auto Result = MCPSuccess();
 	MCPSetCreated(Result);
-	Result->SetStringField(TEXT("path"), NewAsset->GetPathName());
+	Result->SetStringField(TEXT("path"), Created.Asset->GetPathName());
 	Result->SetStringField(TEXT("name"), Name);
-	MCPSetDeleteAssetRollback(Result, NewAsset->GetPathName());
+	MCPSetDeleteAssetRollback(Result, Created.Asset->GetPathName());
 	return MCPResult(Result);
 }
 
@@ -1065,18 +1060,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::ExecutePCGGraph(const TSharedPtr<FJsonObjec
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	// Find actor by label
-	AActor* FoundActor = nullptr;
-	for (TActorIterator<AActor> ActorIt(World); ActorIt; ++ActorIt)
-	{
-		AActor* Actor = *ActorIt;
-		if (Actor && Actor->GetActorLabel() == ActorLabel)
-		{
-			FoundActor = Actor;
-			break;
-		}
-	}
-
+	AActor* FoundActor = FindActorByLabel(World, ActorLabel);
 	if (!FoundActor)
 	{
 		return MCPError(FString::Printf(TEXT("Actor not found with label: %s"), *ActorLabel));
@@ -1117,22 +1101,9 @@ TSharedPtr<FJsonValue> FPCGHandlers::SpawnPCGVolume(const TSharedPtr<FJsonObject
 	const FString Label = OptionalString(Params, TEXT("label"));
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
-	if (!Label.IsEmpty())
+	if (auto Existing = MCPCheckActorLabelExists(World, Label, OnConflict, TEXT("PCGVolume")))
 	{
-		for (TActorIterator<AActor> It(World); It; ++It)
-		{
-			if (It->GetActorLabel() == Label)
-			{
-				if (OnConflict == TEXT("error"))
-				{
-					return MCPError(FString::Printf(TEXT("PCGVolume '%s' already exists"), *Label));
-				}
-				auto Existing = MCPSuccess();
-				MCPSetExisted(Existing);
-				Existing->SetStringField(TEXT("actorLabel"), Label);
-				return MCPResult(Existing);
-			}
-		}
+		return Existing;
 	}
 
 	// #218: location/extent ship as nested {x,y,z} objects per the TS schema
@@ -1387,18 +1358,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::GetPCGComponentDetails(const TSharedPtr<FJs
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	// Find actor by label
-	AActor* FoundActor = nullptr;
-	for (TActorIterator<AActor> ActorIt(World); ActorIt; ++ActorIt)
-	{
-		AActor* Actor = *ActorIt;
-		if (Actor && Actor->GetActorLabel() == ActorLabel)
-		{
-			FoundActor = Actor;
-			break;
-		}
-	}
-
+	AActor* FoundActor = FindActorByLabel(World, ActorLabel);
 	if (!FoundActor)
 	{
 		return MCPError(FString::Printf(TEXT("Actor not found with label: %s"), *ActorLabel));
@@ -1582,17 +1542,9 @@ namespace
 		}
 		if (!World) return MCPError(TEXT("Editor world not available"));
 
-		for (TActorIterator<AActor> It(World); It; ++It)
-		{
-			AActor* A = *It;
-			if (A && A->GetActorLabel() == ActorLabel)
-			{
-				OutActor = A;
-				OutComp = A->FindComponentByClass<UPCGComponent>();
-				break;
-			}
-		}
+		OutActor = FindActorByLabel(World, ActorLabel);
 		if (!OutActor) return MCPError(FString::Printf(TEXT("Actor not found with label: %s"), *ActorLabel));
+		OutComp = OutActor->FindComponentByClass<UPCGComponent>();
 		if (!OutComp) return MCPError(FString::Printf(TEXT("No PCGComponent on actor: %s"), *ActorLabel));
 		return nullptr;
 	}
@@ -1971,6 +1923,8 @@ TSharedPtr<FJsonValue> FPCGHandlers::ExportGraph(const TSharedPtr<FJsonObject>& 
 	// only populated when the node was authored through this bridge - the PCG
 	// editor never writes back to it. Build a lookup so editor-authored
 	// graphs round-trip their hand-laid-out positions.
+	// (5.4 lacks UPCGEditorGraphNodeBase; falls back to runtime PositionX/Y below.)
+#if UE_MCP_HAS_5_5_API
 	TMap<const UPCGNode*, const UPCGEditorGraphNodeBase*> EditorNodeByPCGNode;
 	for (TObjectIterator<UPCGEditorGraphNodeBase> It; It; ++It)
 	{
@@ -1983,6 +1937,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::ExportGraph(const TSharedPtr<FJsonObject>& 
 			EditorNodeByPCGNode.Add(PCGN, EdNode);
 		}
 	}
+#endif
 
 	TArray<TSharedPtr<FJsonValue>> NodesArr;
 	for (const UPCGNode* Node : Graph->GetNodes())
@@ -1994,11 +1949,13 @@ TSharedPtr<FJsonValue> FPCGHandlers::ExportGraph(const TSharedPtr<FJsonObject>& 
 
 		double PosX = Node->PositionX;
 		double PosY = Node->PositionY;
+#if UE_MCP_HAS_5_5_API
 		if (const UPCGEditorGraphNodeBase* const* EdNodePtr = EditorNodeByPCGNode.Find(Node); EdNodePtr && *EdNodePtr)
 		{
 			PosX = (*EdNodePtr)->NodePosX;
 			PosY = (*EdNodePtr)->NodePosY;
 		}
+#endif
 		NodeObj->SetNumberField(TEXT("posX"), PosX);
 		NodeObj->SetNumberField(TEXT("posY"), PosY);
 

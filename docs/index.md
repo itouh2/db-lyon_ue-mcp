@@ -1,6 +1,6 @@
 # UE-MCP
 
-**Unreal Engine Model Context Protocol Server** - lets AI assistants drive the Unreal Editor through <!-- count:tools -->20<!-- /count --> category tools covering <!-- count:actions -->500+<!-- /count --> actions.
+**Unreal Engine Model Context Protocol Server** - lets AI assistants drive the Unreal Editor through <!-- count:tools -->21<!-- /count --> category tools covering <!-- count:actions -->524+<!-- /count --> actions.
 
 UE-MCP is a bridge between an AI client (Claude Code, Claude Desktop, Cursor, etc.) and the Unreal Editor. It runs a TypeScript MCP server on your machine, which talks over WebSocket to a C++ plugin running inside the editor. The result: your AI can place actors, write blueprints, author materials, sculpt landscape, set up Niagara VFX, configure replication, run PIE, build the project — anything the editor can do.
 
@@ -45,12 +45,15 @@ Start with **[Getting Started](getting-started.md)**. It assumes zero knowledge 
 
 Plus a **flow engine** that lets you chain any of these into multi-step YAML workflows with rollback, retries, and step references — see [Flows](flows.md).
 
+And a **plugin system** that lets npm packages inject new actions into the existing categories. Plugins ship through `npm install` and slot into the same `pcg`/`landscape`/etc. tools the agent is already using — there is nothing extra for the agent to discover. See [Plugins](plugins.md) for the author contract and [Configuration → Plugins](configuration.md#plugins) for the consumer view.
+
 ## Navigation
 
 - **[Getting Started](getting-started.md)** - Zero-to-running walkthrough for first-time users
 - **[Architecture](architecture.md)** - How the TypeScript server, C++ plugin, and editor fit together
-- **[Tool Reference](tool-reference.md)** - All <!-- count:tools -->20<!-- /count --> tools with every action and its parameters
+- **[Tool Reference](tool-reference.md)** - All <!-- count:tools -->21<!-- /count --> tools with every action and its parameters
 - **[Flows](flows.md)** - Multi-step YAML workflows, custom tasks, hooks, rollback
+- **[Plugins](plugins.md)** - npm packages that inject new actions into existing categories
 - **[Configuration](configuration.md)** - `.ue-mcp.json` and MCP client config
 - **[Neon Shrine Demo](neon-shrine-demo.md)** - 19-step procedural scene walkthrough
 - **[Feedback](feedback.md)** - Agent feedback system for improving UE-MCP

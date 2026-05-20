@@ -2,6 +2,7 @@
 #include "UE_MCP_BridgeModule.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+#include "HandlerAssetCreate.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInstanceConstant.h"
@@ -54,14 +55,9 @@ void FMaterialHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("recompile_material"), &RecompileMaterial);
 	Registry.RegisterHandler(TEXT("create_material_instance"), &CreateMaterialInstance);
 	Registry.RegisterHandler(TEXT("set_material_parameter"), &SetMaterialParameter);
-	Registry.RegisterHandler(TEXT("connect_expression"), &ConnectExpression);
-	Registry.RegisterHandler(TEXT("connect_material_property"), &ConnectMaterialProperty);
-	Registry.RegisterHandler(TEXT("delete_expression"), &DeleteExpression);
 	Registry.RegisterHandler(TEXT("set_expression_value"), &SetExpressionValue);
-	Registry.RegisterHandler(TEXT("create_material_from_texture"), &CreateMaterialFromTexture);
-	Registry.RegisterHandler(TEXT("read_material_instance"), &ReadMaterialInstance);
 
-	// TS-expected name aliases
+	// Expression graph operations
 	Registry.RegisterHandler(TEXT("connect_texture_to_material"), &ConnectTextureToMaterial);
 	Registry.RegisterHandler(TEXT("connect_material_expressions"), &ConnectMaterialExpressions);
 	Registry.RegisterHandler(TEXT("connect_to_material_property"), &ConnectToMaterialProperty);
@@ -69,6 +65,7 @@ void FMaterialHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("disconnect_material_property"), &DisconnectMaterialProperty);
 
 	// v0.7.9 — depth
+	Registry.RegisterHandler(TEXT("create_material_from_texture"), &CreateMaterialFromTexture);
 	Registry.RegisterHandler(TEXT("duplicate_material"), &DuplicateMaterial);
 	Registry.RegisterHandler(TEXT("validate_material"), &ValidateMaterial);
 	Registry.RegisterHandler(TEXT("get_material_shader_stats"), &GetMaterialShaderStats);
@@ -85,25 +82,12 @@ void FMaterialHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 
 UMaterial* FMaterialHandlers::LoadMaterialFromPath(const FString& AssetPath)
 {
-	UObject* LoadedObject = StaticLoadObject(UMaterial::StaticClass(), nullptr, *AssetPath);
-	if (!LoadedObject)
-	{
-		// Try with explicit class prefix
-		LoadedObject = StaticLoadObject(UMaterial::StaticClass(), nullptr, *(TEXT("Material'") + AssetPath + TEXT("'")));
-	}
-	return Cast<UMaterial>(LoadedObject);
+	return LoadAssetByPath<UMaterial>(AssetPath);
 }
 
 UMaterialInstanceConstant* FMaterialHandlers::LoadMaterialInstanceFromPath(const FString& AssetPath)
 {
-	UObject* LoadedObject = StaticLoadObject(UMaterialInstanceConstant::StaticClass(), nullptr, *AssetPath);
-	if (!LoadedObject)
-	{
-		// Try with explicit class prefix
-		LoadedObject = StaticLoadObject(UMaterialInstanceConstant::StaticClass(), nullptr,
-			*(TEXT("MaterialInstanceConstant'") + AssetPath + TEXT("'")));
-	}
-	return Cast<UMaterialInstanceConstant>(LoadedObject);
+	return LoadAssetByPath<UMaterialInstanceConstant>(AssetPath);
 }
 
 EMaterialShadingModel FMaterialHandlers::ParseShadingModel(const FString& ShadingModelStr)
@@ -266,53 +250,19 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterial(const TSharedPtr<FJsonO
 
 	UE_LOG(LogMCPBridge, Log, TEXT("[UE-MCP] CreateMaterial: name=%s packagePath=%s"), *Name, *PackagePath);
 
-	// Idempotency: check if the material already exists at the target path.
-	const FString ProbePath = PackagePath + TEXT("/") + Name + TEXT(".") + Name;
-	if (UMaterial* Existing = LoadObject<UMaterial>(nullptr, *ProbePath))
-	{
-		if (OnConflict == TEXT("error"))
-		{
-			return MCPError(FString::Printf(TEXT("Material '%s' already exists"), *ProbePath));
-		}
-		auto ExistingResult = MCPSuccess();
-		MCPSetExisted(ExistingResult);
-		ExistingResult->SetStringField(TEXT("path"), Existing->GetPathName());
-		ExistingResult->SetStringField(TEXT("name"), Name);
-		ExistingResult->SetStringField(TEXT("packagePath"), PackagePath);
-		return MCPResult(ExistingResult);
-	}
-
-	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-	IAssetTools& AssetTools = AssetToolsModule.Get();
-
 	UMaterialFactoryNew* MaterialFactory = NewObject<UMaterialFactoryNew>();
-	UObject* NewAsset = AssetTools.CreateAsset(Name, PackagePath, UMaterial::StaticClass(), MaterialFactory);
+	auto Created = MCPCreateAssetIdempotent<UMaterial>(Name, PackagePath, OnConflict, TEXT("Material"), MaterialFactory);
+	if (Created.EarlyReturn) return Created.EarlyReturn;
 
-	if (!NewAsset)
-	{
-		return MCPError(TEXT("Failed to create material asset"));
-	}
-
-	UMaterial* NewMaterial = Cast<UMaterial>(NewAsset);
-	if (!NewMaterial)
-	{
-		return MCPError(TEXT("Created asset is not a material"));
-	}
-
-	SaveAssetPackage(NewMaterial);
-
-	const FString AssetPath = NewMaterial->GetPathName();
+	SaveAssetPackage(Created.Asset);
+	const FString AssetPath = Created.Asset->GetPathName();
 
 	auto Result = MCPSuccess();
 	MCPSetCreated(Result);
 	Result->SetStringField(TEXT("path"), AssetPath);
 	Result->SetStringField(TEXT("name"), Name);
 	Result->SetStringField(TEXT("packagePath"), PackagePath);
-
-	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-	Payload->SetStringField(TEXT("assetPath"), AssetPath);
-	MCPSetRollback(Result, TEXT("delete_asset"), Payload);
-
+	MCPSetDeleteAssetRollback(Result, AssetPath);
 	return MCPResult(Result);
 }
 
@@ -1159,11 +1109,6 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterialInstance(const TSharedPt
 	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
-	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("MaterialInstance")))
-	{
-		return Existing;
-	}
-
 	UMaterialInterface* ParentMaterial = Cast<UMaterialInterface>(
 		StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, *ParentPath));
 	if (!ParentMaterial)
@@ -1179,35 +1124,21 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterialInstance(const TSharedPt
 
 	UE_LOG(LogMCPBridge, Log, TEXT("[UE-MCP] CreateMaterialInstance: name=%s parent=%s packagePath=%s"), *Name, *ParentPath, *PackagePath);
 
-	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-	IAssetTools& AssetTools = AssetToolsModule.Get();
-
 	UMaterialInstanceConstantFactoryNew* Factory = NewObject<UMaterialInstanceConstantFactoryNew>();
 	Factory->InitialParent = ParentMaterial;
 
-	UObject* NewAsset = AssetTools.CreateAsset(Name, PackagePath, UMaterialInstanceConstant::StaticClass(), Factory);
-	if (!NewAsset)
-	{
-		return MCPError(TEXT("Failed to create material instance asset"));
-	}
+	auto Created = MCPCreateAssetIdempotent<UMaterialInstanceConstant>(Name, PackagePath, OnConflict, TEXT("Material instance"), Factory);
+	if (Created.EarlyReturn) return Created.EarlyReturn;
 
-	UMaterialInstanceConstant* MaterialInstance = Cast<UMaterialInstanceConstant>(NewAsset);
-	if (!MaterialInstance)
-	{
-		return MCPError(TEXT("Created asset is not a material instance"));
-	}
-
-	// Save the package
-	SaveAssetPackage(MaterialInstance);
+	SaveAssetPackage(Created.Asset);
 
 	auto Result = MCPSuccess();
 	MCPSetCreated(Result);
-	Result->SetStringField(TEXT("path"), MaterialInstance->GetPathName());
+	Result->SetStringField(TEXT("path"), Created.Asset->GetPathName());
 	Result->SetStringField(TEXT("name"), Name);
 	Result->SetStringField(TEXT("parentPath"), ParentMaterial->GetPathName());
 	Result->SetStringField(TEXT("packagePath"), PackagePath);
-	MCPSetDeleteAssetRollback(Result, MaterialInstance->GetPathName());
-
+	MCPSetDeleteAssetRollback(Result, Created.Asset->GetPathName());
 	return MCPResult(Result);
 }
 
@@ -1425,256 +1356,6 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialParameter(const TSharedPtr<
 		return MCPError(FString::Printf(TEXT("Unknown parameterType '%s'. Use 'scalar', 'vector', or 'texture'."), *ParameterType));
 	}
 }
-
-TSharedPtr<FJsonValue> FMaterialHandlers::ConnectExpression(const TSharedPtr<FJsonObject>& Params)
-{
-	FString MaterialPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("path"), MaterialPath)) return Err;
-	if (MaterialPath.IsEmpty())
-	{
-		Params->TryGetStringField(TEXT("assetPath"), MaterialPath);
-		if (MaterialPath.IsEmpty())
-		{
-			return MCPError(TEXT("Missing required parameter 'materialPath' (or 'path')"));
-		}
-	}
-
-	int32 SourceIndex = -1;
-	if (!Params->TryGetNumberField(TEXT("sourceIndex"), SourceIndex))
-	{
-		return MCPError(TEXT("Missing required parameter 'sourceIndex'"));
-	}
-
-	int32 TargetIndex = -1;
-	if (!Params->TryGetNumberField(TEXT("targetIndex"), TargetIndex))
-	{
-		return MCPError(TEXT("Missing required parameter 'targetIndex'"));
-	}
-
-	int32 SourceOutputIndex = OptionalInt(Params, TEXT("sourceOutputIndex"), 0);
-	int32 TargetInputIndex = OptionalInt(Params, TEXT("targetInputIndex"), 0);
-
-	UMaterial* Material = LoadMaterialFromPath(MaterialPath);
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	auto Expressions = Material->GetExpressions();
-
-	if (SourceIndex < 0 || SourceIndex >= Expressions.Num())
-	{
-		return MCPError(FString::Printf(TEXT("Source expression index %d out of range (0-%d)"), SourceIndex, Expressions.Num() - 1));
-	}
-
-	if (TargetIndex < 0 || TargetIndex >= Expressions.Num())
-	{
-		return MCPError(FString::Printf(TEXT("Target expression index %d out of range (0-%d)"), TargetIndex, Expressions.Num() - 1));
-	}
-
-	UMaterialExpression* SourceExpression = Expressions[SourceIndex];
-	UMaterialExpression* TargetExpression = Expressions[TargetIndex];
-
-	if (!SourceExpression || !TargetExpression)
-	{
-		return MCPError(TEXT("Source or target expression is null"));
-	}
-
-	// Validate target input index by probing GetInput()
-	FExpressionInput* TargetInput = TargetExpression->GetInput(TargetInputIndex);
-	if (!TargetInput)
-	{
-		return MCPError(FString::Printf(TEXT("Target input index %d is out of range"), TargetInputIndex));
-	}
-
-	// Idempotency: check if input is already wired to the same source
-	if (TargetInput->Expression == SourceExpression && TargetInput->OutputIndex == SourceOutputIndex)
-	{
-		auto Existed = MCPSuccess();
-		MCPSetExisted(Existed);
-		Existed->SetStringField(TEXT("materialPath"), Material->GetPathName());
-		Existed->SetNumberField(TEXT("sourceIndex"), SourceIndex);
-		Existed->SetNumberField(TEXT("targetIndex"), TargetIndex);
-		Existed->SetNumberField(TEXT("sourceOutputIndex"), SourceOutputIndex);
-		Existed->SetNumberField(TEXT("targetInputIndex"), TargetInputIndex);
-		return MCPResult(Existed);
-	}
-
-	Material->PreEditChange(nullptr);
-	TargetInput->Connect(SourceOutputIndex, SourceExpression);
-
-	Material->PostEditChange();
-	Material->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Result->SetNumberField(TEXT("sourceIndex"), SourceIndex);
-	Result->SetStringField(TEXT("sourceClass"), SourceExpression->GetClass()->GetName());
-	Result->SetNumberField(TEXT("targetIndex"), TargetIndex);
-	Result->SetStringField(TEXT("targetClass"), TargetExpression->GetClass()->GetName());
-	Result->SetNumberField(TEXT("sourceOutputIndex"), SourceOutputIndex);
-	Result->SetNumberField(TEXT("targetInputIndex"), TargetInputIndex);
-	// No rollback: no paired disconnect_expression handler.
-
-	return MCPResult(Result);
-}
-
-TSharedPtr<FJsonValue> FMaterialHandlers::ConnectMaterialProperty(const TSharedPtr<FJsonObject>& Params)
-{
-	FString MaterialPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("path"), MaterialPath)) return Err;
-	if (MaterialPath.IsEmpty())
-	{
-		Params->TryGetStringField(TEXT("assetPath"), MaterialPath);
-		if (MaterialPath.IsEmpty())
-		{
-			return MCPError(TEXT("Missing required parameter 'materialPath' (or 'path')"));
-		}
-	}
-
-	int32 ExpressionIndex = -1;
-	if (!Params->TryGetNumberField(TEXT("expressionIndex"), ExpressionIndex))
-	{
-		return MCPError(TEXT("Missing required parameter 'expressionIndex'"));
-	}
-
-	FString PropertyName;
-	if (auto Err = RequireString(Params, TEXT("property"), PropertyName)) return Err;
-
-	int32 OutputIndex = OptionalInt(Params, TEXT("outputIndex"), 0);
-
-	UMaterial* Material = LoadMaterialFromPath(MaterialPath);
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	auto Expressions = Material->GetExpressions();
-
-	if (ExpressionIndex < 0 || ExpressionIndex >= Expressions.Num())
-	{
-		return MCPError(FString::Printf(TEXT("Expression index %d out of range (0-%d)"), ExpressionIndex, Expressions.Num() - 1));
-	}
-
-	UMaterialExpression* Expression = Expressions[ExpressionIndex];
-	if (!Expression)
-	{
-		return MCPError(TEXT("Expression at given index is null"));
-	}
-
-	EMaterialProperty MatProperty;
-	if (!ParseMaterialProperty(PropertyName, MatProperty))
-	{
-		return MCPError(FString::Printf(TEXT("Unknown material property '%s'. Available: BaseColor, Metallic, Specular, Roughness, Anisotropy, EmissiveColor, Opacity, OpacityMask, Normal, Tangent, WorldPositionOffset, SubsurfaceColor, AmbientOcclusion, Refraction, PixelDepthOffset, ShadingModel"), *PropertyName));
-	}
-
-	Material->PreEditChange(nullptr);
-
-	// Get the editor-only data to access the material property inputs
-	UMaterialEditorOnlyData* EditorOnlyData = Material->GetEditorOnlyData();
-	if (!EditorOnlyData)
-	{
-		return MCPError(TEXT("Material has no editor-only data (is this material domain supported?)"));
-	}
-	FExpressionInput* PropertyInput = GetMaterialPropertyInput(EditorOnlyData, MatProperty);
-	if (!PropertyInput)
-	{
-		return MCPError(FString::Printf(TEXT("Material property '%s' is not supported for direct connection"), *PropertyName));
-	}
-
-	// Idempotency: check if already connected to this expression with same output index
-	if (PropertyInput->Expression == Expression && PropertyInput->OutputIndex == OutputIndex)
-	{
-		auto Existed = MCPSuccess();
-		MCPSetExisted(Existed);
-		Existed->SetStringField(TEXT("materialPath"), Material->GetPathName());
-		Existed->SetNumberField(TEXT("expressionIndex"), ExpressionIndex);
-		Existed->SetStringField(TEXT("property"), PropertyName);
-		Existed->SetNumberField(TEXT("outputIndex"), OutputIndex);
-		return MCPResult(Existed);
-	}
-
-	PropertyInput->Connect(OutputIndex, Expression);
-
-	Material->PostEditChange();
-	Material->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Result->SetNumberField(TEXT("expressionIndex"), ExpressionIndex);
-	Result->SetStringField(TEXT("expressionClass"), Expression->GetClass()->GetName());
-	Result->SetStringField(TEXT("property"), PropertyName);
-	Result->SetNumberField(TEXT("outputIndex"), OutputIndex);
-
-	// Rollback: disconnect_material_property
-	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-	Payload->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Payload->SetStringField(TEXT("property"), PropertyName);
-	MCPSetRollback(Result, TEXT("disconnect_material_property"), Payload);
-
-	return MCPResult(Result);
-}
-
-TSharedPtr<FJsonValue> FMaterialHandlers::DeleteExpression(const TSharedPtr<FJsonObject>& Params)
-{
-	FString MaterialPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("path"), MaterialPath)) return Err;
-	if (MaterialPath.IsEmpty())
-	{
-		Params->TryGetStringField(TEXT("assetPath"), MaterialPath);
-		if (MaterialPath.IsEmpty())
-		{
-			return MCPError(TEXT("Missing required parameter 'materialPath' (or 'path')"));
-		}
-	}
-
-	int32 ExpressionIndex = -1;
-	if (!Params->TryGetNumberField(TEXT("expressionIndex"), ExpressionIndex))
-	{
-		return MCPError(TEXT("Missing required parameter 'expressionIndex'"));
-	}
-
-	UMaterial* Material = LoadMaterialFromPath(MaterialPath);
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	auto Expressions = Material->GetExpressions();
-
-	if (ExpressionIndex < 0 || ExpressionIndex >= Expressions.Num())
-	{
-		return MCPError(FString::Printf(TEXT("Expression index %d out of range (0-%d)"), ExpressionIndex, Expressions.Num() - 1));
-	}
-
-	UMaterialExpression* Expression = Expressions[ExpressionIndex];
-	if (!Expression)
-	{
-		return MCPError(TEXT("Expression at given index is null"));
-	}
-
-	FString DeletedClass = Expression->GetClass()->GetName();
-
-	Material->PreEditChange(nullptr);
-
-	Material->GetExpressionCollection().RemoveExpression(Expression);
-
-	Material->PostEditChange();
-	Material->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Result->SetNumberField(TEXT("deletedIndex"), ExpressionIndex);
-	Result->SetStringField(TEXT("deletedClass"), DeletedClass);
-	Result->SetNumberField(TEXT("expressionCount"), Material->GetExpressions().Num());
-	Result->SetBoolField(TEXT("deleted"), true);
-	// No rollback: deletion is destructive (would need to snapshot expression + connections to reverse).
-
-	return MCPResult(Result);
-}
-
 TSharedPtr<FJsonValue> FMaterialHandlers::SetExpressionValue(const TSharedPtr<FJsonObject>& Params)
 {
 	FString MaterialPath;
@@ -2029,85 +1710,6 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetExpressionValue(const TSharedPtr<FJ
 
 	return MCPResult(Result);
 }
-TSharedPtr<FJsonValue> FMaterialHandlers::ReadMaterialInstance(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
-
-	UMaterialInstanceConstant* MaterialInstance = LoadMaterialInstanceFromPath(AssetPath);
-	if (!MaterialInstance)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material instance at '%s'"), *AssetPath));
-	}
-
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("name"), MaterialInstance->GetName());
-	Result->SetStringField(TEXT("path"), MaterialInstance->GetPathName());
-	Result->SetBoolField(TEXT("isMaterialInstance"), true);
-
-	// Parent material
-	UMaterialInterface* Parent = MaterialInstance->Parent;
-	if (Parent)
-	{
-		Result->SetStringField(TEXT("parent"), Parent->GetPathName());
-	}
-	else
-	{
-		Result->SetStringField(TEXT("parent"), TEXT(""));
-	}
-
-	// Scalar parameter overrides
-	TArray<TSharedPtr<FJsonValue>> ScalarOverrides;
-	for (const FScalarParameterValue& ScalarParam : MaterialInstance->ScalarParameterValues)
-	{
-		TSharedPtr<FJsonObject> ParamObj = MakeShared<FJsonObject>();
-		ParamObj->SetStringField(TEXT("name"), ScalarParam.ParameterInfo.Name.ToString());
-		ParamObj->SetNumberField(TEXT("value"), ScalarParam.ParameterValue);
-		ScalarOverrides.Add(MakeShared<FJsonValueObject>(ParamObj));
-	}
-
-	// Vector parameter overrides
-	TArray<TSharedPtr<FJsonValue>> VectorOverrides;
-	for (const FVectorParameterValue& VectorParam : MaterialInstance->VectorParameterValues)
-	{
-		TSharedPtr<FJsonObject> ParamObj = MakeShared<FJsonObject>();
-		ParamObj->SetStringField(TEXT("name"), VectorParam.ParameterInfo.Name.ToString());
-
-		TSharedPtr<FJsonObject> ValueObj = MakeShared<FJsonObject>();
-		ValueObj->SetNumberField(TEXT("r"), VectorParam.ParameterValue.R);
-		ValueObj->SetNumberField(TEXT("g"), VectorParam.ParameterValue.G);
-		ValueObj->SetNumberField(TEXT("b"), VectorParam.ParameterValue.B);
-		ValueObj->SetNumberField(TEXT("a"), VectorParam.ParameterValue.A);
-		ParamObj->SetObjectField(TEXT("value"), ValueObj);
-
-		VectorOverrides.Add(MakeShared<FJsonValueObject>(ParamObj));
-	}
-
-	// Texture parameter overrides
-	TArray<TSharedPtr<FJsonValue>> TextureOverrides;
-	for (const FTextureParameterValue& TextureParam : MaterialInstance->TextureParameterValues)
-	{
-		TSharedPtr<FJsonObject> ParamObj = MakeShared<FJsonObject>();
-		ParamObj->SetStringField(TEXT("name"), TextureParam.ParameterInfo.Name.ToString());
-		if (TextureParam.ParameterValue)
-		{
-			ParamObj->SetStringField(TEXT("value"), TextureParam.ParameterValue->GetPathName());
-		}
-		else
-		{
-			ParamObj->SetStringField(TEXT("value"), TEXT(""));
-		}
-		TextureOverrides.Add(MakeShared<FJsonValueObject>(ParamObj));
-	}
-
-	Result->SetArrayField(TEXT("scalarOverrides"), ScalarOverrides);
-	Result->SetArrayField(TEXT("vectorOverrides"), VectorOverrides);
-	Result->SetArrayField(TEXT("textureOverrides"), TextureOverrides);
-	Result->SetNumberField(TEXT("totalOverrides"), ScalarOverrides.Num() + VectorOverrides.Num() + TextureOverrides.Num());
-
-	return MCPResult(Result);
-}
-
 UMaterialExpression* FMaterialHandlers::FindExpressionByName(UMaterial* Material, const FString& ExpressionName)
 {
 	if (!Material || ExpressionName.IsEmpty()) return nullptr;
@@ -2183,516 +1785,6 @@ UMaterialExpression* FMaterialHandlers::FindExpressionByName(UMaterial* Material
 	}
 
 	return nullptr;
-}
-
-TSharedPtr<FJsonValue> FMaterialHandlers::ConnectTextureToMaterial(const TSharedPtr<FJsonObject>& Params)
-{
-	FString MaterialPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("path"), MaterialPath)) return Err;
-	if (MaterialPath.IsEmpty())
-	{
-		Params->TryGetStringField(TEXT("assetPath"), MaterialPath);
-		if (MaterialPath.IsEmpty())
-		{
-			return MCPError(TEXT("Missing required parameter 'materialPath' (or 'path')"));
-		}
-	}
-
-	FString TexturePath;
-	if (auto Err = RequireString(Params, TEXT("texturePath"), TexturePath)) return Err;
-
-	FString PropertyName = TEXT("BaseColor");
-	if (!Params->TryGetStringField(TEXT("property"), PropertyName))
-	{
-		Params->TryGetStringField(TEXT("materialProperty"), PropertyName);
-	}
-
-	UMaterial* Material = LoadMaterialFromPath(MaterialPath);
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	// Load the texture
-	UTexture* Texture = Cast<UTexture>(StaticLoadObject(UTexture::StaticClass(), nullptr, *TexturePath));
-	if (!Texture)
-	{
-		Texture = Cast<UTexture>(StaticLoadObject(UTexture::StaticClass(), nullptr,
-			*(TEXT("Texture2D'") + TexturePath + TEXT("'"))));
-	}
-	if (!Texture)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load texture at '%s'"), *TexturePath));
-	}
-
-	EMaterialProperty MatProperty;
-	if (!ParseMaterialProperty(PropertyName, MatProperty))
-	{
-		return MCPError(FString::Printf(TEXT("Unknown material property '%s'"), *PropertyName));
-	}
-
-	Material->PreEditChange(nullptr);
-
-	// Create a TextureSample expression.
-	// Note: connect_texture_to_material adds a new TextureSample node every call
-	// (not natural-key idempotent). Use connect_material_expressions with named
-	// source/target expressions if idempotency is required.
-	UMaterialExpressionTextureSample* TextureSampleExpr = NewObject<UMaterialExpressionTextureSample>(Material);
-	TextureSampleExpr->Texture = Texture;
-	TextureSampleExpr->MaterialExpressionEditorX = -400;
-	TextureSampleExpr->MaterialExpressionEditorY = 0;
-
-	Material->GetExpressionCollection().AddExpression(TextureSampleExpr);
-
-	// Connect RGB output (index 0) to the requested material property
-	UMaterialEditorOnlyData* EditorOnlyData = Material->GetEditorOnlyData();
-	if (FExpressionInput* PropertyInput = GetMaterialPropertyInput(EditorOnlyData, MatProperty))
-	{
-		PropertyInput->Connect(0, TextureSampleExpr);
-	}
-
-	Material->PostEditChange();
-	Material->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Result->SetStringField(TEXT("texturePath"), Texture->GetPathName());
-	Result->SetStringField(TEXT("property"), PropertyName);
-	Result->SetNumberField(TEXT("expressionCount"), Material->GetExpressions().Num());
-
-	return MCPResult(Result);
-}
-
-TSharedPtr<FJsonValue> FMaterialHandlers::ConnectMaterialExpressions(const TSharedPtr<FJsonObject>& Params)
-{
-	FString MaterialPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("path"), MaterialPath)) return Err;
-	if (MaterialPath.IsEmpty())
-	{
-		Params->TryGetStringField(TEXT("assetPath"), MaterialPath);
-		if (MaterialPath.IsEmpty())
-		{
-			return MCPError(TEXT("Missing required parameter 'materialPath' (or 'path')"));
-		}
-	}
-
-	FString SourceExpressionName;
-	if (auto Err = RequireString(Params, TEXT("sourceExpression"), SourceExpressionName)) return Err;
-
-	FString TargetExpressionName;
-	if (auto Err = RequireString(Params, TEXT("targetExpression"), TargetExpressionName)) return Err;
-
-	// Source/target output/input can be specified by name or index
-	FString SourceOutputName = OptionalString(Params, TEXT("sourceOutput"));
-	FString TargetInputName = OptionalString(Params, TEXT("targetInput"));
-
-	UMaterial* Material = LoadMaterialFromPath(MaterialPath);
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	UMaterialExpression* SourceExpression = FindExpressionByName(Material, SourceExpressionName);
-	if (!SourceExpression)
-	{
-		return MCPError(FString::Printf(TEXT("Source expression '%s' not found"), *SourceExpressionName));
-	}
-
-	UMaterialExpression* TargetExpression = FindExpressionByName(Material, TargetExpressionName);
-	if (!TargetExpression)
-	{
-		return MCPError(FString::Printf(TEXT("Target expression '%s' not found"), *TargetExpressionName));
-	}
-
-	// Resolve source output index. Track whether we matched a named pin so
-	// unknown names fail loudly instead of silently aliasing to index 0
-	// and overwriting whatever connection lives there (#318).
-	int32 SourceOutputIndex = 0;
-	bool bSourceOutputResolved = SourceOutputName.IsEmpty(); // empty == "use default 0"
-	if (!SourceOutputName.IsEmpty())
-	{
-		if (SourceOutputName.IsNumeric())
-		{
-			SourceOutputIndex = FCString::Atoi(*SourceOutputName);
-			bSourceOutputResolved = true;
-		}
-		else
-		{
-			TArray<FExpressionOutput>& Outputs = SourceExpression->GetOutputs();
-			for (int32 i = 0; i < Outputs.Num(); i++)
-			{
-				if (Outputs[i].OutputName.ToString().Equals(SourceOutputName, ESearchCase::IgnoreCase))
-				{
-					SourceOutputIndex = i;
-					bSourceOutputResolved = true;
-					break;
-				}
-			}
-			if (!bSourceOutputResolved)
-			{
-				TArray<FString> Names;
-				for (const FExpressionOutput& O : Outputs) { Names.Add(O.OutputName.ToString()); }
-				return MCPError(FString::Printf(
-					TEXT("Source output '%s' not found on '%s'. Available: [%s]"),
-					*SourceOutputName, *SourceExpressionName,
-					*FString::Join(Names, TEXT(", "))));
-			}
-		}
-	}
-
-	// Resolve target input index. Same loud-fail rule (#318) - this is the
-	// case that previously aliased unknown names to A/RGB and clobbered prior
-	// wiring.
-	int32 TargetInputIndex = 0;
-	bool bTargetInputResolved = TargetInputName.IsEmpty();
-	if (!TargetInputName.IsEmpty())
-	{
-		if (TargetInputName.IsNumeric())
-		{
-			TargetInputIndex = FCString::Atoi(*TargetInputName);
-			bTargetInputResolved = true;
-		}
-		else
-		{
-			for (int32 i = 0; ; i++)
-			{
-				FExpressionInput* Input = TargetExpression->GetInput(i);
-				if (!Input) break;
-				FName InputName = TargetExpression->GetInputName(i);
-				if (InputName.ToString().Equals(TargetInputName, ESearchCase::IgnoreCase))
-				{
-					TargetInputIndex = i;
-					bTargetInputResolved = true;
-					break;
-				}
-			}
-			if (!bTargetInputResolved)
-			{
-				TArray<FString> Names;
-				for (int32 i = 0; ; i++)
-				{
-					if (!TargetExpression->GetInput(i)) break;
-					Names.Add(TargetExpression->GetInputName(i).ToString());
-				}
-				return MCPError(FString::Printf(
-					TEXT("Target input '%s' not found on '%s'. Available: [%s]"),
-					*TargetInputName, *TargetExpressionName,
-					*FString::Join(Names, TEXT(", "))));
-			}
-		}
-	}
-
-	FExpressionInput* TargetInput = TargetExpression->GetInput(TargetInputIndex);
-	if (!TargetInput)
-	{
-		return MCPError(FString::Printf(TEXT("Target input index %d is out of range"), TargetInputIndex));
-	}
-
-	// Idempotency: already wired?
-	if (TargetInput->Expression == SourceExpression && TargetInput->OutputIndex == SourceOutputIndex)
-	{
-		auto Existed = MCPSuccess();
-		MCPSetExisted(Existed);
-		Existed->SetStringField(TEXT("materialPath"), Material->GetPathName());
-		Existed->SetStringField(TEXT("sourceExpression"), SourceExpressionName);
-		Existed->SetStringField(TEXT("targetExpression"), TargetExpressionName);
-		Existed->SetNumberField(TEXT("sourceOutputIndex"), SourceOutputIndex);
-		Existed->SetNumberField(TEXT("targetInputIndex"), TargetInputIndex);
-		return MCPResult(Existed);
-	}
-
-	Material->PreEditChange(nullptr);
-	TargetInput->Connect(SourceOutputIndex, SourceExpression);
-	Material->PostEditChange();
-	Material->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Result->SetStringField(TEXT("sourceExpression"), SourceExpression->GetClass()->GetName());
-	Result->SetStringField(TEXT("targetExpression"), TargetExpression->GetClass()->GetName());
-	Result->SetNumberField(TEXT("sourceOutputIndex"), SourceOutputIndex);
-	Result->SetNumberField(TEXT("targetInputIndex"), TargetInputIndex);
-	// No rollback: no paired disconnect handler by names.
-
-	return MCPResult(Result);
-}
-
-TSharedPtr<FJsonValue> FMaterialHandlers::ConnectToMaterialProperty(const TSharedPtr<FJsonObject>& Params)
-{
-	FString MaterialPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("path"), MaterialPath)) return Err;
-	if (MaterialPath.IsEmpty())
-	{
-		Params->TryGetStringField(TEXT("assetPath"), MaterialPath);
-		if (MaterialPath.IsEmpty())
-		{
-			return MCPError(TEXT("Missing required parameter 'materialPath' (or 'path')"));
-		}
-	}
-
-	FString ExpressionName;
-	if (auto Err = RequireString(Params, TEXT("expressionName"), ExpressionName)) return Err;
-
-	FString PropertyName;
-	if (auto Err = RequireString(Params, TEXT("property"), PropertyName)) return Err;
-
-	FString OutputName = OptionalString(Params, TEXT("outputName"));
-
-	UMaterial* Material = LoadMaterialFromPath(MaterialPath);
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	UMaterialExpression* Expression = FindExpressionByName(Material, ExpressionName);
-	if (!Expression)
-	{
-		return MCPError(FString::Printf(TEXT("Expression '%s' not found"), *ExpressionName));
-	}
-
-	// Resolve output index
-	int32 OutputIndex = 0;
-	if (!OutputName.IsEmpty())
-	{
-		if (OutputName.IsNumeric())
-		{
-			OutputIndex = FCString::Atoi(*OutputName);
-		}
-		else
-		{
-			TArray<FExpressionOutput>& Outputs = Expression->GetOutputs();
-			for (int32 i = 0; i < Outputs.Num(); i++)
-			{
-				if (Outputs[i].OutputName.ToString().Equals(OutputName, ESearchCase::IgnoreCase))
-				{
-					OutputIndex = i;
-					break;
-				}
-			}
-		}
-	}
-
-	EMaterialProperty MatProperty;
-	if (!ParseMaterialProperty(PropertyName, MatProperty))
-	{
-		return MCPError(FString::Printf(TEXT("Unknown material property '%s'"), *PropertyName));
-	}
-
-	Material->PreEditChange(nullptr);
-
-	UMaterialEditorOnlyData* EditorOnlyData = Material->GetEditorOnlyData();
-	if (!EditorOnlyData)
-	{
-		return MCPError(TEXT("Material has no editor-only data (is this material domain supported?)"));
-	}
-	FExpressionInput* PropertyInput = GetMaterialPropertyInput(EditorOnlyData, MatProperty);
-	if (!PropertyInput)
-	{
-		return MCPError(FString::Printf(TEXT("Material property '%s' is not supported for direct connection"), *PropertyName));
-	}
-
-	// Idempotency
-	if (PropertyInput->Expression == Expression && PropertyInput->OutputIndex == OutputIndex)
-	{
-		auto Existed = MCPSuccess();
-		MCPSetExisted(Existed);
-		Existed->SetStringField(TEXT("materialPath"), Material->GetPathName());
-		Existed->SetStringField(TEXT("expressionName"), ExpressionName);
-		Existed->SetStringField(TEXT("property"), PropertyName);
-		Existed->SetNumberField(TEXT("outputIndex"), OutputIndex);
-		return MCPResult(Existed);
-	}
-
-	PropertyInput->Connect(OutputIndex, Expression);
-
-	Material->PostEditChange();
-	Material->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Result->SetStringField(TEXT("expressionName"), ExpressionName);
-	Result->SetStringField(TEXT("expressionClass"), Expression->GetClass()->GetName());
-	Result->SetStringField(TEXT("property"), PropertyName);
-	Result->SetNumberField(TEXT("outputIndex"), OutputIndex);
-
-	// Rollback: disconnect_material_property
-	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-	Payload->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Payload->SetStringField(TEXT("property"), PropertyName);
-	MCPSetRollback(Result, TEXT("disconnect_material_property"), Payload);
-
-	return MCPResult(Result);
-}
-
-TSharedPtr<FJsonValue> FMaterialHandlers::DeleteMaterialExpression(const TSharedPtr<FJsonObject>& Params)
-{
-	FString MaterialPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("path"), MaterialPath)) return Err;
-	if (MaterialPath.IsEmpty())
-	{
-		Params->TryGetStringField(TEXT("assetPath"), MaterialPath);
-		if (MaterialPath.IsEmpty())
-		{
-			return MCPError(TEXT("Missing required parameter 'materialPath' (or 'path')"));
-		}
-	}
-
-	FString ExpressionName;
-	if (auto Err = RequireString(Params, TEXT("expressionName"), ExpressionName)) return Err;
-
-	UMaterial* Material = LoadMaterialFromPath(MaterialPath);
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	UMaterialExpression* Expression = FindExpressionByName(Material, ExpressionName);
-	if (!Expression)
-	{
-		// Idempotent: already deleted
-		auto Noop = MCPSuccess();
-		Noop->SetStringField(TEXT("materialPath"), Material->GetPathName());
-		Noop->SetStringField(TEXT("expressionName"), ExpressionName);
-		Noop->SetBoolField(TEXT("alreadyDeleted"), true);
-		return MCPResult(Noop);
-	}
-
-	FString DeletedClass = Expression->GetClass()->GetName();
-
-	Material->PreEditChange(nullptr);
-
-	// Disconnect all references from other expressions that point to this one
-	for (UMaterialExpression* OtherExpr : Material->GetExpressions())
-	{
-		if (!OtherExpr || OtherExpr == Expression) continue;
-		for (int32 i = 0; ; i++)
-		{
-			FExpressionInput* Input = OtherExpr->GetInput(i);
-			if (!Input) break;
-			if (Input->Expression == Expression)
-			{
-				Input->Expression = nullptr;
-				Input->OutputIndex = 0;
-			}
-		}
-	}
-
-	// Disconnect any material property inputs that reference this expression
-	UMaterialEditorOnlyData* EditorOnlyData = Material->GetEditorOnlyData();
-	if (EditorOnlyData)
-	{
-		auto ClearIfMatch = [Expression](FExpressionInput& Input)
-		{
-			if (Input.Expression == Expression)
-			{
-				Input.Expression = nullptr;
-				Input.OutputIndex = 0;
-			}
-		};
-		ClearIfMatch(EditorOnlyData->BaseColor);
-		ClearIfMatch(EditorOnlyData->Metallic);
-		ClearIfMatch(EditorOnlyData->Specular);
-		ClearIfMatch(EditorOnlyData->Roughness);
-		ClearIfMatch(EditorOnlyData->Anisotropy);
-		ClearIfMatch(EditorOnlyData->EmissiveColor);
-		ClearIfMatch(EditorOnlyData->Opacity);
-		ClearIfMatch(EditorOnlyData->OpacityMask);
-		ClearIfMatch(EditorOnlyData->Normal);
-		ClearIfMatch(EditorOnlyData->Tangent);
-		ClearIfMatch(EditorOnlyData->WorldPositionOffset);
-		ClearIfMatch(EditorOnlyData->SubsurfaceColor);
-		ClearIfMatch(EditorOnlyData->AmbientOcclusion);
-		ClearIfMatch(EditorOnlyData->Refraction);
-		ClearIfMatch(EditorOnlyData->PixelDepthOffset);
-	}
-
-	Material->GetExpressionCollection().RemoveExpression(Expression);
-	Material->PostEditChange();
-	Material->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Result->SetStringField(TEXT("deletedExpression"), ExpressionName);
-	Result->SetStringField(TEXT("deletedClass"), DeletedClass);
-	Result->SetNumberField(TEXT("expressionCount"), Material->GetExpressions().Num());
-	Result->SetBoolField(TEXT("deleted"), true);
-	// No rollback: would require snapshotting the expression and all its connections.
-
-	return MCPResult(Result);
-}
-
-// ---------------------------------------------------------------------------
-// disconnect_material_property -- Clear a material property input (#43)
-// Params: materialPath, property (BaseColor, Normal, Roughness, etc.)
-// ---------------------------------------------------------------------------
-TSharedPtr<FJsonValue> FMaterialHandlers::DisconnectMaterialProperty(const TSharedPtr<FJsonObject>& Params)
-{
-	FString MaterialPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("materialPath"), TEXT("assetPath"), MaterialPath)) return Err;
-
-	FString PropertyName;
-	if (auto Err = RequireString(Params, TEXT("property"), PropertyName)) return Err;
-
-	UMaterial* Material = LoadMaterialFromPath(MaterialPath);
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	UMaterialEditorOnlyData* EditorOnlyData = Material->GetEditorOnlyData();
-	if (!EditorOnlyData)
-	{
-		return MCPError(TEXT("Material has no editor-only data"));
-	}
-
-	Material->PreEditChange(nullptr);
-
-	auto ClearInput = [](FExpressionInput& Input)
-	{
-		Input.Expression = nullptr;
-		Input.OutputIndex = 0;
-	};
-
-	FString LowerProp = PropertyName.ToLower();
-	bool bFound = true;
-
-	if (LowerProp == TEXT("basecolor")) ClearInput(EditorOnlyData->BaseColor);
-	else if (LowerProp == TEXT("metallic")) ClearInput(EditorOnlyData->Metallic);
-	else if (LowerProp == TEXT("specular")) ClearInput(EditorOnlyData->Specular);
-	else if (LowerProp == TEXT("roughness")) ClearInput(EditorOnlyData->Roughness);
-	else if (LowerProp == TEXT("anisotropy")) ClearInput(EditorOnlyData->Anisotropy);
-	else if (LowerProp == TEXT("emissivecolor") || LowerProp == TEXT("emissive")) ClearInput(EditorOnlyData->EmissiveColor);
-	else if (LowerProp == TEXT("opacity")) ClearInput(EditorOnlyData->Opacity);
-	else if (LowerProp == TEXT("opacitymask")) ClearInput(EditorOnlyData->OpacityMask);
-	else if (LowerProp == TEXT("normal")) ClearInput(EditorOnlyData->Normal);
-	else if (LowerProp == TEXT("tangent")) ClearInput(EditorOnlyData->Tangent);
-	else if (LowerProp == TEXT("worldpositionoffset")) ClearInput(EditorOnlyData->WorldPositionOffset);
-	else if (LowerProp == TEXT("subsurfacecolor")) ClearInput(EditorOnlyData->SubsurfaceColor);
-	else if (LowerProp == TEXT("ambientocclusion")) ClearInput(EditorOnlyData->AmbientOcclusion);
-	else if (LowerProp == TEXT("refraction")) ClearInput(EditorOnlyData->Refraction);
-	else if (LowerProp == TEXT("pixeldepthoffset")) ClearInput(EditorOnlyData->PixelDepthOffset);
-	else bFound = false;
-
-	if (!bFound)
-	{
-		return MCPError(FString::Printf(
-			TEXT("Unknown property '%s'. Use: BaseColor, Metallic, Specular, Roughness, EmissiveColor, Opacity, OpacityMask, Normal, Tangent, WorldPositionOffset, SubsurfaceColor, AmbientOcclusion, Refraction, PixelDepthOffset"),
-			*PropertyName));
-	}
-
-	Material->PostEditChange();
-	Material->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("materialPath"), Material->GetPathName());
-	Result->SetStringField(TEXT("property"), PropertyName);
-	// No rollback: we don't capture the previous expression binding before clearing.
-
-	return MCPResult(Result);
 }
 
 // #225: parse a string usage flag into EMaterialUsage. Mirrors the
@@ -2791,26 +1883,12 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterialSimple(const TSharedPtr<
 	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Materials"));
 	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
+	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
-	const FString FullPath = PackagePath + TEXT("/") + Name;
-	if (UEditorAssetLibrary::DoesAssetExist(FullPath))
-	{
-		const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
-		if (OnConflict == TEXT("error"))
-		{
-			return MCPError(FString::Printf(TEXT("Material already exists: %s"), *FullPath));
-		}
-		auto Existed = MCPSuccess();
-		MCPSetExisted(Existed);
-		Existed->SetStringField(TEXT("assetPath"), FullPath);
-		return MCPResult(Existed);
-	}
-
-	IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
 	UMaterialFactoryNew* Factory = NewObject<UMaterialFactoryNew>();
-	UObject* Created = AssetTools.CreateAsset(Name, PackagePath, UMaterial::StaticClass(), Factory);
-	UMaterial* Material = Cast<UMaterial>(Created);
-	if (!Material) return MCPError(TEXT("Failed to create material asset"));
+	auto CreatedRes = MCPCreateAssetIdempotent<UMaterial>(Name, PackagePath, OnConflict, TEXT("Material"), Factory);
+	if (CreatedRes.EarlyReturn) return CreatedRes.EarlyReturn;
+	UMaterial* Material = CreatedRes.Asset;
 
 	auto AddConstant3 = [Material](double R, double G, double B) -> UMaterialExpressionConstant3Vector*
 	{

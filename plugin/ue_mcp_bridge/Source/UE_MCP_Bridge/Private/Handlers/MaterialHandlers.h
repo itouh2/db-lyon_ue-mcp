@@ -23,12 +23,7 @@ private:
 	static TSharedPtr<FJsonValue> RecompileMaterial(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateMaterialInstance(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetMaterialParameter(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> ConnectExpression(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> ConnectMaterialProperty(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> DeleteExpression(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetExpressionValue(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> CreateMaterialFromTexture(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> ReadMaterialInstance(const TSharedPtr<FJsonObject>& Params);
 
 	// Name-based handlers matching TS tool expectations
 	static TSharedPtr<FJsonValue> ConnectTextureToMaterial(const TSharedPtr<FJsonObject>& Params);
@@ -62,6 +57,7 @@ private:
 	static UMaterialExpression* FindExpressionByName(UMaterial* Material, const FString& ExpressionName);
 
 	// v0.7.9 — material depth
+	static TSharedPtr<FJsonValue> CreateMaterialFromTexture(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DuplicateMaterial(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ValidateMaterial(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetMaterialShaderStats(const TSharedPtr<FJsonObject>& Params);

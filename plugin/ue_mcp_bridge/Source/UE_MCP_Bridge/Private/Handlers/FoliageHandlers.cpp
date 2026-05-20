@@ -23,12 +23,11 @@ void FFoliageHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 {
 	Registry.RegisterHandler(TEXT("list_foliage_types"), &ListFoliageTypes);
 	Registry.RegisterHandler(TEXT("sample_foliage"), &SampleFoliage);
-	Registry.RegisterHandler(TEXT("get_foliage_settings"), &GetFoliageSettings);
+	Registry.RegisterHandler(TEXT("get_foliage_type_settings"), &GetFoliageSettings);
 	Registry.RegisterHandler(TEXT("paint_foliage"), &PaintFoliage);
 	Registry.RegisterHandler(TEXT("erase_foliage"), &EraseFoliage);
 	Registry.RegisterHandler(TEXT("sample_foliage_instances"), &SampleFoliageInstances);
 	Registry.RegisterHandler(TEXT("create_foliage_layer"), &CreateFoliageLayer);
-	Registry.RegisterHandler(TEXT("get_foliage_type_settings"), &GetFoliageSettings);
 	Registry.RegisterHandler(TEXT("set_foliage_type_settings"), &SetFoliageTypeSettings);
 	Registry.RegisterHandler(TEXT("create_foliage_type"), &CreateFoliageType);
 }
@@ -81,18 +80,8 @@ TSharedPtr<FJsonValue> FFoliageHandlers::ListFoliageTypes(const TSharedPtr<FJson
 
 TSharedPtr<FJsonValue> FFoliageHandlers::SampleFoliage(const TSharedPtr<FJsonObject>& Params)
 {
-	// Parse center point
-	const TSharedPtr<FJsonObject>* CenterObj = nullptr;
-	if (!Params->TryGetObjectField(TEXT("center"), CenterObj) || !CenterObj || !(*CenterObj).IsValid())
-	{
-		return MCPError(TEXT("Missing 'center' parameter (object with x, y, z)"));
-	}
-
-	double CenterX = 0, CenterY = 0, CenterZ = 0;
-	(*CenterObj)->TryGetNumberField(TEXT("x"), CenterX);
-	(*CenterObj)->TryGetNumberField(TEXT("y"), CenterY);
-	(*CenterObj)->TryGetNumberField(TEXT("z"), CenterZ);
-	FVector Center(CenterX, CenterY, CenterZ);
+	FVector Center;
+	if (auto Err = RequireVec3(Params, TEXT("center"), Center)) return Err;
 
 	double Radius = OptionalNumber(Params, TEXT("radius"), 1000.0);
 	double RadiusSq = Radius * Radius;
@@ -154,13 +143,7 @@ TSharedPtr<FJsonValue> FFoliageHandlers::SampleFoliage(const TSharedPtr<FJsonObj
 	}
 
 	auto Result = MCPSuccess();
-
-	TSharedPtr<FJsonObject> CenterResult = MakeShared<FJsonObject>();
-	CenterResult->SetNumberField(TEXT("x"), CenterX);
-	CenterResult->SetNumberField(TEXT("y"), CenterY);
-	CenterResult->SetNumberField(TEXT("z"), CenterZ);
-
-	Result->SetObjectField(TEXT("center"), CenterResult);
+	Result->SetObjectField(TEXT("center"), MCPVec3ToJsonObject(Center));
 	Result->SetNumberField(TEXT("radius"), Radius);
 	Result->SetNumberField(TEXT("totalCount"), TotalCount);
 	Result->SetArrayField(TEXT("types"), TypesArray);

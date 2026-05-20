@@ -2,6 +2,7 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerJsonProperty.h"
+#include "HandlerAssetCreate.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Subsystems/AssetEditorSubsystem.h"
@@ -162,11 +163,8 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("bulk_rename_assets"), &BulkRename);
 	Registry.RegisterHandler(TEXT("create_data_asset"), &CreateDataAsset);
 	Registry.RegisterHandler(TEXT("save_asset"), &SaveAsset);
+	Registry.RegisterHandler(TEXT("save_all_dirty"), &SaveAllDirty);
 	Registry.RegisterHandler(TEXT("list_textures"), &ListTextures);
-
-	// DataTable handlers
-	Registry.RegisterHandler(TEXT("import_datatable_json"), &ImportDataTableJson);
-	Registry.RegisterHandler(TEXT("export_datatable_json"), &ExportDataTableJson);
 
 	// FBX import handlers
 	Registry.RegisterHandler(TEXT("import_static_mesh"), &ImportStaticMesh);
@@ -174,11 +172,8 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("import_animation"), &ImportAnimation);
 
 	// Texture handlers
-	Registry.RegisterHandler(TEXT("list_texture_properties"), &ListTextureProperties);
-	Registry.RegisterHandler(TEXT("set_texture_properties"), &SetTextureProperties);
 	Registry.RegisterHandler(TEXT("import_texture"), &ImportTexture);
-
-	// Aliases for TS tool compatibility
+	Registry.RegisterHandler(TEXT("import_texture_batch"), &ImportTextureBatch);
 	Registry.RegisterHandler(TEXT("get_texture_info"), &ListTextureProperties);
 	Registry.RegisterHandler(TEXT("set_texture_settings"), &SetTextureProperties);
 
@@ -221,6 +216,7 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 
 	// v1.0.0-rc.3 — #177, #192, #193
 	Registry.RegisterHandler(TEXT("get_mesh_bounds"), &GetMeshBounds);
+	Registry.RegisterHandler(TEXT("get_mesh_info"), &GetMeshInfo);
 	Registry.RegisterHandler(TEXT("read_import_sources"), &ReadImportSources);
 	Registry.RegisterHandler(TEXT("get_mesh_collision"), &GetMeshCollision);
 	Registry.RegisterHandler(TEXT("set_mesh_nav"), &SetMeshNav);
@@ -364,49 +360,36 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReindexAssetsFTS(const TSharedPtr<FJsonOb
 
 TSharedPtr<FJsonValue> FAssetHandlers::ListAssets(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Query = OptionalString(Params, TEXT("query"), TEXT("*"));
-	// Default scope: /Game/ only. Explicit empty string or "*" passed as
-	// directory means "all mounted roots" — agents must opt in deliberately.
-	FString Directory = OptionalString(Params, TEXT("directory"), TEXT("/Game"));
+	const FString Directory = OptionalString(Params, TEXT("directory"), TEXT("/Game"));
 	const bool bRecursive = OptionalBool(Params, TEXT("recursive"), true);
+	const int32 MaxResults = OptionalInt(Params, TEXT("maxResults"), 2000);
+	const FString ClassFilter = OptionalString(Params, TEXT("classFilter"));
 
-	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	TArray<FAssetData> Found;
+	Registry.GetAssetsByPath(FName(*Directory), Found, bRecursive);
 
-	TArray<FAssetData> AssetDataList;
-	if (Directory.IsEmpty() || Directory == TEXT("*") || Directory == TEXT("/"))
+	TArray<TSharedPtr<FJsonValue>> Out;
+	for (const FAssetData& Data : Found)
 	{
-		// Explicit all-mounts request — mirror prior behavior.
-		AssetRegistry.GetAllAssets(AssetDataList);
-	}
-	else
-	{
-		// Strip a trailing slash so "/Game/Foo/" and "/Game/Foo" are equivalent.
-		while (Directory.Len() > 1 && Directory.EndsWith(TEXT("/"))) Directory = Directory.LeftChop(1);
-		FARFilter Filter;
-		Filter.bRecursivePaths = bRecursive;
-		Filter.PackagePaths.Add(FName(*Directory));
-		AssetRegistry.GetAssets(Filter, AssetDataList);
-	}
-
-	TArray<TSharedPtr<FJsonValue>> AssetsArray;
-	for (const FAssetData& AssetData : AssetDataList)
-	{
-		FString AssetPath = AssetData.GetObjectPathString();
-		if (Query == TEXT("*") || AssetPath.Contains(Query))
+		if (Out.Num() >= MaxResults) break;
+		const FString ClassName = Data.AssetClassPath.GetAssetName().ToString();
+		if (!ClassFilter.IsEmpty() && !ClassName.Equals(ClassFilter, ESearchCase::IgnoreCase) && !ClassName.Contains(ClassFilter))
 		{
-			TSharedPtr<FJsonObject> AssetObj = MakeShared<FJsonObject>();
-			AssetObj->SetStringField(TEXT("path"), AssetPath);
-			AssetObj->SetStringField(TEXT("className"), AssetData.AssetClassPath.GetAssetName().ToString());
-			AssetObj->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
-			AssetsArray.Add(MakeShared<FJsonValueObject>(AssetObj));
+			continue;
 		}
+		TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+		Item->SetStringField(TEXT("path"), Data.PackageName.ToString());
+		Item->SetStringField(TEXT("name"), Data.AssetName.ToString());
+		Item->SetStringField(TEXT("className"), ClassName);
+		Out.Add(MakeShared<FJsonValueObject>(Item));
 	}
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("directory"), Directory);
-	Result->SetArrayField(TEXT("assets"), AssetsArray);
-	Result->SetNumberField(TEXT("count"), AssetsArray.Num());
-
+	Result->SetBoolField(TEXT("recursive"), bRecursive);
+	Result->SetNumberField(TEXT("assetCount"), Out.Num());
+	Result->SetArrayField(TEXT("assets"), Out);
 	return MCPResult(Result);
 }
 
@@ -1109,7 +1092,16 @@ TSharedPtr<FJsonValue> FAssetHandlers::RenameAsset(const TSharedPtr<FJsonObject>
 		{
 			SourcePath = AssetPath;
 			FString PackageName, AssetName;
-			AssetPath.Split(TEXT("."), &PackageName, &AssetName, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+			// AssetPath may be either bare ("/Game/Foo/Bar") or object-path form
+			// ("/Game/Foo/Bar.Bar"). When the dot is absent, Split returns false
+			// and leaves both outputs empty - then GetPath of "" yields "" and
+			// DestPath collapses to "/NewName.NewName", dropping the source
+			// folder entirely (#425). Treat the whole input as the package name
+			// in that case.
+			if (!AssetPath.Split(TEXT("."), &PackageName, &AssetName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+			{
+				PackageName = AssetPath;
+			}
 			FString ParentDir = FPaths::GetPath(PackageName);
 			if (ParentDir.IsEmpty()) ParentDir = PackageName;
 			DestPath = FString::Printf(TEXT("%s/%s.%s"), *ParentDir, *NewName, *NewName);
@@ -1601,18 +1593,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateDataAsset(const TSharedPtr<FJsonObj
 
 	const FString FullPath = FString::Printf(TEXT("%s/%s.%s"), *PackagePath, *Name, *Name);
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
-	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("DataAsset")))
-	{
-		return Existing;
-	}
 
-	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-	IAssetTools& AssetTools = AssetToolsModule.Get();
-	UObject* NewAsset = AssetTools.CreateAsset(Name, PackagePath, DataClass, nullptr);
-	if (!NewAsset)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to create DataAsset %s of class %s"), *Name, *DataClass->GetName()));
-	}
+	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("DataAsset"), DataClass, nullptr);
+	if (Created.EarlyReturn) return Created.EarlyReturn;
+	UObject* NewAsset = Created.Asset;
 
 	// Optional properties object — use recursive JSON-to-property setter so that
 	// TArray<FStruct> with nested UObject refs, FGameplayTag, etc. all work (#196, #199).
@@ -1686,6 +1670,20 @@ TSharedPtr<FJsonValue> FAssetHandlers::SaveAsset(const TSharedPtr<FJsonObject>& 
 	}
 }
 
+TSharedPtr<FJsonValue> FAssetHandlers::SaveAllDirty(const TSharedPtr<FJsonObject>& Params)
+{
+	const bool bSaveMapPackages = OptionalBool(Params, TEXT("saveMapPackages"), true);
+	const bool bSaveContentPackages = OptionalBool(Params, TEXT("saveContentPackages"), true);
+
+	const bool bOk = UEditorLoadingAndSavingUtils::SaveDirtyPackages(bSaveMapPackages, bSaveContentPackages);
+
+	auto Result = MCPSuccess();
+	Result->SetBoolField(TEXT("saveMapPackages"), bSaveMapPackages);
+	Result->SetBoolField(TEXT("saveContentPackages"), bSaveContentPackages);
+	Result->SetBoolField(TEXT("savedAll"), bOk);
+	return MCPResult(Result);
+}
+
 TSharedPtr<FJsonValue> FAssetHandlers::ListTextures(const TSharedPtr<FJsonObject>& Params)
 {
 	FString Directory = OptionalString(Params, TEXT("directory"), TEXT("/Game/"));
@@ -1715,656 +1713,6 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListTextures(const TSharedPtr<FJsonObject
 	Result->SetNumberField(TEXT("count"), TexturesArray.Num());
 	return MCPResult(Result);
 }
-TSharedPtr<FJsonValue> FAssetHandlers::SetMeshMaterial(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
-
-	FString MaterialPath;
-	if (auto Err = RequireString(Params, TEXT("materialPath"), MaterialPath)) return Err;
-
-	int32 SlotIndex = OptionalInt(Params, TEXT("slotIndex"), 0);
-
-	UStaticMesh* Mesh = Cast<UStaticMesh>(StaticLoadObject(UStaticMesh::StaticClass(), nullptr, *AssetPath));
-	if (!Mesh)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load static mesh at '%s'"), *AssetPath));
-	}
-
-	UMaterialInterface* Material = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, *MaterialPath));
-	if (!Material)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load material at '%s'"), *MaterialPath));
-	}
-
-	if (SlotIndex < 0 || SlotIndex >= Mesh->GetStaticMaterials().Num())
-	{
-		return MCPError(FString::Printf(TEXT("Slot index %d out of range (mesh has %d slots)"), SlotIndex, Mesh->GetStaticMaterials().Num()));
-	}
-
-	// Capture previous material for self-inverse rollback.
-	FString PreviousMaterialPath;
-	if (UMaterialInterface* Prev = Mesh->GetMaterial(SlotIndex))
-	{
-		PreviousMaterialPath = Prev->GetPathName();
-	}
-
-	Mesh->SetMaterial(SlotIndex, Material);
-	UEditorAssetLibrary::SaveAsset(AssetPath, false);
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("assetPath"), AssetPath);
-	Result->SetStringField(TEXT("materialPath"), MaterialPath);
-	Result->SetNumberField(TEXT("slotIndex"), SlotIndex);
-	Result->SetStringField(TEXT("previousMaterialPath"), PreviousMaterialPath);
-
-	if (!PreviousMaterialPath.IsEmpty())
-	{
-		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-		Payload->SetStringField(TEXT("assetPath"), AssetPath);
-		Payload->SetStringField(TEXT("materialPath"), PreviousMaterialPath);
-		Payload->SetNumberField(TEXT("slotIndex"), SlotIndex);
-		MCPSetRollback(Result, TEXT("set_mesh_material"), Payload);
-	}
-
-	return MCPResult(Result);
-}
-TSharedPtr<FJsonValue> FAssetHandlers::RecenterPivot(const TSharedPtr<FJsonObject>& Params)
-{
-	// Support single assetPath or array of assetPaths
-	TArray<FString> AssetPaths;
-	const TArray<TSharedPtr<FJsonValue>>* PathsArray = nullptr;
-	FString SinglePath;
-
-	if (Params->TryGetArrayField(TEXT("assetPaths"), PathsArray))
-	{
-		for (const auto& Val : *PathsArray)
-		{
-			FString P;
-			if (Val->TryGetString(P) && !P.IsEmpty())
-			{
-				AssetPaths.Add(P);
-			}
-		}
-	}
-	else if (Params->TryGetStringField(TEXT("assetPath"), SinglePath) || Params->TryGetStringField(TEXT("path"), SinglePath))
-	{
-		if (!SinglePath.IsEmpty())
-		{
-			AssetPaths.Add(SinglePath);
-		}
-	}
-
-	if (AssetPaths.Num() == 0)
-	{
-		return MCPError(TEXT("Missing 'assetPath' (string) or 'assetPaths' (array of strings)"));
-	}
-
-	// Load all meshes
-	TArray<UStaticMesh*> Meshes;
-	for (const FString& Path : AssetPaths)
-	{
-		UStaticMesh* Mesh = Cast<UStaticMesh>(StaticLoadObject(UStaticMesh::StaticClass(), nullptr, *Path));
-		if (!Mesh)
-		{
-			return MCPError(FString::Printf(TEXT("Failed to load static mesh at '%s'"), *Path));
-		}
-		Meshes.Add(Mesh);
-	}
-
-	// Compute the center from the FIRST mesh (reference mesh)
-	FMeshDescription* RefDesc = Meshes[0]->GetMeshDescription(0);
-	if (!RefDesc)
-	{
-		return MCPError(TEXT("Failed to get mesh description for reference mesh LOD 0"));
-	}
-
-	FVertexArray& RefVerts = RefDesc->Vertices();
-	TVertexAttributesRef<FVector3f> RefPositions = RefDesc->GetVertexPositions();
-
-	FVector3f Center = FVector3f::ZeroVector;
-	int32 RefVertCount = RefVerts.Num();
-	if (RefVertCount == 0)
-	{
-		return MCPError(TEXT("Reference mesh has no vertices"));
-	}
-
-	for (FVertexID VertID : RefVerts.GetElementIDs())
-	{
-		Center += RefPositions[VertID];
-	}
-	Center /= (float)RefVertCount;
-
-	// Apply the SAME offset to ALL meshes
-	TArray<TSharedPtr<FJsonValue>> ResultArray;
-	for (int32 i = 0; i < Meshes.Num(); i++)
-	{
-		FMeshDescription* MeshDesc = Meshes[i]->GetMeshDescription(0);
-		if (!MeshDesc) continue;
-
-		FVertexArray& Verts = MeshDesc->Vertices();
-		TVertexAttributesRef<FVector3f> Positions = MeshDesc->GetVertexPositions();
-
-		for (FVertexID VertID : Verts.GetElementIDs())
-		{
-			Positions[VertID] -= Center;
-		}
-
-		Meshes[i]->CommitMeshDescription(0);
-		Meshes[i]->Build(false);
-		Meshes[i]->PostEditChange();
-		Meshes[i]->MarkPackageDirty();
-		UEditorAssetLibrary::SaveAsset(AssetPaths[i], false);
-
-		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
-		Entry->SetStringField(TEXT("assetPath"), AssetPaths[i]);
-		Entry->SetNumberField(TEXT("vertexCount"), Verts.Num());
-		ResultArray.Add(MakeShared<FJsonValueObject>(Entry));
-	}
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetArrayField(TEXT("meshes"), ResultArray);
-	Result->SetStringField(TEXT("offsetApplied"), FString::Printf(TEXT("(%.2f, %.2f, %.2f)"), Center.X, Center.Y, Center.Z));
-	Result->SetNumberField(TEXT("meshCount"), Meshes.Num());
-	// No rollback: destructive/external — vertex offsets applied non-idempotently;
-	// re-running shifts the pivot again. Not natural-key idempotent.
-
-	return MCPResult(Result);
-}
-TSharedPtr<FJsonValue> FAssetHandlers::AddSocket(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;
-	FString SocketName;
-	if (auto Err = RequireString(Params, TEXT("socketName"), SocketName)) return Err;
-
-	FVector RelLoc = FVector::ZeroVector;
-	FRotator RelRot = FRotator::ZeroRotator;
-	FVector RelScale = FVector::OneVector;
-
-	if (const TSharedPtr<FJsonObject>* LocObj; Params->TryGetObjectField(TEXT("relativeLocation"), LocObj))
-	{
-		RelLoc.X = (*LocObj)->GetNumberField(TEXT("x"));
-		RelLoc.Y = (*LocObj)->GetNumberField(TEXT("y"));
-		RelLoc.Z = (*LocObj)->GetNumberField(TEXT("z"));
-	}
-	if (const TSharedPtr<FJsonObject>* RotObj; Params->TryGetObjectField(TEXT("relativeRotation"), RotObj))
-	{
-		RelRot.Pitch = (*RotObj)->GetNumberField(TEXT("pitch"));
-		RelRot.Yaw   = (*RotObj)->GetNumberField(TEXT("yaw"));
-		RelRot.Roll  = (*RotObj)->GetNumberField(TEXT("roll"));
-	}
-	if (const TSharedPtr<FJsonObject>* ScaleObj; Params->TryGetObjectField(TEXT("relativeScale"), ScaleObj))
-	{
-		RelScale.X = (*ScaleObj)->GetNumberField(TEXT("x"));
-		RelScale.Y = (*ScaleObj)->GetNumberField(TEXT("y"));
-		RelScale.Z = (*ScaleObj)->GetNumberField(TEXT("z"));
-	}
-
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
-	}
-
-	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
-
-	// Track which transform fields the caller actually supplied so onConflict=update
-	// only overwrites what was passed in (matches set_socket_transform semantics).
-	const bool bHasLoc   = Params->HasField(TEXT("relativeLocation"));
-	const bool bHasRot   = Params->HasField(TEXT("relativeRotation"));
-	const bool bHasScale = Params->HasField(TEXT("relativeScale"));
-
-	// Try StaticMesh first
-	if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
-	{
-		for (UStaticMeshSocket* Existing : SM->Sockets)
-		{
-			if (Existing && Existing->SocketName == FName(*SocketName))
-			{
-				if (OnConflict == TEXT("error"))
-				{
-					return MCPError(FString::Printf(TEXT("Socket '%s' already exists"), *SocketName));
-				}
-				if (OnConflict == TEXT("update"))
-				{
-					const FVector PrevLoc = Existing->RelativeLocation;
-					const FRotator PrevRot = Existing->RelativeRotation;
-					const FVector PrevScale = Existing->RelativeScale;
-					SM->Modify();
-					Existing->Modify();
-					if (bHasLoc)   Existing->RelativeLocation = RelLoc;
-					if (bHasRot)   Existing->RelativeRotation = RelRot;
-					if (bHasScale) Existing->RelativeScale = RelScale;
-					SM->MarkPackageDirty();
-
-					auto UpdatedResult = MCPSuccess();
-					MCPSetUpdated(UpdatedResult);
-					UpdatedResult->SetStringField(TEXT("socketName"), SocketName);
-					UpdatedResult->SetStringField(TEXT("meshType"), TEXT("StaticMesh"));
-
-					// Rollback: restore the previous transform via set_socket_transform.
-					TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-					Payload->SetStringField(TEXT("assetPath"), AssetPath);
-					Payload->SetStringField(TEXT("socketName"), SocketName);
-					TSharedPtr<FJsonObject> PrevLocObj = MakeShared<FJsonObject>();
-					PrevLocObj->SetNumberField(TEXT("x"), PrevLoc.X);
-					PrevLocObj->SetNumberField(TEXT("y"), PrevLoc.Y);
-					PrevLocObj->SetNumberField(TEXT("z"), PrevLoc.Z);
-					Payload->SetObjectField(TEXT("relativeLocation"), PrevLocObj);
-					TSharedPtr<FJsonObject> PrevRotObj = MakeShared<FJsonObject>();
-					PrevRotObj->SetNumberField(TEXT("pitch"), PrevRot.Pitch);
-					PrevRotObj->SetNumberField(TEXT("yaw"), PrevRot.Yaw);
-					PrevRotObj->SetNumberField(TEXT("roll"), PrevRot.Roll);
-					Payload->SetObjectField(TEXT("relativeRotation"), PrevRotObj);
-					TSharedPtr<FJsonObject> PrevScaleObj = MakeShared<FJsonObject>();
-					PrevScaleObj->SetNumberField(TEXT("x"), PrevScale.X);
-					PrevScaleObj->SetNumberField(TEXT("y"), PrevScale.Y);
-					PrevScaleObj->SetNumberField(TEXT("z"), PrevScale.Z);
-					Payload->SetObjectField(TEXT("relativeScale"), PrevScaleObj);
-					MCPSetRollback(UpdatedResult, TEXT("set_socket_transform"), Payload);
-					return MCPResult(UpdatedResult);
-				}
-				auto ExistingResult = MCPSuccess();
-				MCPSetExisted(ExistingResult);
-				ExistingResult->SetStringField(TEXT("socketName"), SocketName);
-				ExistingResult->SetStringField(TEXT("meshType"), TEXT("StaticMesh"));
-				return MCPResult(ExistingResult);
-			}
-		}
-
-		UStaticMeshSocket* NewSocket = NewObject<UStaticMeshSocket>(SM);
-		NewSocket->SocketName = FName(*SocketName);
-		NewSocket->RelativeLocation = RelLoc;
-		NewSocket->RelativeRotation = RelRot;
-		NewSocket->RelativeScale = RelScale;
-		SM->Modify();
-		SM->Sockets.Add(NewSocket);
-		SM->MarkPackageDirty();
-
-		auto Result = MCPSuccess();
-		MCPSetCreated(Result);
-		Result->SetStringField(TEXT("socketName"), SocketName);
-		Result->SetStringField(TEXT("meshType"), TEXT("StaticMesh"));
-		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-		Payload->SetStringField(TEXT("assetPath"), AssetPath);
-		Payload->SetStringField(TEXT("socketName"), SocketName);
-		MCPSetRollback(Result, TEXT("remove_socket"), Payload);
-		return MCPResult(Result);
-	}
-
-	// Try SkeletalMesh
-	if (USkeletalMesh* SKM = Cast<USkeletalMesh>(Asset))
-	{
-		FString BoneName = OptionalString(Params, TEXT("boneName"), TEXT("root"));
-
-		for (USkeletalMeshSocket* Existing : SKM->GetMeshOnlySocketList())
-		{
-			if (Existing && Existing->SocketName == FName(*SocketName))
-			{
-				if (OnConflict == TEXT("error"))
-				{
-					return MCPError(FString::Printf(TEXT("Socket '%s' already exists"), *SocketName));
-				}
-				if (OnConflict == TEXT("update"))
-				{
-					const FVector PrevLoc = Existing->RelativeLocation;
-					const FRotator PrevRot = Existing->RelativeRotation;
-					const FVector PrevScale = Existing->RelativeScale;
-					SKM->Modify();
-					Existing->Modify();
-					if (bHasLoc)   Existing->RelativeLocation = RelLoc;
-					if (bHasRot)   Existing->RelativeRotation = RelRot;
-					if (bHasScale) Existing->RelativeScale = RelScale;
-					SKM->MarkPackageDirty();
-					SKM->PostEditChange();
-
-					auto UpdatedResult = MCPSuccess();
-					MCPSetUpdated(UpdatedResult);
-					UpdatedResult->SetStringField(TEXT("socketName"), SocketName);
-					UpdatedResult->SetStringField(TEXT("meshType"), TEXT("SkeletalMesh"));
-
-					TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-					Payload->SetStringField(TEXT("assetPath"), AssetPath);
-					Payload->SetStringField(TEXT("socketName"), SocketName);
-					TSharedPtr<FJsonObject> PrevLocObj = MakeShared<FJsonObject>();
-					PrevLocObj->SetNumberField(TEXT("x"), PrevLoc.X);
-					PrevLocObj->SetNumberField(TEXT("y"), PrevLoc.Y);
-					PrevLocObj->SetNumberField(TEXT("z"), PrevLoc.Z);
-					Payload->SetObjectField(TEXT("relativeLocation"), PrevLocObj);
-					TSharedPtr<FJsonObject> PrevRotObj = MakeShared<FJsonObject>();
-					PrevRotObj->SetNumberField(TEXT("pitch"), PrevRot.Pitch);
-					PrevRotObj->SetNumberField(TEXT("yaw"), PrevRot.Yaw);
-					PrevRotObj->SetNumberField(TEXT("roll"), PrevRot.Roll);
-					Payload->SetObjectField(TEXT("relativeRotation"), PrevRotObj);
-					TSharedPtr<FJsonObject> PrevScaleObj = MakeShared<FJsonObject>();
-					PrevScaleObj->SetNumberField(TEXT("x"), PrevScale.X);
-					PrevScaleObj->SetNumberField(TEXT("y"), PrevScale.Y);
-					PrevScaleObj->SetNumberField(TEXT("z"), PrevScale.Z);
-					Payload->SetObjectField(TEXT("relativeScale"), PrevScaleObj);
-					MCPSetRollback(UpdatedResult, TEXT("set_socket_transform"), Payload);
-					return MCPResult(UpdatedResult);
-				}
-				auto ExistingResult = MCPSuccess();
-				MCPSetExisted(ExistingResult);
-				ExistingResult->SetStringField(TEXT("socketName"), SocketName);
-				ExistingResult->SetStringField(TEXT("meshType"), TEXT("SkeletalMesh"));
-				return MCPResult(ExistingResult);
-			}
-		}
-
-		USkeletalMeshSocket* NewSocket = NewObject<USkeletalMeshSocket>(SKM);
-		NewSocket->SocketName = FName(*SocketName);
-		NewSocket->BoneName = FName(*BoneName);
-		NewSocket->RelativeLocation = RelLoc;
-		NewSocket->RelativeRotation = RelRot;
-		NewSocket->RelativeScale = RelScale;
-		SKM->GetMeshOnlySocketList().Add(NewSocket);
-		SKM->MarkPackageDirty();
-		SKM->PostEditChange();
-
-		auto Result = MCPSuccess();
-		MCPSetCreated(Result);
-		Result->SetStringField(TEXT("socketName"), SocketName);
-		Result->SetStringField(TEXT("boneName"), BoneName);
-		Result->SetStringField(TEXT("meshType"), TEXT("SkeletalMesh"));
-		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-		Payload->SetStringField(TEXT("assetPath"), AssetPath);
-		Payload->SetStringField(TEXT("socketName"), SocketName);
-		MCPSetRollback(Result, TEXT("remove_socket"), Payload);
-		return MCPResult(Result);
-	}
-
-	return MCPError(FString::Printf(TEXT("'%s' is not a StaticMesh or SkeletalMesh"), *AssetPath));
-}
-
-TSharedPtr<FJsonValue> FAssetHandlers::RemoveSocket(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;
-	FString SocketName;
-	if (auto Err = RequireString(Params, TEXT("socketName"), SocketName)) return Err;
-
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
-	}
-
-	if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
-	{
-		for (int32 i = 0; i < SM->Sockets.Num(); ++i)
-		{
-			if (SM->Sockets[i] && SM->Sockets[i]->SocketName == FName(*SocketName))
-			{
-				SM->Modify();
-				SM->Sockets.RemoveAt(i);
-				SM->MarkPackageDirty();
-
-				auto Result = MCPSuccess();
-				Result->SetStringField(TEXT("removed"), SocketName);
-				Result->SetBoolField(TEXT("deleted"), true);
-				return MCPResult(Result);
-			}
-		}
-		// Idempotent: socket already absent.
-		auto Noop = MCPSuccess();
-		Noop->SetStringField(TEXT("socketName"), SocketName);
-		Noop->SetBoolField(TEXT("alreadyDeleted"), true);
-		return MCPResult(Noop);
-	}
-
-	if (USkeletalMesh* SKM = Cast<USkeletalMesh>(Asset))
-	{
-		auto& Sockets = SKM->GetMeshOnlySocketList();
-		for (int32 i = 0; i < Sockets.Num(); ++i)
-		{
-			if (Sockets[i] && Sockets[i]->SocketName == FName(*SocketName))
-			{
-				Sockets.RemoveAt(i);
-				SKM->MarkPackageDirty();
-				SKM->PostEditChange();
-
-				auto Result = MCPSuccess();
-				Result->SetStringField(TEXT("removed"), SocketName);
-				Result->SetBoolField(TEXT("deleted"), true);
-				return MCPResult(Result);
-			}
-		}
-		auto Noop = MCPSuccess();
-		Noop->SetStringField(TEXT("socketName"), SocketName);
-		Noop->SetBoolField(TEXT("alreadyDeleted"), true);
-		return MCPResult(Noop);
-	}
-
-	return MCPError(FString::Printf(TEXT("'%s' is not a StaticMesh or SkeletalMesh"), *AssetPath));
-}
-
-TSharedPtr<FJsonValue> FAssetHandlers::ListSockets(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;
-
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
-	}
-
-	auto Result = MCPSuccess();
-	TArray<TSharedPtr<FJsonValue>> SocketArray;
-
-	if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
-	{
-		for (UStaticMeshSocket* Socket : SM->Sockets)
-		{
-			if (!Socket) continue;
-			TSharedPtr<FJsonObject> S = MakeShared<FJsonObject>();
-			S->SetStringField(TEXT("name"), Socket->SocketName.ToString());
-			S->SetStringField(TEXT("tag"), Socket->Tag);
-
-			TSharedPtr<FJsonObject> Loc = MakeShared<FJsonObject>();
-			Loc->SetNumberField(TEXT("x"), Socket->RelativeLocation.X);
-			Loc->SetNumberField(TEXT("y"), Socket->RelativeLocation.Y);
-			Loc->SetNumberField(TEXT("z"), Socket->RelativeLocation.Z);
-			S->SetObjectField(TEXT("relativeLocation"), Loc);
-
-			TSharedPtr<FJsonObject> Rot = MakeShared<FJsonObject>();
-			Rot->SetNumberField(TEXT("pitch"), Socket->RelativeRotation.Pitch);
-			Rot->SetNumberField(TEXT("yaw"), Socket->RelativeRotation.Yaw);
-			Rot->SetNumberField(TEXT("roll"), Socket->RelativeRotation.Roll);
-			S->SetObjectField(TEXT("relativeRotation"), Rot);
-
-			TSharedPtr<FJsonObject> Scale = MakeShared<FJsonObject>();
-			Scale->SetNumberField(TEXT("x"), Socket->RelativeScale.X);
-			Scale->SetNumberField(TEXT("y"), Socket->RelativeScale.Y);
-			Scale->SetNumberField(TEXT("z"), Socket->RelativeScale.Z);
-			S->SetObjectField(TEXT("relativeScale"), Scale);
-
-			SocketArray.Add(MakeShared<FJsonValueObject>(S));
-		}
-		Result->SetStringField(TEXT("meshType"), TEXT("StaticMesh"));
-	}
-	else if (USkeletalMesh* SKM = Cast<USkeletalMesh>(Asset))
-	{
-		for (USkeletalMeshSocket* Socket : SKM->GetMeshOnlySocketList())
-		{
-			if (!Socket) continue;
-			TSharedPtr<FJsonObject> S = MakeShared<FJsonObject>();
-			S->SetStringField(TEXT("name"), Socket->SocketName.ToString());
-			S->SetStringField(TEXT("boneName"), Socket->BoneName.ToString());
-
-			TSharedPtr<FJsonObject> Loc = MakeShared<FJsonObject>();
-			Loc->SetNumberField(TEXT("x"), Socket->RelativeLocation.X);
-			Loc->SetNumberField(TEXT("y"), Socket->RelativeLocation.Y);
-			Loc->SetNumberField(TEXT("z"), Socket->RelativeLocation.Z);
-			S->SetObjectField(TEXT("relativeLocation"), Loc);
-
-			TSharedPtr<FJsonObject> Rot = MakeShared<FJsonObject>();
-			Rot->SetNumberField(TEXT("pitch"), Socket->RelativeRotation.Pitch);
-			Rot->SetNumberField(TEXT("yaw"), Socket->RelativeRotation.Yaw);
-			Rot->SetNumberField(TEXT("roll"), Socket->RelativeRotation.Roll);
-			S->SetObjectField(TEXT("relativeRotation"), Rot);
-
-			TSharedPtr<FJsonObject> Scale = MakeShared<FJsonObject>();
-			Scale->SetNumberField(TEXT("x"), Socket->RelativeScale.X);
-			Scale->SetNumberField(TEXT("y"), Socket->RelativeScale.Y);
-			Scale->SetNumberField(TEXT("z"), Socket->RelativeScale.Z);
-			S->SetObjectField(TEXT("relativeScale"), Scale);
-
-			SocketArray.Add(MakeShared<FJsonValueObject>(S));
-		}
-		Result->SetStringField(TEXT("meshType"), TEXT("SkeletalMesh"));
-	}
-	else
-	{
-		return MCPError(FString::Printf(TEXT("'%s' is not a StaticMesh or SkeletalMesh"), *AssetPath));
-	}
-
-	Result->SetStringField(TEXT("assetPath"), AssetPath);
-	Result->SetNumberField(TEXT("socketCount"), SocketArray.Num());
-	Result->SetArrayField(TEXT("sockets"), SocketArray);
-
-	return MCPResult(Result);
-}
-
-// ---------------------------------------------------------------------------
-// set_socket_transform -- Update an existing socket's relative transform on a
-// StaticMesh or SkeletalMesh. FBX-imported SOCKET_* empties commonly land with
-// relative_scale=(100,100,100) and need to be corrected without recreating
-// the socket (#412).
-// ---------------------------------------------------------------------------
-TSharedPtr<FJsonValue> FAssetHandlers::SetSocketTransform(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;
-	FString SocketName;
-	if (auto Err = RequireString(Params, TEXT("socketName"), SocketName)) return Err;
-
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
-	}
-
-	// Optional transform components — only fields that are passed are written.
-	const bool bHasLoc = Params->HasField(TEXT("relativeLocation"));
-	const bool bHasRot = Params->HasField(TEXT("relativeRotation"));
-	const bool bHasScale = Params->HasField(TEXT("relativeScale"));
-	if (!bHasLoc && !bHasRot && !bHasScale)
-	{
-		return MCPError(TEXT("Pass at least one of relativeLocation, relativeRotation, relativeScale"));
-	}
-
-	FVector NewLoc = FVector::ZeroVector;
-	FRotator NewRot = FRotator::ZeroRotator;
-	FVector NewScale = FVector::OneVector;
-	if (const TSharedPtr<FJsonObject>* LocObj; Params->TryGetObjectField(TEXT("relativeLocation"), LocObj))
-	{
-		NewLoc.X = (*LocObj)->GetNumberField(TEXT("x"));
-		NewLoc.Y = (*LocObj)->GetNumberField(TEXT("y"));
-		NewLoc.Z = (*LocObj)->GetNumberField(TEXT("z"));
-	}
-	if (const TSharedPtr<FJsonObject>* RotObj; Params->TryGetObjectField(TEXT("relativeRotation"), RotObj))
-	{
-		NewRot.Pitch = (*RotObj)->GetNumberField(TEXT("pitch"));
-		NewRot.Yaw   = (*RotObj)->GetNumberField(TEXT("yaw"));
-		NewRot.Roll  = (*RotObj)->GetNumberField(TEXT("roll"));
-	}
-	if (const TSharedPtr<FJsonObject>* ScaleObj; Params->TryGetObjectField(TEXT("relativeScale"), ScaleObj))
-	{
-		NewScale.X = (*ScaleObj)->GetNumberField(TEXT("x"));
-		NewScale.Y = (*ScaleObj)->GetNumberField(TEXT("y"));
-		NewScale.Z = (*ScaleObj)->GetNumberField(TEXT("z"));
-	}
-
-	// Build the rollback payload from the pre-change values so we can restore.
-	auto BuildRollback = [&](const FVector& PrevLoc, const FRotator& PrevRot, const FVector& PrevScale)
-	{
-		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
-		Payload->SetStringField(TEXT("assetPath"), AssetPath);
-		Payload->SetStringField(TEXT("socketName"), SocketName);
-		TSharedPtr<FJsonObject> PrevLocObj = MakeShared<FJsonObject>();
-		PrevLocObj->SetNumberField(TEXT("x"), PrevLoc.X);
-		PrevLocObj->SetNumberField(TEXT("y"), PrevLoc.Y);
-		PrevLocObj->SetNumberField(TEXT("z"), PrevLoc.Z);
-		Payload->SetObjectField(TEXT("relativeLocation"), PrevLocObj);
-		TSharedPtr<FJsonObject> PrevRotObj = MakeShared<FJsonObject>();
-		PrevRotObj->SetNumberField(TEXT("pitch"), PrevRot.Pitch);
-		PrevRotObj->SetNumberField(TEXT("yaw"), PrevRot.Yaw);
-		PrevRotObj->SetNumberField(TEXT("roll"), PrevRot.Roll);
-		Payload->SetObjectField(TEXT("relativeRotation"), PrevRotObj);
-		TSharedPtr<FJsonObject> PrevScaleObj = MakeShared<FJsonObject>();
-		PrevScaleObj->SetNumberField(TEXT("x"), PrevScale.X);
-		PrevScaleObj->SetNumberField(TEXT("y"), PrevScale.Y);
-		PrevScaleObj->SetNumberField(TEXT("z"), PrevScale.Z);
-		Payload->SetObjectField(TEXT("relativeScale"), PrevScaleObj);
-		return Payload;
-	};
-
-	if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
-	{
-		for (UStaticMeshSocket* Existing : SM->Sockets)
-		{
-			if (Existing && Existing->SocketName == FName(*SocketName))
-			{
-				const FVector PrevLoc = Existing->RelativeLocation;
-				const FRotator PrevRot = Existing->RelativeRotation;
-				const FVector PrevScale = Existing->RelativeScale;
-				SM->Modify();
-				Existing->Modify();
-				if (bHasLoc)   Existing->RelativeLocation = NewLoc;
-				if (bHasRot)   Existing->RelativeRotation = NewRot;
-				if (bHasScale) Existing->RelativeScale = NewScale;
-				SM->MarkPackageDirty();
-
-				auto Result = MCPSuccess();
-				MCPSetUpdated(Result);
-				Result->SetStringField(TEXT("socketName"), SocketName);
-				Result->SetStringField(TEXT("meshType"), TEXT("StaticMesh"));
-				MCPSetRollback(Result, TEXT("set_socket_transform"), BuildRollback(PrevLoc, PrevRot, PrevScale));
-				return MCPResult(Result);
-			}
-		}
-		return MCPError(FString::Printf(TEXT("Socket '%s' not found on StaticMesh '%s'"), *SocketName, *AssetPath));
-	}
-
-	if (USkeletalMesh* SKM = Cast<USkeletalMesh>(Asset))
-	{
-		for (USkeletalMeshSocket* Existing : SKM->GetMeshOnlySocketList())
-		{
-			if (Existing && Existing->SocketName == FName(*SocketName))
-			{
-				const FVector PrevLoc = Existing->RelativeLocation;
-				const FRotator PrevRot = Existing->RelativeRotation;
-				const FVector PrevScale = Existing->RelativeScale;
-				SKM->Modify();
-				Existing->Modify();
-				if (bHasLoc)   Existing->RelativeLocation = NewLoc;
-				if (bHasRot)   Existing->RelativeRotation = NewRot;
-				if (bHasScale) Existing->RelativeScale = NewScale;
-				SKM->MarkPackageDirty();
-				SKM->PostEditChange();
-
-				auto Result = MCPSuccess();
-				MCPSetUpdated(Result);
-				Result->SetStringField(TEXT("socketName"), SocketName);
-				Result->SetStringField(TEXT("meshType"), TEXT("SkeletalMesh"));
-				MCPSetRollback(Result, TEXT("set_socket_transform"), BuildRollback(PrevLoc, PrevRot, PrevScale));
-				return MCPResult(Result);
-			}
-		}
-		return MCPError(FString::Printf(TEXT("Socket '%s' not found on SkeletalMesh '%s'"), *SocketName, *AssetPath));
-	}
-
-	return MCPError(FString::Printf(TEXT("'%s' is not a StaticMesh or SkeletalMesh"), *AssetPath));
-}
-
-// ---------------------------------------------------------------------------
-// reload_package -- Force reload an asset package from disk (#53)
-// ---------------------------------------------------------------------------
 TSharedPtr<FJsonValue> FAssetHandlers::ReloadPackage(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
@@ -2448,118 +1796,6 @@ TSharedPtr<FJsonValue> FAssetHandlers::GetReferencers(const TSharedPtr<FJsonObje
 	Result->SetNumberField(TEXT("queriedPackages"), Packages.Num());
 	return MCPResult(Result);
 }
-
-// ─── #155 asset(set_sk_material_slots) ──────────────────────────────
-// Blueprint component property writes to SkeletalMeshComponent.OverrideMaterials
-// are silently reverted by UE's ICH pipeline; the reliable path is to mutate
-// USkeletalMesh.Materials directly. Accepts either slotName or slotIndex per
-// entry. Missing slot names are reported, not skipped silently.
-TSharedPtr<FJsonValue> FAssetHandlers::SetSkeletalMeshMaterialSlots(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
-
-	const TArray<TSharedPtr<FJsonValue>>* SlotsArr = nullptr;
-	if (!Params->TryGetArrayField(TEXT("slots"), SlotsArr))
-	{
-		return MCPError(TEXT("Missing 'slots' array parameter"));
-	}
-
-	USkeletalMesh* Mesh = Cast<USkeletalMesh>(StaticLoadObject(USkeletalMesh::StaticClass(), nullptr, *AssetPath));
-	if (!Mesh) return MCPError(FString::Printf(TEXT("SkeletalMesh not found: %s"), *AssetPath));
-
-	Mesh->Modify();
-	TArray<FSkeletalMaterial> Materials = Mesh->GetMaterials();
-
-	TArray<TSharedPtr<FJsonValue>> Applied;
-	TArray<FString> Errors;
-
-	for (const TSharedPtr<FJsonValue>& SlotVal : *SlotsArr)
-	{
-		const TSharedPtr<FJsonObject>* SlotObjPtr = nullptr;
-		if (!SlotVal.IsValid() || !SlotVal->TryGetObject(SlotObjPtr)) continue;
-		const TSharedPtr<FJsonObject>& Slot = *SlotObjPtr;
-
-		FString MaterialPath;
-		if (!Slot->TryGetStringField(TEXT("materialPath"), MaterialPath))
-		{
-			Errors.Add(TEXT("slot entry missing 'materialPath'"));
-			continue;
-		}
-
-		UMaterialInterface* Material = Cast<UMaterialInterface>(StaticLoadObject(UMaterialInterface::StaticClass(), nullptr, *MaterialPath));
-		if (!Material)
-		{
-			Errors.Add(FString::Printf(TEXT("material not found: %s"), *MaterialPath));
-			continue;
-		}
-
-		int32 Index = INDEX_NONE;
-		double SlotIdxNum = 0;
-		if (Slot->TryGetNumberField(TEXT("slotIndex"), SlotIdxNum))
-		{
-			Index = (int32)SlotIdxNum;
-		}
-		else
-		{
-			FString SlotName;
-			if (Slot->TryGetStringField(TEXT("slotName"), SlotName))
-			{
-				const FName Target(*SlotName);
-				for (int32 I = 0; I < Materials.Num(); ++I)
-				{
-					if (Materials[I].MaterialSlotName == Target)
-					{
-						Index = I; break;
-					}
-				}
-				if (Index == INDEX_NONE)
-				{
-					Errors.Add(FString::Printf(TEXT("slotName '%s' not found on %s"), *SlotName, *AssetPath));
-					continue;
-				}
-			}
-		}
-
-		if (Index < 0 || Index >= Materials.Num())
-		{
-			Errors.Add(FString::Printf(TEXT("slotIndex %d out of range (mesh has %d slots)"), Index, Materials.Num()));
-			continue;
-		}
-
-		Materials[Index].MaterialInterface = Material;
-
-		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
-		Entry->SetNumberField(TEXT("slotIndex"), Index);
-		Entry->SetStringField(TEXT("slotName"), Materials[Index].MaterialSlotName.ToString());
-		Entry->SetStringField(TEXT("materialPath"), MaterialPath);
-		Applied.Add(MakeShared<FJsonValueObject>(Entry));
-	}
-
-	Mesh->SetMaterials(Materials);
-	Mesh->PostEditChange();
-	Mesh->MarkPackageDirty();
-	UEditorAssetLibrary::SaveLoadedAsset(Mesh, /*bOnlyIfIsDirty=*/false);
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("assetPath"), AssetPath);
-	Result->SetNumberField(TEXT("slotCount"), Materials.Num());
-	Result->SetArrayField(TEXT("applied"), Applied);
-	if (Errors.Num() > 0)
-	{
-		TArray<TSharedPtr<FJsonValue>> ErrArr;
-		for (const FString& E : Errors) ErrArr.Add(MakeShared<FJsonValueString>(E));
-		Result->SetArrayField(TEXT("errors"), ErrArr);
-	}
-	return MCPResult(Result);
-}
-
-// ─── #155 asset(diagnose_registry) ──────────────────────────────────
-// Explains the gap between disk state and the in-memory AssetRegistry.
-// Returns on-disk vs registry-including-memory counts so callers can
-// recognise pending-kill ghost entries after delete(). reconcile=true
-// forces a synchronous rescan (matches the Python workaround).
 TSharedPtr<FJsonValue> FAssetHandlers::DiagnoseRegistry(const TSharedPtr<FJsonObject>& Params)
 {
 	FString Path;
@@ -2610,253 +1846,6 @@ TSharedPtr<FJsonValue> FAssetHandlers::DiagnoseRegistry(const TSharedPtr<FJsonOb
 	Result->SetArrayField(TEXT("ghostPaths"), GhostArr);
 	return MCPResult(Result);
 }
-
-// ---------------------------------------------------------------------------
-// v1.0.0-rc.3 — #193 get_mesh_bounds
-// ---------------------------------------------------------------------------
-TSharedPtr<FJsonValue> FAssetHandlers::GetMeshBounds(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;
-
-	// #351: accept SkeletalMesh too — get_mesh_bounds previously errored
-	// on SkeletalMesh assets and callers had to fall back to Python
-	// (load_asset + get_bounds). Probe StaticMesh first, then SkeletalMesh.
-	FBox BoundingBox(ForceInit);
-	FString MeshKind;
-	if (UStaticMesh* AsStaticMesh = LoadAssetByPath<UStaticMesh>(AssetPath))
-	{
-		BoundingBox = AsStaticMesh->GetBoundingBox();
-		MeshKind = TEXT("StaticMesh");
-	}
-	else if (USkeletalMesh* AsSkeletalMesh = LoadAssetByPath<USkeletalMesh>(AssetPath))
-	{
-		const FBoxSphereBounds Bounds = AsSkeletalMesh->GetBounds();
-		BoundingBox = FBox(Bounds.Origin - Bounds.BoxExtent, Bounds.Origin + Bounds.BoxExtent);
-		MeshKind = TEXT("SkeletalMesh");
-	}
-	else
-	{
-		return MCPError(FString::Printf(
-			TEXT("Mesh not found at '%s' (tried StaticMesh and SkeletalMesh)"), *AssetPath));
-	}
-
-	FVector Min = BoundingBox.Min;
-	FVector Max = BoundingBox.Max;
-	FVector Extent = BoundingBox.GetExtent();
-	FVector Center = BoundingBox.GetCenter();
-
-	TSharedPtr<FJsonObject> MinObj = MakeShared<FJsonObject>();
-	MinObj->SetNumberField(TEXT("x"), Min.X);
-	MinObj->SetNumberField(TEXT("y"), Min.Y);
-	MinObj->SetNumberField(TEXT("z"), Min.Z);
-
-	TSharedPtr<FJsonObject> MaxObj = MakeShared<FJsonObject>();
-	MaxObj->SetNumberField(TEXT("x"), Max.X);
-	MaxObj->SetNumberField(TEXT("y"), Max.Y);
-	MaxObj->SetNumberField(TEXT("z"), Max.Z);
-
-	TSharedPtr<FJsonObject> ExtentObj = MakeShared<FJsonObject>();
-	ExtentObj->SetNumberField(TEXT("x"), Extent.X);
-	ExtentObj->SetNumberField(TEXT("y"), Extent.Y);
-	ExtentObj->SetNumberField(TEXT("z"), Extent.Z);
-
-	TSharedPtr<FJsonObject> CenterObj = MakeShared<FJsonObject>();
-	CenterObj->SetNumberField(TEXT("x"), Center.X);
-	CenterObj->SetNumberField(TEXT("y"), Center.Y);
-	CenterObj->SetNumberField(TEXT("z"), Center.Z);
-
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("assetPath"), AssetPath);
-	Result->SetStringField(TEXT("meshKind"), MeshKind);
-	Result->SetObjectField(TEXT("min"), MinObj);
-	Result->SetObjectField(TEXT("max"), MaxObj);
-	Result->SetObjectField(TEXT("boxExtent"), ExtentObj);
-	Result->SetObjectField(TEXT("boxCenter"), CenterObj);
-	return MCPResult(Result);
-}
-
-// ---------------------------------------------------------------------------
-// #270: surface AssetImportData->SourceData filenames on imported assets so
-// callers can validate legacy imports without dropping to Python. Works for
-// any UObject that owns an AssetImportData (StaticMesh, SkeletalMesh, Texture,
-// Animation*, etc.) - resolved via reflection on the asset class.
-// ---------------------------------------------------------------------------
-TSharedPtr<FJsonValue> FAssetHandlers::ReadImportSources(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
-
-	UObject* Asset = LoadAssetByPath<UObject>(AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
-	}
-
-	UAssetImportData* ImportData = nullptr;
-	if (UStaticMesh* SM = Cast<UStaticMesh>(Asset))
-	{
-		ImportData = SM->GetAssetImportData();
-	}
-	else if (USkeletalMesh* SKM = Cast<USkeletalMesh>(Asset))
-	{
-		ImportData = SKM->GetAssetImportData();
-	}
-	else
-	{
-		// Most other importable assets expose an `AssetImportData` UPROPERTY.
-		if (FObjectProperty* Prop = CastField<FObjectProperty>(Asset->GetClass()->FindPropertyByName(TEXT("AssetImportData"))))
-		{
-			ImportData = Cast<UAssetImportData>(Prop->GetObjectPropertyValue_InContainer(Asset));
-		}
-	}
-
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("assetPath"), Asset->GetPathName());
-	Result->SetStringField(TEXT("assetClass"), Asset->GetClass()->GetName());
-
-	if (!ImportData)
-	{
-		Result->SetBoolField(TEXT("hasImportData"), false);
-		TArray<TSharedPtr<FJsonValue>> Empty;
-		Result->SetArrayField(TEXT("sources"), Empty);
-		return MCPResult(Result);
-	}
-
-	Result->SetBoolField(TEXT("hasImportData"), true);
-	TArray<TSharedPtr<FJsonValue>> Sources;
-	for (const FAssetImportInfo::FSourceFile& SF : ImportData->SourceData.SourceFiles)
-	{
-		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
-		Entry->SetStringField(TEXT("relativeFilename"), SF.RelativeFilename);
-		Entry->SetStringField(TEXT("timestamp"), SF.Timestamp.ToString());
-		Entry->SetStringField(TEXT("fileHash"), LexToString(SF.FileHash));
-		Entry->SetStringField(TEXT("displayLabelName"), SF.DisplayLabelName);
-		// Resolve absolute path: SourceFilenames returns the resolved paths in
-		// the same order as SourceData.SourceFiles. The internal Resolve method
-		// is protected, so we lift the public ExtractFilenames helper instead.
-		Sources.Add(MakeShared<FJsonValueObject>(Entry));
-	}
-	TArray<FString> AbsoluteFilenames;
-	ImportData->ExtractFilenames(AbsoluteFilenames);
-	for (int32 i = 0; i < Sources.Num() && i < AbsoluteFilenames.Num(); ++i)
-	{
-		Sources[i]->AsObject()->SetStringField(TEXT("absolutePath"), AbsoluteFilenames[i]);
-	}
-	Result->SetArrayField(TEXT("sources"), Sources);
-	return MCPResult(Result);
-}
-
-// ---------------------------------------------------------------------------
-// v1.0.0-rc.3 — #177 get_mesh_collision
-// ---------------------------------------------------------------------------
-TSharedPtr<FJsonValue> FAssetHandlers::GetMeshCollision(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;
-
-	REQUIRE_ASSET(UStaticMesh, Mesh, AssetPath);
-
-	UBodySetup* BodySetup = Mesh->GetBodySetup();
-	if (!BodySetup)
-	{
-		return MCPError(FString::Printf(TEXT("No BodySetup found on mesh: %s"), *AssetPath));
-	}
-
-	// Collision trace flag as string
-	FString TraceFlag;
-	switch (BodySetup->CollisionTraceFlag)
-	{
-	case CTF_UseDefault:             TraceFlag = TEXT("CTF_UseDefault"); break;
-	case CTF_UseSimpleAndComplex:    TraceFlag = TEXT("CTF_UseSimpleAndComplex"); break;
-	case CTF_UseSimpleAsComplex:     TraceFlag = TEXT("CTF_UseSimpleAsComplex"); break;
-	case CTF_UseComplexAsSimple:     TraceFlag = TEXT("CTF_UseComplexAsSimple"); break;
-	default:                         TraceFlag = TEXT("Unknown"); break;
-	}
-
-	const FKAggregateGeom& AggGeom = BodySetup->AggGeom;
-
-	int32 NumConvex  = AggGeom.ConvexElems.Num();
-	int32 NumBox     = AggGeom.BoxElems.Num();
-	int32 NumSphere  = AggGeom.SphereElems.Num();
-	int32 NumSphyl   = AggGeom.SphylElems.Num();
-
-	bool bHasSimple = (NumConvex + NumBox + NumSphere + NumSphyl) > 0;
-
-	// Complex collision is available when the trace flag allows it
-	bool bHasComplex = (BodySetup->CollisionTraceFlag == CTF_UseDefault
-		|| BodySetup->CollisionTraceFlag == CTF_UseSimpleAndComplex
-		|| BodySetup->CollisionTraceFlag == CTF_UseComplexAsSimple);
-
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("assetPath"), AssetPath);
-	Result->SetStringField(TEXT("collisionTraceFlag"), TraceFlag);
-	Result->SetBoolField(TEXT("hasSimpleCollision"), bHasSimple);
-	Result->SetBoolField(TEXT("hasComplexCollision"), bHasComplex);
-	Result->SetNumberField(TEXT("numConvexElems"), NumConvex);
-	Result->SetNumberField(TEXT("numBoxElems"), NumBox);
-	Result->SetNumberField(TEXT("numSphereElems"), NumSphere);
-	Result->SetNumberField(TEXT("numSphylElems"), NumSphyl);
-
-	// NavCollision info (#167)
-	Result->SetBoolField(TEXT("bCanEverAffectNavigation"), Mesh->bHasNavigationData);
-	if (Mesh->GetNavCollision())
-	{
-		Result->SetBoolField(TEXT("hasNavCollision"), true);
-		Result->SetBoolField(TEXT("bIsDynamicObstacle"), Mesh->GetNavCollision()->IsDynamicObstacle());
-	}
-	else
-	{
-		Result->SetBoolField(TEXT("hasNavCollision"), false);
-	}
-
-	return MCPResult(Result);
-}
-
-// ---------------------------------------------------------------------------
-// v1.0.0-rc.5 — #167 set_mesh_nav
-// ---------------------------------------------------------------------------
-TSharedPtr<FJsonValue> FAssetHandlers::SetMeshNav(const TSharedPtr<FJsonObject>& Params)
-{
-	FString AssetPath;
-	if (auto Err = RequireString(Params, TEXT("assetPath"), AssetPath)) return Err;
-
-	REQUIRE_ASSET(UStaticMesh, Mesh, AssetPath);
-
-	bool bChanged = false;
-
-	bool bHasNavData = false;
-	if (Params->TryGetBoolField(TEXT("bHasNavigationData"), bHasNavData))
-	{
-		Mesh->bHasNavigationData = bHasNavData;
-		bChanged = true;
-	}
-
-	bool bClearNavCollision = false;
-	if (Params->TryGetBoolField(TEXT("clearNavCollision"), bClearNavCollision) && bClearNavCollision)
-	{
-		Mesh->SetNavCollision(nullptr);
-		bChanged = true;
-	}
-
-	if (!bChanged)
-	{
-		return MCPError(TEXT("No changes requested. Provide bHasNavigationData and/or clearNavCollision."));
-	}
-
-	Mesh->MarkPackageDirty();
-
-	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
-	Result->SetStringField(TEXT("assetPath"), AssetPath);
-	Result->SetBoolField(TEXT("bHasNavigationData"), Mesh->bHasNavigationData);
-	Result->SetBoolField(TEXT("hasNavCollision"), Mesh->GetNavCollision() != nullptr);
-	return MCPResult(Result);
-}
-
-// ---------------------------------------------------------------------------
-// v1.0.0-rc.3 — #192 move_folder
-// ---------------------------------------------------------------------------
 TSharedPtr<FJsonValue> FAssetHandlers::MoveFolder(const TSharedPtr<FJsonObject>& Params)
 {
 	FString SourcePath;
@@ -3334,23 +2323,15 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateInterchangePipeline(const TSharedPt
 	const FString MeshType = OptionalString(Params, TEXT("meshType"), TEXT("skeletal")).ToLower();
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
-	if (auto Existing = MCPCheckAssetExists(PackagePath, Name, OnConflict, TEXT("InterchangePipeline")))
-	{
-		return Existing;
-	}
-
 	UClass* PipelineClass = FindObject<UClass>(nullptr, TEXT("/Script/InterchangePipelines.InterchangeGenericAssetsPipeline"));
 	if (!PipelineClass)
 	{
 		return MCPError(TEXT("InterchangeGenericAssetsPipeline class not found. Enable the Interchange Editor plugin."));
 	}
 
-	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-	UObject* NewAsset = AssetToolsModule.Get().CreateAsset(Name, PackagePath, PipelineClass, nullptr);
-	if (!NewAsset)
-	{
-		return MCPError(TEXT("Failed to create InterchangePipeline asset"));
-	}
+	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("InterchangePipeline"), PipelineClass, nullptr);
+	if (Created.EarlyReturn) return Created.EarlyReturn;
+	UObject* NewAsset = Created.Asset;
 
 	// Default mesh-pipeline settings. We write through SetJsonOnProperty so
 	// every field stays in sync with the asset's UPROPERTY layout.

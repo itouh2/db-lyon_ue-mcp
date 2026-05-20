@@ -1,5 +1,3 @@
-import * as fs from "node:fs";
-import * as path from "node:path";
 import { z } from "zod";
 import { categoryTool, bp, type ToolDef } from "../types.js";
 import { Vec3, Rotator } from "../schemas.js";
@@ -8,39 +6,11 @@ export const assetTool: ToolDef = categoryTool(
   "asset",
   "Asset management: list, search, read, CRUD, import meshes/textures, datatables.",
   {
-    list: {
-      description: "List assets in directory. Params: directory?, typeFilter?, recursive?",
-      handler: async (ctx, p) => {
-        ctx.project.ensureLoaded();
-        const dir = p.directory ? ctx.project.resolveContentDir(p.directory as string) : ctx.project.contentDir!;
-        const recursive = p.recursive !== false;
-        const typeFilter = (p.typeFilter as string | undefined)?.toLowerCase();
-        if (!fs.existsSync(dir)) throw new Error(`Directory not found: ${dir}`);
-        const assets: Array<{ path: string; name: string; extension: string; sizeKB: number }> = [];
-        function scan(d: string): void {
-          for (const entry of fs.readdirSync(d, { withFileTypes: true })) {
-            const full = path.join(d, entry.name);
-            if (entry.isDirectory()) { if (recursive) scan(full); }
-            else {
-              const ext = path.extname(entry.name).slice(1).toLowerCase();
-              if (ext !== "uasset" && ext !== "umap") continue;
-              if (typeFilter && ext !== typeFilter) continue;
-              assets.push({ path: ctx.project.getRelativeContentPath(full), name: path.basename(entry.name, path.extname(entry.name)), extension: ext, sizeKB: Math.round(fs.statSync(full).size / 1024) });
-            }
-          }
-        }
-        scan(dir);
-        const result: Record<string, unknown> = { directory: p.directory ?? "/Game/", recursive, assetCount: assets.length, assets: assets.slice(0, 2000) };
-        if (assets.length === 0) {
-          const plugins = ctx.project.discoverPlugins();
-          if (plugins.length > 0) {
-            result.suggestion = `No assets found in ${p.directory ?? "/Game/"}. This project has plugin content — try listing one of these: ${plugins.map((pl) => pl.mountPoint).join(", ")}`;
-            result.availablePlugins = plugins.map((pl) => ({ name: pl.name, mountPoint: pl.mountPoint }));
-          }
-        }
-        return result;
-      },
-    },
+    list: bp(
+      "List assets via the AssetRegistry (sees /Game and every mounted plugin root). Params: directory? (default /Game), classFilter?, recursive? (default true), maxResults? (default 2000)",
+      "list_assets",
+      (p) => ({ directory: p.directory, classFilter: p.classFilter ?? p.typeFilter, recursive: p.recursive, maxResults: p.maxResults }),
+    ),
     search: {
       description: "Search by name/class/path. Params: query, directory?, maxResults?, searchAll?",
       handler: async (ctx, p) => {
@@ -78,6 +48,7 @@ export const assetTool: ToolDef = categoryTool(
     delete_batch:   bp("Batch-delete assets. Per-path status (deleted/absent/failed) plus reason+referencers on failed entries (#278). Params: assetPaths[], force?", "delete_asset_batch"),
     create_data_asset: bp("Create UDataAsset instance of custom class. Params: name, className (/Script/Module.ClassName or loaded name), packagePath?, properties? (key/value map)", "create_data_asset"),
     save:           bp("Save asset(s). Params: assetPath?", "save_asset"),
+    save_all_dirty: bp("Flush every dirty package to disk in one call. End-of-workflow shortcut after bulk import/edit. Params: saveMapPackages? (default true), saveContentPackages? (default true). Returns savedAll boolean (#429)", "save_all_dirty", (p) => ({ saveMapPackages: p.saveMapPackages, saveContentPackages: p.saveContentPackages })),
     set_mesh_material:    bp("Assign material to static mesh slot. Params: assetPath, materialPath, slotIndex?", "set_mesh_material"),
     recenter_pivot:       { description: "Move static mesh pivot to geometry center. Params: assetPath OR assetPaths", bridge: "recenter_pivot", mapParams: (p) => {
       const paths = p.assetPaths as string[] | undefined;
@@ -88,6 +59,7 @@ export const assetTool: ToolDef = categoryTool(
     import_skeletal_mesh: bp("Import skeletal mesh from FBX. Params: filePath, name?, packagePath?, skeletonPath?, importMaterials?, importTextures?", "import_skeletal_mesh", (p) => ({ filename: p.filePath, destinationPath: p.packagePath, assetName: p.name, skeletonPath: p.skeletonPath, importMaterials: p.importMaterials, importTextures: p.importTextures })),
     import_animation:     bp("Import anim from FBX. Params: filePath, name?, packagePath?, skeletonPath", "import_animation", (p) => ({ filename: p.filePath, destinationPath: p.packagePath, assetName: p.name, skeletonPath: p.skeletonPath })),
     import_texture:       bp("Import image. Params: filePath, name?, packagePath?", "import_texture", (p) => ({ filename: p.filePath, destinationPath: p.packagePath, assetName: p.name })),
+    import_texture_batch: bp("Import many textures in one call - the loop stays inside the editor (no per-file bridge round-trip), so this finishes far faster than N import_texture calls. Per-item result records mirror import_texture. Params: items[]: [{filePath, packagePath?, name?, replaceExisting?}], packagePath? (default for items that don't set it), save? (default true), automated? (default true). Returns requested/imported/failed counts + items[] (#430)", "import_texture_batch", (p) => ({ items: p.items, packagePath: p.packagePath, save: p.save, automated: p.automated })),
     reimport:             bp("Reimport asset from source file. Params: assetPath, filePath?", "reimport_asset", (p) => ({ assetPath: p.assetPath, filePath: p.filePath })),
     read_datatable:       bp("Read DataTable rows. Params: assetPath, rowFilter?", "read_datatable", (p) => ({ path: p.assetPath, rowFilter: p.rowFilter })),
     create_datatable:     bp("Create DataTable. Params: name, packagePath?, rowStruct", "create_datatable"),
@@ -120,6 +92,7 @@ export const assetTool: ToolDef = categoryTool(
     set_sk_material_slots: bp("Set materials on a USkeletalMesh by slot name or slotIndex (bypasses the blueprint override-materials path that UE's ICH silently reverts). Params: assetPath, slots[{slotName?|slotIndex?, materialPath}]", "set_sk_material_slots"),
     diagnose_registry:    bp("Scan a content path and compare disk vs AssetRegistry (including in-memory pending-kill entries). Returns onDiskCount, inMemoryIncludedCount, ghostCount and paths. Params: path, recursive? (default true), reconcile? (forceRescan=true)", "diagnose_registry"),
     get_mesh_bounds:      bp("Get StaticMesh OR SkeletalMesh bounding box. Params: assetPath. Returns min, max, boxExtent, boxCenter, meshKind (#193/#351)", "get_mesh_bounds"),
+    get_mesh_info:        bp("One-call mesh QA: bounds + material slots + skeleton + LOD/vertex counts. Works for both UStaticMesh and USkeletalMesh. Params: assetPath. Returns meshKind, boundsOrigin, boundsExtent, heightM, lodCount, vertexCount, skeletonPath (skeletal only), materialSlots:[{index, slotName, materialPath, isDefaultFallback}], materialCount (#431)", "get_mesh_info"),
     read_import_sources:  bp("Read AssetImportData source filenames on an imported asset (StaticMesh, SkeletalMesh, Texture, Animation, etc.). Returns sources[] of {relativeFilename, absolutePath, timestamp, fileHash, displayLabelName}. Params: assetPath (#270)", "read_import_sources", (p) => ({ assetPath: p.assetPath ?? p.path })),
     get_mesh_collision:   bp("Inspect StaticMesh collision setup. Params: assetPath. Returns collisionTraceFlag, hasSimple/ComplexCollision, element counts (#177)", "get_mesh_collision"),
     move_folder:          bp("Move/rename entire content folder with redirector fixup in one transaction. Params: sourcePath, destinationPath (#192)", "move_folder"),
@@ -128,6 +101,16 @@ export const assetTool: ToolDef = categoryTool(
   },
   undefined,
   {
+    saveMapPackages: z.boolean().optional().describe("save_all_dirty: include map packages (default true)"),
+    saveContentPackages: z.boolean().optional().describe("save_all_dirty: include content packages (default true)"),
+    items: z.array(z.object({
+      filePath: z.string(),
+      packagePath: z.string().optional(),
+      name: z.string().optional(),
+      replaceExisting: z.boolean().optional(),
+    })).optional().describe("import_texture_batch entries"),
+    save: z.boolean().optional().describe("import_texture_batch: save imported packages immediately (default true)"),
+    automated: z.boolean().optional().describe("import_texture_batch: bypass interactive dialogs (default true)"),
     assetPath: z.string().optional().describe("Asset path"),
     directory: z.string().optional(), query: z.string().optional(),
     maxResults: z.number().optional(), typeFilter: z.string().optional(),
