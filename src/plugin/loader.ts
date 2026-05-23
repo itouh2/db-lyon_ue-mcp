@@ -9,6 +9,8 @@ import { loadManifest, type PluginManifest } from "./manifest.js";
 import { resolvePackage, type ResolvedPackage } from "./resolver.js";
 import { satisfiesMinimum } from "./version.js";
 import { mergeInjectionsIntoTool, type InjectionPlan } from "./injection.js";
+import { buildProvidedTool, type ProvisionPlan } from "./provision.js";
+import { readDeployedBridgeApiVersion } from "./bridge-api.js";
 
 /** Per-plugin record surfaced to the `plugins` introspection category. */
 export interface PluginRecord {
@@ -21,6 +23,9 @@ export interface PluginRecord {
   uePluginDependency?: string;
   /** Final injected action names, by category. */
   injected: Record<string, string[]>;
+  /** Categories this plugin contributes as new top-level MCP tools. Map
+   *  category name -> action names provided. */
+  provided: Record<string, string[]>;
   /** Knowledge files attached, by category. */
   knowledge: Record<string, string>;
   /** Plugin-supplied flow names. */
@@ -82,6 +87,7 @@ export async function loadPlugins(
   }
 
   const builtInCategories = new Set(tools.map((t) => t.name));
+  const bridgeApiVersion = readDeployedBridgeApiVersion(projectDir);
   const records: PluginRecord[] = [];
   const taskRegistrations: Array<{ name: string; ctor: TaskConstructor }> = [];
   const classPathRegistrations: Array<{ classPath: string; ctor: TaskConstructor }> = [];
@@ -90,6 +96,9 @@ export async function loadPlugins(
   const knowledgeByCategory: Record<string, string[]> = {};
   // For each category, accumulate injection plans across all plugins.
   const plansByCategory = new Map<string, InjectionPlan[]>();
+  // Provided categories: first writer wins. Tracks the owning plugin name
+  // so cross-plugin collisions surface as skip reasons on the loser.
+  const provisionByCategory = new Map<string, ProvisionPlan>();
 
   for (const entry of entries) {
     const record = await loadOne(
@@ -97,6 +106,7 @@ export async function loadPlugins(
       projectDir,
       serverVersion,
       builtInCategories,
+      bridgeApiVersion,
     );
     records.push(record.record);
     if (record.record.status !== "active" || !record.payload) continue;
@@ -155,6 +165,37 @@ export async function loadPlugins(
       }
     }
 
+    // Provided categories: claim each name (first writer wins). Subsequent
+    // plugins that try to provide the same name are skipped with a clear
+    // reason. Actions land in the task registry under `<category>.<action>`
+    // with no prefix — the provider owns the namespace.
+    for (const [category, providedSpec] of Object.entries(manifest.provides)) {
+      const existing = provisionByCategory.get(category);
+      if (existing) {
+        warn(
+          "plugin",
+          `${pkg.name}: provides target '${category}' already claimed by '${existing.pluginName}'; skipping this provider`,
+        );
+        continue;
+      }
+      const plan: ProvisionPlan = {
+        category,
+        pluginName: pkg.name,
+        description: providedSpec.description,
+        spec: providedSpec,
+      };
+      provisionByCategory.set(category, plan);
+
+      for (const [actionName, actionSpec] of Object.entries(providedSpec.actions)) {
+        const ctor = taskCtors.get(actionSpec.task);
+        if (!ctor) continue;
+        const dispatchName = `${category}.${actionName}`;
+        taskRegistrations.push({ name: dispatchName, ctor });
+      }
+
+      record.record.provided[category] = Object.keys(providedSpec.actions);
+    }
+
     // Knowledge: load file contents now; the loader returns text so the
     // server can attach to instructions before the bridge connects.
     for (const [category, relPath] of Object.entries(manifest.knowledge)) {
@@ -194,13 +235,22 @@ export async function loadPlugins(
     return merged;
   });
 
+  // Append provided categories as new top-level tools. By this point we
+  // have already rejected names that collide with built-ins (in loadOne)
+  // and with other plugins (first-wins above), so we can safely build and
+  // push each plan's ToolDef.
+  const providedTools: ToolDef[] = [];
+  for (const plan of provisionByCategory.values()) {
+    providedTools.push(buildProvidedTool(plan));
+  }
+
   info(
     "plugin",
     `loaded ${records.filter((r) => r.status === "active").length}/${records.length} plugin(s)`,
   );
 
   return {
-    tools: modifiedTools,
+    tools: [...modifiedTools, ...providedTools],
     records,
     taskRegistrations,
     classPathRegistrations,
@@ -226,6 +276,7 @@ async function loadOne(
   projectDir: string,
   serverVersion: string,
   builtInCategories: Set<string>,
+  bridgeApiVersion: number | null,
 ): Promise<LoadOneResult> {
   const base = baseRecord(entry);
   let pkg: ResolvedPackage;
@@ -253,12 +304,44 @@ async function loadOne(
     return skip(base, `requires server >= ${manifest.minServerVersion} (have ${serverVersion})`);
   }
 
+  // Native module gate: the plugin ships C++ that registers handlers via
+  // UEMCP::RegisterExternalHandler. Refuse to load if its minBridgeApi
+  // exceeds the bridge ABI currently deployed in this project. We do NOT
+  // hard-fail when bridgeApiVersion is unknown (no bridge deployed yet);
+  // a warning lets users see the manifest but the C++ side won't run
+  // until they `ue-mcp init`/`update` to deploy a bridge.
+  if (manifest.nativeModule) {
+    if (bridgeApiVersion === null) {
+      warn(
+        "plugin",
+        `${entry.name}: declares nativeModule but no UE_MCP_Bridge is deployed yet — run \`ue-mcp init\` or \`ue-mcp update\` to deploy the bridge before invoking its native actions`,
+      );
+    } else if (manifest.nativeModule.minBridgeApi > bridgeApiVersion) {
+      return skip(
+        base,
+        `nativeModule requires bridge ABI >= ${manifest.nativeModule.minBridgeApi} (deployed bridge is ${bridgeApiVersion}). Run \`ue-mcp update\` to refresh the bridge.`,
+      );
+    }
+  }
+
   // Target validation: every inject target must be a registered category.
   for (const target of Object.keys(manifest.inject)) {
     if (!builtInCategories.has(target)) {
       return skip(
         base,
         `inject target '${target}' is not a registered category. Valid: ${[...builtInCategories].sort().join(", ")}`,
+      );
+    }
+  }
+
+  // Provided categories must not collide with built-in category names.
+  // Cross-plugin collisions are detected in the second pass in loadPlugins,
+  // where all active plugins' provides: blocks are visible.
+  for (const provided of Object.keys(manifest.provides)) {
+    if (builtInCategories.has(provided)) {
+      return skip(
+        base,
+        `provides target '${provided}' collides with a built-in category; plugins may not override built-ins`,
       );
     }
   }
@@ -288,6 +371,18 @@ async function loadOne(
     }
   }
 
+  // Every provides entry must also point to a task we just registered.
+  for (const [category, providedSpec] of Object.entries(manifest.provides)) {
+    for (const [actionName, actionSpec] of Object.entries(providedSpec.actions)) {
+      if (!taskCtors.has(actionSpec.task)) {
+        return skip(
+          base,
+          `provides ${category}.${actionName} references unknown task '${actionSpec.task}'`,
+        );
+      }
+    }
+  }
+
   base.flows = Object.keys(manifest.flows);
   base.status = "active";
   return { record: base, payload: { manifest, pkg, taskCtors } };
@@ -301,6 +396,7 @@ function baseRecord(entry: PluginEntry): PluginRecord {
     pkgDir: "(unresolved)",
     manifestPath: "(unresolved)",
     injected: {},
+    provided: {},
     knowledge: {},
     flows: [],
     tasks: [],

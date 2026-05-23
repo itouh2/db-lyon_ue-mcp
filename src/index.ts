@@ -233,7 +233,7 @@ async function main() {
   });
 
   // ── Optional HTTP surface for flow.run (#144) ───────────────────
-  // Off by default; opt-in via ".ue-mcp.json" { "http": { "enabled": true, "port": 7723 } }.
+  // Off by default; opt-in via ue-mcp.yml `ue-mcp.http: { enabled: true, port: 7723 }`.
   // Binds to 127.0.0.1 only — do NOT expose to the network without adding auth.
   if (project.config.http?.enabled) {
     try {
@@ -322,6 +322,7 @@ function toPluginInfo(rec: PluginRecord, project: ProjectContext): PluginInfo {
     uePluginDependency: rec.uePluginDependency,
     uePluginPresent,
     injected: rec.injected,
+    provided: rec.provided,
     knowledge: rec.knowledge,
     flows: rec.flows,
     tasks: rec.tasks,
@@ -358,6 +359,12 @@ if (subcmd === "init") {
 } else if (subcmd === "uninstall-hooks") {
   process.argv.splice(2, 1);
   import("./uninstall-hooks.js");
+} else if (subcmd === "auth") {
+  process.argv.splice(2, 1);
+  import("./auth-cli.js");
+} else if (subcmd === "feedback") {
+  process.argv.splice(2, 1);
+  import("./feedback-cli.js");
 } else if (subcmd === "resolve") {
   import("./resolve.js");
 } else if (subcmd === "plugin") {

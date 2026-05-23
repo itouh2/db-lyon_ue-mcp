@@ -1,9 +1,30 @@
 import { z } from "zod";
 import { EngineConfigSchema } from "@db-lyon/flowkit";
 
+/**
+ * The `ue-mcp:` block at the top of ue-mcp.yml. Hosts project-level config
+ * that every collaborator should share. Per-user-per-device preferences
+ * (e.g. feedback approval mode) and machine-only state (e.g. installedHooks)
+ * live in `~/.ue-mcp/state.json`, not here.
+ *
+ *   ue-mcp:
+ *     version: 1
+ *     contentRoots: ["/Game/"]
+ *     disable: ["gas"]
+ *     http: { enabled: false, port: 7723 }
+ */
 export const FlowVersionSchema = z.object({
   version: z.literal(1),
-});
+  contentRoots: z.array(z.string()).optional(),
+  disable: z.array(z.string()).optional(),
+  http: z
+    .object({
+      enabled: z.boolean().optional(),
+      port: z.number().int().min(1).max(65535).optional(),
+      host: z.string().optional(),
+    })
+    .optional(),
+}).passthrough();
 
 export const FlowProjectSchema = z.object({
   name: z.string().optional(),

@@ -4,7 +4,31 @@ import { submitFeedback } from "../github-app.js";
 import { readUserAuth } from "../auth.js";
 import { getWorkarounds, clearWorkarounds } from "../workaround-tracker.js";
 import { scrubSecrets } from "../secret-scrub.js";
+import { privacyScrub } from "../privacy-scrub.js";
+import { deferSubmission } from "../feedback-deferred.js";
+import { getFeedbackMode, type FeedbackMode } from "../user-state.js";
 import { warn } from "../log.js";
+
+/**
+ * Resolve the active feedback mode. Precedence (highest wins):
+ *
+ *   1. UE_MCP_FEEDBACK_MODE env var       — per-process override
+ *   2. ~/.ue-mcp/state.json preference    — per-user-per-device, set via
+ *                                            `npx ue-mcp feedback mode`
+ *   3. default "interactive"
+ *
+ * Mode is NOT read from ue-mcp.yml. It's a per-user preference that varies
+ * across machines and developers (am I at the keyboard, is this an
+ * unattended run, etc.) — not project policy. The agent has no surface to
+ * change this; it's set by the human running the server.
+ */
+function resolveFeedbackMode(_ctx: ToolContext): FeedbackMode {
+  const env = (process.env.UE_MCP_FEEDBACK_MODE ?? "").trim().toLowerCase();
+  if (env === "auto-approve" || env === "defer" || env === "interactive") return env;
+  const pref = getFeedbackMode();
+  if (pref) return pref;
+  return "interactive";
+}
 
 const PLACEHOLDER_TITLE_RE =
   /^(noop|nop|test|tests?|testing|x|y|z|todo|tbd|tba|ignore|ignored|stop|dummy|temp|tmp|placeholder|accidental|oops|cleanup|n\/?a|none|null|undefined|na|misc|\.+|-+)$/i;
@@ -125,11 +149,17 @@ interface AssembledPayload {
   scrubHits: number;
 }
 
+interface PrivacyInputs {
+  projectRoot?: string;
+  projectName?: string;
+}
+
 function assemblePayload(
   title: string,
   summary: string,
   pythonWorkaround: string | undefined,
   idealTool: string | undefined,
+  privacy: PrivacyInputs,
 ): AssembledPayload {
   const sections: string[] = ["## Summary", summary];
 
@@ -165,24 +195,49 @@ function assemblePayload(
   sections.push("", "---", "*Submitted via ue-mcp agent feedback*");
 
   const rawBody = sections.join("\n");
-  const scrubbedBody = scrubSecrets(rawBody);
-  const scrubbedTitle = scrubSecrets(title);
-  const scrubHits =
-    scrubbedBody.hits.reduce((n, h) => n + h.count, 0) +
-    scrubbedTitle.hits.reduce((n, h) => n + h.count, 0);
+
+  // Two-pass scrub. Order matters:
+  //   1. Secret-shaped strings (PEMs, API tokens, JWTs, env-style secrets).
+  //   2. Personal/project identifiers (project root path, home dir, project
+  //      name, OS username). Applied second so a path that contained a
+  //      secret-shaped substring has the secret redacted before we drop the
+  //      surrounding path bytes.
+  // The agent has no surface to bypass either pass — both are applied here
+  // server-side before the body ever appears on the elicitation prompt or
+  // crosses the GitHub API boundary.
+  const secretsBody = scrubSecrets(rawBody);
+  const privacyBody = privacyScrub(secretsBody.text, {
+    projectRoot: privacy.projectRoot,
+    projectName: privacy.projectName,
+  });
+  const secretsTitle = scrubSecrets(title);
+  const privacyTitle = privacyScrub(secretsTitle.text, {
+    projectRoot: privacy.projectRoot,
+    projectName: privacy.projectName,
+  });
+
+  const allHits = [
+    ...secretsBody.hits,
+    ...privacyBody.hits,
+    ...secretsTitle.hits,
+    ...privacyTitle.hits,
+  ];
+  const scrubHits = allHits.reduce((n, h) => n + h.count, 0);
 
   if (scrubHits > 0) {
-    const allHits = [...scrubbedBody.hits, ...scrubbedTitle.hits];
     warn(
       "feedback",
-      `redacted ${scrubHits} secret-shaped strings before approval prompt: ${allHits.map((h) => `${h.rule}=${h.count}`).join(", ")}`,
+      `redacted ${scrubHits} string(s) before approval prompt: ${allHits.map((h) => `${h.rule}=${h.count}`).join(", ")}`,
     );
   }
 
   return {
-    title: scrubbedTitle.text,
-    body: scrubbedBody.text,
-    labels: inferLabels(scrubbedTitle.text, summary, idealTool),
+    title: privacyTitle.text,
+    body: privacyBody.text,
+    // Inferred labels look at the (already-scrubbed) title + the
+    // user-supplied summary. summary feeds keyword detection (blueprint,
+    // niagara, etc.) which is structural classification, not user identity.
+    labels: inferLabels(privacyTitle.text, summary, idealTool),
     scrubHits,
   };
 }
@@ -257,12 +312,13 @@ export const feedbackTool: ToolDef = categoryTool(
           );
         }
 
-        // ── Deterministic approval gate ─────────────────────────────
-        // Without an elicitation channel there is no way to obtain a
-        // user-mediated signal that the agent cannot forge. We refuse
-        // rather than fall back to an agent-mediated channel — the whole
-        // point of this code path is that the agent is the adversary.
-        if (!ctx.elicit) {
+        // Resolve mode BEFORE checking for elicit. In interactive mode the
+        // missing elicit capability is a hard block. In auto-approve or
+        // defer modes the user has explicitly opted out of the elicitation
+        // gate, so elicit support is irrelevant.
+        const mode = resolveFeedbackMode(ctx);
+
+        if (mode === "interactive" && !ctx.elicit) {
           return directive(
             [
               `[FEEDBACK BLOCKED - NO APPROVAL CHANNEL]`,
@@ -270,8 +326,9 @@ export const feedbackTool: ToolDef = categoryTool(
               `so the server has no deterministic way to obtain the user's approval`,
               `for posting an issue to a public tracker.`,
               ``,
-              `Upgrade your client (Claude Code >= 2.1.76) or use a different client.`,
-              `feedback(submit) will refuse until elicitation is available.`,
+              `Upgrade your client (Claude Code >= 2.1.76), or run`,
+              `\`npx ue-mcp feedback mode auto-approve|defer\` (or set the`,
+              `UE_MCP_FEEDBACK_MODE env var) to skip the prompt for this session.`,
             ].join("\n"),
             {
               submitted: false,
@@ -286,7 +343,10 @@ export const feedbackTool: ToolDef = categoryTool(
           );
         }
 
-        const payload = assemblePayload(title, summary, pythonWorkaround, idealTool);
+        const payload = assemblePayload(title, summary, pythonWorkaround, idealTool, {
+          projectRoot: ctx.project?.projectDir ?? undefined,
+          projectName: ctx.project?.projectName ?? undefined,
+        });
 
         // Two independent checks: (1) capture intent above, (2) validate
         // auth here. Auth validation only matters when intent is "user".
@@ -327,23 +387,117 @@ export const feedbackTool: ToolDef = categoryTool(
           useBotForSubmit = false;
         }
 
+        // ── Defer mode ─────────────────────────────────────────────
+        // User has explicitly opted out of the elicitation gate via
+        // `npx ue-mcp feedback mode defer` (or the env override).
+        // Write the scrubbed payload to ~/.ue-mcp/pending-feedback/ for
+        // later review via `npx ue-mcp feedback list/approve/discard`.
+        if (mode === "defer") {
+          const entry = deferSubmission(
+            { title: payload.title, body: payload.body, labels: payload.labels },
+            ctx.project?.projectName ?? null,
+            useBotForSubmit ? "bot" : "user",
+          );
+          clearWorkarounds();
+          return {
+            message: `Feedback deferred locally for later review (id ${entry.id}).`,
+            deferred: true,
+            id: entry.id,
+            createdAt: entry.createdAt,
+            mode: "defer",
+            review_with: "npx ue-mcp feedback list",
+          };
+        }
+
+        // ── Auto-approve mode ──────────────────────────────────────
+        // Skip the elicitation prompt entirely and post the scrubbed
+        // body. Opt-in via config/env only; the agent has no surface
+        // to set this.
+        if (mode === "auto-approve") {
+          const result = await submitFeedback(
+            payload.title,
+            payload.body,
+            payload.labels,
+            { useBot: useBotForSubmit },
+          );
+          if (result.kind === "auth_required") {
+            return directive(
+              [
+                `[FEEDBACK BLOCKED - CACHED GITHUB TOKEN REJECTED]`,
+                ``,
+                `Auto-approve mode tried to post as your user but GitHub`,
+                `rejected the cached token (revoked or expired). Re-authorize`,
+                `with \`npx ue-mcp auth\` or switch to author="bot".`,
+              ].join("\n"),
+              {
+                submitted: false,
+                authRequired: true,
+                verification_uri: result.verification_uri,
+                user_code: result.user_code,
+                expires_in: result.expires_in,
+              },
+              {
+                kind: "feedback.auth_required",
+                requiredActions: ["surface_oauth_url_to_user"],
+                context: {
+                  verification_uri: result.verification_uri,
+                  user_code: result.user_code,
+                },
+              },
+            );
+          }
+          clearWorkarounds();
+          return {
+            message: `Feedback auto-approved and submitted as ${result.authoredAs === "user" ? `@${result.authoredBy}` : "bot"} (auto-approve mode).`,
+            issue_url: result.url,
+            issue_number: result.number,
+            authored_by: result.authoredBy,
+            authored_as: result.authoredAs,
+            labels: payload.labels,
+            mode: "auto-approve",
+          };
+        }
+
+        // ── Interactive mode (default): elicitation gate ───────────
+        // NOTE: ctx.elicit is guaranteed defined here because the
+        // mode === "interactive" + !ctx.elicit case returned above.
         let elicitResult;
         try {
-          elicitResult = await ctx.elicit({
+          elicitResult = await ctx.elicit!({
             message: buildApprovalMessage(payload, authorPromptLine),
+            // Radio semantics on `decision` (two-value enum, mutually
+            // exclusive by schema). Filling the `revisions` text field is
+            // its own choice and takes precedence over `decision` — no
+            // extra checkbox to tick. Three outcomes the user can express:
+            //
+            //   decision = submit, revisions empty   → post the body as shown
+            //   decision = reject, revisions empty   → discard
+            //   revisions non-empty (any decision)   → return notes to the
+            //                                          agent for a body
+            //                                          rewrite; nothing posts
+            //                                          until re-approval
+            //
+            // Form-level Decline/cancel always declines, regardless of
+            // field values.
+            // The form-level Accept / Decline buttons are Claude Code's
+            // built-in form actions — they carry the submit/discard
+            // decision. We only need ONE field in the schema, for the
+            // optional revisions text. The three outcomes:
+            //
+            //   form Decline / cancel    → discard
+            //   form Accept, empty text  → submit the body as shown
+            //   form Accept, text filled → return notes to the agent;
+            //                              nothing posts until re-approval
             requestedSchema: {
               type: "object",
               properties: {
-                decision: {
+                revisions: {
                   type: "string",
-                  title: "Approve submission?",
+                  title: "Submit with revisions (optional)",
                   description:
-                    "Approve to post this exact issue to the public ue-mcp GitHub tracker. Decline to discard.",
-                  enum: ["approve", "decline"],
-                  default: "decline",
+                    "Leave EMPTY and click Accept to submit the body as shown. Fill in to ask the agent to rewrite the body per these notes — nothing posts until you re-approve the revised body. Click Decline to discard.",
                 },
               },
-              required: ["decision"],
             },
           });
         } catch (e) {
@@ -364,33 +518,67 @@ export const feedbackTool: ToolDef = categoryTool(
           );
         }
 
-        const decision =
-          typeof elicitResult.content?.decision === "string"
-            ? elicitResult.content.decision
+        const revisions =
+          typeof elicitResult.content?.revisions === "string"
+            ? elicitResult.content.revisions.trim()
             : "";
-        const approved =
-          elicitResult.action === "accept" && decision === "approve";
 
-        if (!approved) {
+        // form-level Accept = submit. form-level Decline/cancel = discard.
+        // Revisions text presence routes to the rewrite path on Accept.
+        if (elicitResult.action !== "accept") {
           const reasonCode =
-            elicitResult.action === "decline" || decision === "decline"
-              ? "user_declined"
+            elicitResult.action === "decline"
+              ? "user_declined_form"
               : elicitResult.action === "cancel"
                 ? "user_cancelled"
                 : "user_did_not_approve";
           return directive(
             [
-              `[FEEDBACK NOT SUBMITTED - USER DID NOT APPROVE]`,
-              `Reason: ${reasonCode} (action="${elicitResult.action}", decision="${decision}")`,
+              `[FEEDBACK NOT SUBMITTED - USER DECLINED]`,
+              `Reason: ${reasonCode} (action="${elicitResult.action}")`,
               ``,
-              `The user reviewed the prompt and chose not to submit. Do not retry.`,
+              `The user reviewed the prompt and clicked Decline. Do not retry.`,
               `Resume the user's task.`,
             ].join("\n"),
-            { submitted: false, code: reasonCode, action: elicitResult.action, decision },
+            { submitted: false, code: reasonCode, action: elicitResult.action },
             {
               kind: "feedback.declined",
               requiredActions: ["do_not_retry_feedback_submit", "resume_user_task"],
               context: { code: reasonCode, action: elicitResult.action },
+            },
+          );
+        }
+
+        if (revisions) {
+          // The user accepted the principle but wants the body rewritten
+          // before anything posts. Hand the notes back to the agent; agent
+          // revises the params and calls feedback(submit) again to surface
+          // a fresh approval prompt for the revised body.
+          return directive(
+            [
+              `[FEEDBACK NEEDS REVISION BEFORE SUBMIT]`,
+              ``,
+              `The user approved in principle but filled in the revisions field.`,
+              `Nothing has been posted. Revision notes from the user:`,
+              ``,
+              revisions,
+              ``,
+              `Revise the title/summary/pythonWorkaround/idealTool to address`,
+              `these notes and call feedback(submit) again. The user will see`,
+              `a fresh approval prompt for the revised body.`,
+            ].join("\n"),
+            {
+              submitted: false,
+              code: "revisions_requested",
+              revisions,
+            },
+            {
+              kind: "feedback.revisions_requested",
+              requiredActions: [
+                "revise_submission_per_user_notes",
+                "call_feedback_submit_again_with_revised_payload",
+              ],
+              context: { revisions },
             },
           );
         }

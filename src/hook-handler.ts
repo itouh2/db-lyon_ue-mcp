@@ -28,27 +28,29 @@ function readStdin(): Promise<string> {
 }
 
 /**
- * Walk up from cwd looking for a .ue-mcp.json. Returns true if feedback is
- * present in `disable[]` (hook should silently no-op) or if cwd is not inside
- * a ue-mcp project at all (don't nudge an unrelated repo). Defense in depth
- * against stale install — even if `npx ue-mcp uninstall-hooks` was never run,
- * the hook self-disables once the user opts out via config.
+ * Walk up from cwd looking for a ue-mcp.yml. Returns true if the
+ * `ue-mcp.disable[]` block contains "feedback" (hook should silently
+ * no-op) or if cwd is not inside a ue-mcp project at all (don't nudge an
+ * unrelated repo). Defense in depth against stale install — even if
+ * `npx ue-mcp uninstall-hooks` was never run, the hook self-disables once
+ * the user opts out via config.
  */
 async function feedbackDisabledForCwd(): Promise<boolean> {
   try {
     const fs = await import("node:fs");
     const path = await import("node:path");
+    const yaml = (await import("js-yaml")).default;
     let dir = process.cwd();
-    // Guard against runaway loops on detached / unusual paths.
     for (let i = 0; i < 32; i++) {
-      const candidate = path.join(dir, ".ue-mcp.json");
-      if (fs.existsSync(candidate)) {
+      const ymlPath = path.join(dir, "ue-mcp.yml");
+      if (fs.existsSync(ymlPath)) {
         try {
-          const cfg = JSON.parse(fs.readFileSync(candidate, "utf-8")) as {
-            disable?: unknown;
-          };
-          const disable = Array.isArray(cfg.disable) ? cfg.disable : [];
-          return disable.includes("feedback");
+          const doc = yaml.load(fs.readFileSync(ymlPath, "utf-8")) as
+            | { "ue-mcp"?: { disable?: unknown } }
+            | null;
+          const block = doc && typeof doc === "object" ? doc["ue-mcp"] : undefined;
+          const list = block && Array.isArray(block.disable) ? block.disable : [];
+          return list.includes("feedback");
         } catch {
           // Malformed config: don't nudge, safer to no-op.
           return true;
@@ -58,7 +60,7 @@ async function feedbackDisabledForCwd(): Promise<boolean> {
       if (parent === dir) break;
       dir = parent;
     }
-    // No .ue-mcp.json found above cwd — this isn't a ue-mcp project.
+    // No ue-mcp.yml found above cwd — this isn't a ue-mcp project.
     // A hook running outside its own project is stale; silent no-op.
     return true;
   } catch {

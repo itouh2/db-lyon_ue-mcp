@@ -29,24 +29,58 @@ The easiest way to configure UE-MCP is to run `npx ue-mcp init` — it detects y
 
 You can start the server without a `.uproject` argument. It will run in a limited mode — you can then use `project(action="set_project", projectPath="...")` at runtime to attach to a project.
 
-## Project Configuration (`.ue-mcp.json`)
+## Project Configuration (`ue-mcp.yml`)
 
-Place a `.ue-mcp.json` file in your UE project root (next to the `.uproject`) to customize behavior. `npx ue-mcp init` creates this for you.
+Project-level config lives under the `ue-mcp:` block at the top of `ue-mcp.yml`, next to your `.uproject`. The file is meant to be tracked in git so every collaborator sees the same project surface. `npx ue-mcp init` creates and maintains it for you, but hand-editing is fine — there's nothing in it the server treats as opaque machine state.
 
-```json
-{
-  "contentRoots": ["/Game/", "/MyPlugin/"],
-  "disable": ["gas", "networking"]
-}
+```yaml
+ue-mcp:
+  version: 1
+  contentRoots:
+    - /Game/
+    - /MyPlugin/
+  disable:
+    - gas
+    - networking
+  http:
+    enabled: false
+
+tasks: {}
+flows: {}
+plugins: []
 ```
 
-### Options
+!!! info "User-machine state"
+    Anything that varies per machine (e.g. the list of absolute paths to Claude Code settings files where the feedback hook was installed) lives in `~/.ue-mcp/state.json`, **not** in the project tree. The user-state file is maintained automatically by `npx ue-mcp init` / `npx ue-mcp uninstall-hooks`; you shouldn't need to touch it.
+
+!!! tip "Migrating from older versions"
+    - Pre-1.0.29 used `.ue-mcp.json` for the project config.
+    - 1.0.29 briefly introduced `ue-mcp.local.yml` for user-machine state, then moved that state to `~/.ue-mcp/state.json` in 1.0.30.
+
+    On first load after upgrade, the server detects either legacy file and migrates the contents (project fields → `ue-mcp.yml`, machine state → `~/.ue-mcp/state.json`) automatically, then deletes the legacy file. You don't need to do anything.
+
+### `ue-mcp:` block options
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `version` | `1` | `1` | Schema version; required. Set automatically by init. |
 | `contentRoots` | `string[]` | `["/Game/"]` | Content paths to search when using `asset(action="search")`. Add plugin content roots here if your project uses plugins with their own assets. |
-| `disable` | `string[]` | `[]` | Tool categories to disable. Disabled categories are not registered with the MCP server, reducing context noise for the AI. |
-| `http` | `object` | `undefined` (HTTP server off) | Optional REST surface for the flow engine. Object with `enabled` (bool), `port` (default `7723`), `host` (default `127.0.0.1`). When `enabled: true`, the MCP server also serves `GET /flows`, `GET /flows/<name>/plan`, `POST /flows/<name>/run` over HTTP so external tools can drive flows without an MCP client. |
+| `disable` | `string[]` | `[]` | Tool categories to disable. Disabled categories are not registered with the MCP server, reducing context noise for the AI. Use `"feedback"` here to opt out of the feedback tool entirely. |
+| `http` | `object` | `undefined` (HTTP server off) | Optional REST surface for the flow engine. Object with `enabled` (bool), `port` (default `7723`), `host` (default `127.0.0.1`). When `enabled: true`, the MCP server also serves `GET /flows`, `GET /flows/<name>/plan`, `POST /flows/<name>/run`, and the Server-Sent Events stream at `GET /flows/events` (live per-step lifecycle events; see [Live Observation](flows.md#live-observation-sse)) over HTTP so external tools can drive and observe flows without an MCP client. |
+
+The feedback approval mode (`interactive` / `auto-approve` / `defer`) is intentionally **not** in `ue-mcp.yml` — it varies per developer and per machine, so it lives in `~/.ue-mcp/state.json` and is managed with `npx ue-mcp feedback mode ...` or the `UE_MCP_FEEDBACK_MODE` env var. See [Feedback → modes](feedback.md#feedback-modes).
+
+### User-machine state (`~/.ue-mcp/`)
+
+Machine-specific state that ue-mcp commands write but you wouldn't hand-edit lives under `~/.ue-mcp/`:
+
+| Path | What |
+|------|------|
+| `~/.ue-mcp/state.json` | Two things: (a) per-project `installedHooks` — absolute paths of every Claude Code `settings.json` where ue-mcp installed the feedback PostToolUse hook, keyed by absolute project root; (b) `preferences.feedback.mode` — your personal default for the feedback approval mode (`interactive` / `auto-approve` / `defer`). Maintained by `npx ue-mcp init`, `npx ue-mcp uninstall-hooks`, and `npx ue-mcp feedback mode`. |
+| `~/.ue-mcp/auth.json` | Cached GitHub OAuth token for `feedback(submit)` author=user mode. Mode 600. Written by `npx ue-mcp auth`. |
+| `~/.ue-mcp/pending-feedback/<id>.json` | Submissions captured while `feedback mode` is `defer`. Acted on with `npx ue-mcp feedback list/approve/discard`. |
+
+These files never need to be in your project tree or in version control.
 
 ## Plugins
 
@@ -109,6 +143,23 @@ The C++ bridge plugin enables these UE plugins (adding them to `.uproject` if mi
 - `GameplayAbilities` — for GAS tools
 - `Niagara` — for VFX tools
 - `PCG` — for procedural generation tools
+
+## CLI Subcommands
+
+`npx ue-mcp` exposes a few utility subcommands beyond the default MCP server entry:
+
+| Command | Description |
+|---------|-------------|
+| `npx ue-mcp init` | Interactive setup wizard. Deploys the C++ bridge plugin, writes MCP client configs, scaffolds `ue-mcp.yml`, optionally installs Claude Code skills + feedback prompt hook, optionally runs the GitHub OAuth device flow. Migrates any legacy `.ue-mcp.json` / `ue-mcp.local.yml` it finds. |
+| `npx ue-mcp update` | Re-deploy the C++ bridge plugin to the project. Use after a ue-mcp version bump. |
+| `npx ue-mcp auth` | Run the GitHub device flow standalone so `feedback(submit)` can author issues as your real GitHub user. Same step that lives inside `init`; use this if you skipped it at init time. |
+| `npx ue-mcp uninstall-hooks` | Remove the feedback PostToolUse hook from every Claude Code settings file recorded for this project in `~/.ue-mcp/state.json`. |
+| `npx ue-mcp feedback mode [<mode>]` | Read or set your personal feedback approval mode (`interactive`, `auto-approve`, or `defer`). Stored in `~/.ue-mcp/state.json`. See [Feedback → modes](feedback.md#feedback-modes). |
+| `npx ue-mcp feedback list \| show \| approve \| discard \| review` | Manage submissions queued while feedback mode is `defer`. `review` (experimental) walks the queue interactively (approve/discard/skip per item). See [Feedback → Reviewing deferred submissions](feedback.md#reviewing-deferred-submissions). |
+| `npx ue-mcp resolve <issue>` | Fetch a feedback issue, branch, hand it to Claude Code to implement, open a PR. See [Feedback](feedback.md#resolving-feedback-issues). |
+| `npx ue-mcp plugin install <name>` | Install a ue-mcp plugin from npm and register it in `ue-mcp.yml`. See [Configuration → Plugins](#plugins). |
+| `npx ue-mcp plugin uninstall <name>` | Inverse of install. |
+| `npx ue-mcp plugin create <name>` | Scaffold a new plugin package. See [Plugins](plugins.md). |
 
 ## Editor Lifecycle
 

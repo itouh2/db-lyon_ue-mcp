@@ -25,6 +25,26 @@ const InjectActionSchema = z.object({
 
 export type ManifestInjectAction = z.infer<typeof InjectActionSchema>;
 
+/**
+ * One action contributed by a `provides:` entry. Same shape as inject but
+ * lives under a plugin-owned category, not a built-in one, so action names
+ * are NOT prefixed - the category itself is the namespace.
+ */
+const ProvidedActionSchema = z.object({
+  task: z.string().min(1),
+  description: z.string().optional(),
+  schema: z.record(SchemaFieldSchema).optional(),
+});
+
+export type ManifestProvidedAction = z.infer<typeof ProvidedActionSchema>;
+
+const ProvidedCategorySchema = z.object({
+  description: z.string().optional(),
+  actions: z.record(ProvidedActionSchema),
+});
+
+export type ManifestProvidedCategory = z.infer<typeof ProvidedCategorySchema>;
+
 const TaskEntrySchema = z.object({
   class_path: z.string().min(1),
   description: z.string().optional(),
@@ -45,6 +65,38 @@ const FlowEntrySchema = z.object({
   steps: z.record(FlowStepEntrySchema),
 });
 
+/**
+ * Native UE C++ module that ships with this plugin. When present, the CLI
+ * copies `source/` into the user's project Plugins/ at install time and
+ * tracks the deposit for clean uninstall. The plugin's StartupModule is
+ * expected to register handlers via UEMCP::RegisterExternalHandler (see
+ * MCPHandlerRegistration.h shipped under the bridge's Public/).
+ *
+ *   nativeModule:
+ *     uePluginName: VoxelPCGBridge
+ *     minBridgeApi: 1
+ *     source: ue/Plugins/VoxelPCGBridge
+ *     supportedEngineVersions: ["5.5", "5.6"]
+ *     handlers:
+ *       voxel.sample_density: { description: "..." }
+ */
+const NativeModuleSchema = z.object({
+  uePluginName: z.string().min(1),
+  minBridgeApi: z.number().int().nonnegative(),
+  source: z.string().min(1),
+  supportedEngineVersions: z.array(z.string().min(1)).default([]),
+  handlers: z
+    .record(
+      z.object({
+        description: z.string().optional(),
+        timeoutSeconds: z.number().positive().optional(),
+      }),
+    )
+    .default({}),
+});
+
+export type ManifestNativeModule = z.infer<typeof NativeModuleSchema>;
+
 export const PluginManifestSchema = z.object({
   actionPrefix: z.string().regex(/^[a-z][a-z0-9_]*$/, {
     message: "actionPrefix must be a lowercase identifier (letters, digits, underscore; must start with a letter)",
@@ -52,6 +104,16 @@ export const PluginManifestSchema = z.object({
   minServerVersion: z.string().optional(),
   uePluginDependency: z.string().optional(),
   inject: z.record(z.record(InjectActionSchema)).default({}),
+  provides: z
+    .record(
+      z.string().regex(/^[a-z][a-z0-9_]*$/, {
+        message:
+          "provided category name must be a lowercase identifier (letters, digits, underscore; must start with a letter)",
+      }),
+      ProvidedCategorySchema,
+    )
+    .default({}),
+  nativeModule: NativeModuleSchema.optional(),
   knowledge: z.record(z.string()).default({}),
   tasks: z.record(TaskEntrySchema).default({}),
   flows: z.record(FlowEntrySchema).default({}),

@@ -1,9 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import yaml from "js-yaml";
+import { dumpYaml } from "./yaml-dump.js";
 import { McpError, ErrorCode } from "./errors.js";
 import { info, warn } from "./log.js";
 import { UProjectSchema, UeMcpConfigSchema } from "./schemas.js";
 import { findEngineInstall } from "./deployer.js";
+import { setInstalledHooks, setFeedbackMode, type FeedbackMode } from "./user-state.js";
 
 export interface PluginInfo {
   name: string;
@@ -24,10 +27,6 @@ export interface UeMcpConfig {
     /** Override bind host. Defaults to 127.0.0.1 — do not expose externally. */
     host?: string;
   };
-  /** Absolute paths to Claude Code settings.json files where the ue-mcp
-   *  PostToolUse hook was installed. Maintained by the installer in
-   *  src/hook-installer.ts so uninstall can reach every site. */
-  installedHooks?: string[];
 }
 
 export class ProjectContext {
@@ -215,20 +214,171 @@ export class ProjectContext {
 
   private loadConfig(): void {
     if (!this.projectDir) return;
-    const configPath = path.join(this.projectDir, ".ue-mcp.json");
-    if (!fs.existsSync(configPath)) return;
-    try {
-      const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      const parsed = UeMcpConfigSchema.safeParse(raw);
-      if (!parsed.success) {
-        warn("project", `.ue-mcp.json at ${configPath} did not match expected shape - using defaults`, parsed.error);
-        return;
-      }
-      this.config = parsed.data;
-      info("project", `loaded config from ${configPath}`);
-    } catch (e) {
-      warn("project", `failed to parse .ue-mcp.json at ${configPath} - using defaults`, e);
+
+    // One-time migrations:
+    //   - .ue-mcp.json (pre-1.0.29) → ue-mcp.yml + ~/.ue-mcp/state.json
+    //   - ue-mcp.local.yml (1.0.29 only) → ~/.ue-mcp/state.json
+    //   - ue-mcp.feedback.mode in ue-mcp.yml (1.0.28-1.0.31) → user state
+    // All idempotent no-ops once migrated.
+    migrateLegacyJsonConfig(this.projectDir);
+    migrateLegacyLocalYaml(this.projectDir);
+    migrateLegacyFeedbackModeInYaml(this.projectDir);
+
+    const block = readUeMcpBlock(path.join(this.projectDir, "ue-mcp.yml"));
+    const parsed = UeMcpConfigSchema.safeParse(block);
+    if (!parsed.success) {
+      warn(
+        "project",
+        `ue-mcp.yml ue-mcp: block did not match expected shape - using defaults`,
+        parsed.error,
+      );
+      return;
     }
+    this.config = parsed.data;
+    if (Object.keys(block).length > 0) {
+      info("project", `loaded config from ue-mcp.yml`);
+    }
+  }
+}
+
+/**
+ * Extract the `ue-mcp:` block from a YAML file. Returns {} if the file
+ * doesn't exist, doesn't parse, or doesn't have the block. Caller validates.
+ */
+function readUeMcpBlock(filePath: string): Record<string, unknown> {
+  if (!fs.existsSync(filePath)) return {};
+  try {
+    const raw = yaml.load(fs.readFileSync(filePath, "utf-8")) as
+      | { "ue-mcp"?: Record<string, unknown> }
+      | null
+      | undefined;
+    return (raw && typeof raw === "object" && raw["ue-mcp"] && typeof raw["ue-mcp"] === "object")
+      ? (raw["ue-mcp"] as Record<string, unknown>)
+      : {};
+  } catch (e) {
+    warn("project", `failed to parse ${filePath} - skipping ue-mcp: block from this file`, e);
+    return {};
+  }
+}
+
+/**
+ * Migrate a legacy .ue-mcp.json (pre-1.0.29) into ue-mcp.yml +
+ * ~/.ue-mcp/state.json. Project-level fields land in ue-mcp.yml's
+ * `ue-mcp:` block (merging with any existing fields); `installedHooks`
+ * goes into the user-state file keyed by absolute project root. Deletes
+ * the JSON after a successful migration. Idempotent: no-op when the JSON
+ * file is absent.
+ */
+function migrateLegacyJsonConfig(projectDir: string): void {
+  const jsonPath = path.join(projectDir, ".ue-mcp.json");
+  if (!fs.existsSync(jsonPath)) return;
+
+  let legacy: Record<string, unknown>;
+  try {
+    legacy = JSON.parse(fs.readFileSync(jsonPath, "utf-8")) as Record<string, unknown>;
+  } catch (e) {
+    warn("project", `legacy .ue-mcp.json failed to parse during migration - leaving in place`, e);
+    return;
+  }
+
+  const ymlPath = path.join(projectDir, "ue-mcp.yml");
+  const { installedHooks, ...tracked } = legacy as {
+    installedHooks?: string[];
+  } & Record<string, unknown>;
+
+  // Tracked fields → ue-mcp.yml's `ue-mcp:` block.
+  if (Object.keys(tracked).length > 0) {
+    let existing: Record<string, unknown> = {};
+    if (fs.existsSync(ymlPath)) {
+      try {
+        existing = (yaml.load(fs.readFileSync(ymlPath, "utf-8")) as Record<string, unknown>) ?? {};
+      } catch {
+        existing = {};
+      }
+    }
+    const existingBlock = (existing["ue-mcp"] as Record<string, unknown>) ?? {};
+    existing["ue-mcp"] = { version: 1, ...existingBlock, ...tracked };
+    fs.writeFileSync(ymlPath, dumpYaml(existing), "utf-8");
+  }
+
+  // installedHooks → ~/.ue-mcp/state.json under this project's key.
+  if (Array.isArray(installedHooks) && installedHooks.length > 0) {
+    setInstalledHooks(projectDir, installedHooks);
+  }
+
+  try {
+    fs.unlinkSync(jsonPath);
+    info(
+      "project",
+      `migrated legacy .ue-mcp.json → ue-mcp.yml${installedHooks?.length ? " + ~/.ue-mcp/state.json" : ""}`,
+    );
+  } catch (e) {
+    warn("project", `migration wrote new files but couldn't delete .ue-mcp.json - remove it manually`, e);
+  }
+}
+
+/**
+ * Migrate a `ue-mcp.feedback.mode` entry from ue-mcp.yml (used 1.0.28-1.0.31)
+ * into the user-state preferences. Feedback mode is a per-user-per-device
+ * preference that doesn't belong in tracked project config. Strips the key
+ * from the YAML after copying it. Idempotent.
+ */
+function migrateLegacyFeedbackModeInYaml(projectDir: string): void {
+  const ymlPath = path.join(projectDir, "ue-mcp.yml");
+  if (!fs.existsSync(ymlPath)) return;
+
+  let doc: Record<string, unknown> = {};
+  try {
+    doc = (yaml.load(fs.readFileSync(ymlPath, "utf-8")) as Record<string, unknown>) ?? {};
+  } catch {
+    return;
+  }
+  const block = (doc["ue-mcp"] as Record<string, unknown> | undefined) ?? {};
+  const feedback = block.feedback as { mode?: unknown } | undefined;
+  if (!feedback || typeof feedback.mode !== "string") return;
+  const mode = feedback.mode;
+  if (mode !== "interactive" && mode !== "auto-approve" && mode !== "defer") return;
+
+  setFeedbackMode(mode as FeedbackMode);
+
+  // Strip from yaml.
+  delete (block as Record<string, unknown>).feedback;
+  doc["ue-mcp"] = block;
+  fs.writeFileSync(ymlPath, dumpYaml(doc), "utf-8");
+
+  info(
+    "project",
+    `migrated ue-mcp.feedback.mode="${mode}" from ue-mcp.yml → ~/.ue-mcp/state.json (preferences). Mode is now a per-user setting; run \`npx ue-mcp feedback mode\` to change it.`,
+  );
+}
+
+/**
+ * Migrate a ue-mcp.local.yml (only created by the brief 1.0.29 release)
+ * into ~/.ue-mcp/state.json. Idempotent: no-op when absent.
+ */
+function migrateLegacyLocalYaml(projectDir: string): void {
+  const localPath = path.join(projectDir, "ue-mcp.local.yml");
+  if (!fs.existsSync(localPath)) return;
+
+  let doc: Record<string, unknown> = {};
+  try {
+    doc = (yaml.load(fs.readFileSync(localPath, "utf-8")) as Record<string, unknown>) ?? {};
+  } catch (e) {
+    warn("project", `ue-mcp.local.yml failed to parse during migration - leaving in place`, e);
+    return;
+  }
+  const block = (doc["ue-mcp"] as Record<string, unknown> | undefined) ?? {};
+  const installedHooks = block.installedHooks;
+
+  if (Array.isArray(installedHooks) && installedHooks.length > 0) {
+    setInstalledHooks(projectDir, installedHooks as string[]);
+  }
+
+  try {
+    fs.unlinkSync(localPath);
+    info("project", `migrated ue-mcp.local.yml → ~/.ue-mcp/state.json`);
+  } catch (e) {
+    warn("project", `couldn't delete ue-mcp.local.yml after migration - remove it manually`, e);
   }
 }
 

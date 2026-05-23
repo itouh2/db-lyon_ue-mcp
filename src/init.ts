@@ -2,14 +2,17 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as readline from "node:readline";
+import yaml from "js-yaml";
+import { dumpYaml } from "./yaml-dump.js";
 import { ProjectContext } from "./project.js";
 import { deploy } from "./deployer.js";
 import { installSkills, uninstallSkills } from "./skills.js";
-import { readUserAuth, startDeviceFlow, tryExchangeDeviceCode } from "./auth.js";
 import { warn as logWarn } from "./log.js";
-import { BOLD, CYAN, DIM, GREEN, RED, RESET, YELLOW, fail, info, ok, warn } from "./ui/ansi.js";
+import { BOLD, CYAN, DIM, GREEN, RED, RESET, fail, info, ok, warn } from "./ui/ansi.js";
 import { checkboxSelect, singleSelect, type CheckboxItem } from "./ui/select.js";
 import { installClaudeHooks, uninstallClaudeHooks } from "./hook-installer.js";
+import { runFeedbackAuthStep } from "./auth-cli.js";
+import { getInstalledHooks } from "./user-state.js";
 
 /* ------------------------------------------------------------------ */
 /*  Tool categories                                                    */
@@ -140,37 +143,49 @@ function writeMcpConfig(configPath: string, uprojectPath: string): void {
 }
 
 /* ------------------------------------------------------------------ */
-/*  .ue-mcp.json config                                                */
+/*  ue-mcp.yml config writer                                            */
 /* ------------------------------------------------------------------ */
 
-interface UeMcpInitConfig {
-  contentRoots?: string[];
-  disable?: string[];
-}
-
+/**
+ * Merge tool-category + content-root selections into ue-mcp.yml's `ue-mcp:`
+ * block. Preserves anything already in the file (version, plugins, tasks,
+ * flows, http, feedback, etc.).
+ */
 function writeProjectConfig(projectDir: string, disabled: string[]): void {
-  const configPath = path.join(projectDir, ".ue-mcp.json");
-  let existing: UeMcpInitConfig = {};
+  const configPath = path.join(projectDir, "ue-mcp.yml");
+  let existing: Record<string, unknown> = {};
   if (fs.existsSync(configPath)) {
     try {
-      existing = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      existing = (yaml.load(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>) ?? {};
     } catch (e) {
-      logWarn("init", `.ue-mcp.json was not valid JSON - overwriting`, e);
+      logWarn("init", `ue-mcp.yml was not valid YAML - overwriting`, e);
+      existing = {};
     }
   }
 
+  const block = ((existing["ue-mcp"] as Record<string, unknown>) ?? {});
+  if (typeof block.version !== "number") block.version = 1;
+
   if (disabled.length > 0) {
-    existing.disable = disabled;
+    block.disable = disabled;
   } else {
-    delete existing.disable;
+    delete block.disable;
   }
 
-  if (!existing.contentRoots) {
-    existing.contentRoots = ["/Game/"];
+  if (!Array.isArray(block.contentRoots) || (block.contentRoots as unknown[]).length === 0) {
+    block.contentRoots = ["/Game/"];
   }
 
-  fs.writeFileSync(configPath, JSON.stringify(existing, null, 2));
+  existing["ue-mcp"] = block;
+
+  // Ensure tasks/flows blocks exist so the scaffold matches the version
+  // ue-mcp init creates from scratch. Other top-level keys are preserved.
+  if (!("tasks" in existing)) existing.tasks = {};
+  if (!("flows" in existing)) existing.flows = {};
+
+  fs.writeFileSync(configPath, dumpYaml(existing), "utf-8");
 }
+
 
 /* ------------------------------------------------------------------ */
 /*  Plugin enablement                                                  */
@@ -226,96 +241,6 @@ function askPath(): Promise<string> {
 }
 
 /* ------------------------------------------------------------------ */
-/*  GitHub feedback authorship (OAuth device flow)                     */
-/* ------------------------------------------------------------------ */
-
-async function runFeedbackAuthStep(): Promise<void> {
-  console.log("");
-  console.log(
-    `  ${BOLD}${CYAN}Feedback authorship${RESET}  ${DIM}(GitHub OAuth, optional)${RESET}`,
-  );
-
-  const cached = await readUserAuth();
-  if (cached) {
-    ok(`Feedback issues will author as @${cached.login} (cached token reused)`);
-    return;
-  }
-
-  console.log(
-    `  ${DIM}feedback(submit) defaults to authoring issues as your GitHub user.${RESET}`,
-  );
-  console.log(
-    `  ${DIM}Without a cached OAuth token, every submission will refuse until${RESET}`,
-  );
-  console.log(
-    `  ${DIM}you either authorize here, or call feedback(submit) with author="bot"${RESET}`,
-  );
-  console.log(
-    `  ${DIM}to post anonymously as the ue-mcp-feedback bot.${RESET}`,
-  );
-  console.log("");
-
-  const choice = await singleSelect("Authorize now?", [
-    "Yes - run device flow now (recommended)",
-    `Skip - feedback submissions will refuse until I run \`npx ue-mcp auth\` or call with author="bot"`,
-  ]);
-  if (choice !== 0) {
-    info(`Skipped. Run npx ue-mcp auth to set this up later, or pass author="bot" at submit time.`);
-    return;
-  }
-
-  let pending;
-  try {
-    pending = await startDeviceFlow();
-  } catch (e) {
-    warn(`Device flow start failed: ${e instanceof Error ? e.message : e}`);
-    info(`Submissions will refuse until you run \`npx ue-mcp auth\` or call with author="bot".`);
-    return;
-  }
-
-  console.log("");
-  console.log(`  ${BOLD}1.${RESET} Open: ${CYAN}${pending.verification_uri}${RESET}`);
-  console.log(`  ${BOLD}2.${RESET} Enter code: ${BOLD}${YELLOW}${pending.user_code}${RESET}`);
-  console.log(`  ${BOLD}3.${RESET} Authorize the ue-mcp-feedback app`);
-  console.log("");
-  console.log(`  ${DIM}Polling every ${pending.interval}s. Code expires in ~15 min. Ctrl-C to skip.${RESET}`);
-
-  const deadline = pending.expires_at * 1000;
-  process.stdout.write("  ");
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, pending.interval * 1000));
-    let result;
-    try {
-      result = await tryExchangeDeviceCode(pending);
-    } catch (e) {
-      console.log("");
-      warn(`Auth failed: ${e instanceof Error ? e.message : e}`);
-      info(`Submissions will refuse until you re-run \`npx ue-mcp auth\` or call with author="bot".`);
-      return;
-    }
-    if (result.kind === "auth") {
-      console.log("");
-      ok(`Authorized as @${result.auth.login}`);
-      info(`Token cached at ~/.ue-mcp/auth.json (mode 600)`);
-      return;
-    }
-    if (result.kind === "expired") {
-      console.log("");
-      warn("Device code expired. Re-run npx ue-mcp init to retry.");
-      return;
-    }
-    if (result.kind === "denied") {
-      console.log("");
-      warn(`Authorization denied. Submissions will refuse until you re-run auth or call with author="bot".`);
-      return;
-    }
-    process.stdout.write(".");
-  }
-  console.log("");
-  warn(`Timed out waiting for authorization. Submissions will refuse until you re-run auth or call with author="bot".`);
-}
-
-/* ------------------------------------------------------------------ */
 /*  Main init flow                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -357,9 +282,10 @@ async function init() {
   );
   console.log("");
 
-  // On re-init, respect prior opt-outs in .ue-mcp.json so the user doesn't
+  // On re-init, respect prior opt-outs in ue-mcp.yml so the user doesn't
   // have to re-uncheck categories they already disabled. project.config is
-  // populated by ProjectContext.setProject above.
+  // populated by ProjectContext.setProject above (which also migrates any
+  // legacy .ue-mcp.json into the YAML files on first run).
   const existingDisabled = new Set(project.config.disable ?? []);
 
   // 2. Tool category selection — interactive checkboxes with descriptions
@@ -424,7 +350,7 @@ async function init() {
     ok("Required plugins already enabled");
   }
 
-  // .ue-mcp.json is written at the end of init() once all decisions
+  // ue-mcp.yml is written at the end of init() once all decisions
   // (categories, MCP clients, agent behavior) are settled — see step 10.
 
   // 7. Scaffold ue-mcp.yml if it doesn't exist
@@ -524,18 +450,33 @@ async function init() {
   // Claude-Code-only rows (prompt hook + skills + OAuth). The hook and OAuth
   // are nested under feedback: if the user opts out of feedback, the hook
   // and the GitHub device flow are not even offered.
+  //
+  // Every checkbox in this section defaults OFF on a fresh install. A user
+  // who blasts through with Enter gets nothing added — no tool registered,
+  // no hook installed, no skill files copied. Re-init preserves prior
+  // choices by reading state from ue-mcp.yml (categories) +
+  // ~/.ue-mcp/state.json (installedHooks) and the filesystem (skills directory).
   const configuredClaudeCode = detected.some(
     (c, i) => c.name.startsWith("Claude Code") && clientStates[i],
   );
 
   console.log("");
 
+  // ue-mcp.yml existing means init has been run before in this project
+  // (or a legacy .ue-mcp.json was migrated into it). We use that as the
+  // "this is a re-init" signal: prior choices should be honored. On a
+  // fresh install (no config file yet), default all Agent behavior off
+  // regardless of what the eventual disable[] would look like.
+  const ueMcpYmlPathForSeed = path.join(project.projectDir!, "ue-mcp.yml");
+  const isReInit = fs.existsSync(ueMcpYmlPathForSeed);
+
   const behaviorItems: CheckboxItem[] = [
     {
       label: "Enable feedback(submit) tool for filing tool-gap issues",
-      checked: !existingDisabled.has("feedback"),
+      // Fresh install: off. Re-init: on unless they previously disabled it.
+      checked: isReInit && !existingDisabled.has("feedback"),
       suffix:
-        "calls block on a user-approval prompt before anything is posted to a public tracker",
+        "Recommended. Calls block on a user-approval prompt before anything is posted to a public tracker.",
     },
   ];
   if (configuredClaudeCode) {
@@ -548,8 +489,10 @@ async function init() {
       ".claude",
       "settings.json",
     );
+    // Hook install registry lives in ~/.ue-mcp/state.json keyed by
+    // project root, not in project.config.
     const installedHookSites = new Set(
-      (project.config.installedHooks ?? []).map((p) => path.resolve(p)),
+      getInstalledHooks(project.projectDir!).map((p) => path.resolve(p)),
     );
     const hookCurrentlyInstalled = installedHookSites.has(
       path.resolve(claudeSettingsPathForSeed),
@@ -561,17 +504,18 @@ async function init() {
 
     behaviorItems.push({
       label: "Auto-nudge agent to offer feedback after execute_python",
-      // Default off on fresh install (opt-in). On re-init: respect prior
-      // choice by reading the install registry.
+      // Fresh install: off (opt-in only). Re-init: respect prior install.
       checked: hookCurrentlyInstalled,
       suffix:
-        "installs a PostToolUse hook in .claude/settings.json; ignored if feedback is off",
+        "Opt-in. Installs a PostToolUse hook in .claude/settings.json; ignored if feedback is off.",
     });
     behaviorItems.push({
       label: "Install bundled Claude Code skills (workflow guides)",
-      // Default on for fresh installs; respect prior uninstall on re-init.
-      checked: !fs.existsSync(skillsDir) || skillsCurrentlyInstalled,
-      suffix: "copies skill markdown into .claude/skills/",
+      // Fresh install: off. Re-init: on if any skill file is currently
+      // present (a non-empty skills dir means they were installed before).
+      checked: skillsCurrentlyInstalled,
+      suffix:
+        "Recommended for Claude Code. Copies skill markdown into .claude/skills/.",
     });
   }
 
@@ -641,13 +585,13 @@ async function init() {
     }
   }
 
-  // 10. Write .ue-mcp.json with the final disable[] — done last so the
+  // 10. Write ue-mcp.yml with the final disable[] — done last so the
   // feedback toggle from step 9 is captured. contentRoots seeding lives
   // inside writeProjectConfig.
-  const ueMcpJsonPath = path.join(project.projectDir!, ".ue-mcp.json");
+  const ueMcpYmlPath = path.join(project.projectDir!, "ue-mcp.yml");
   writeProjectConfig(project.projectDir!, disabled);
-  ok(".ue-mcp.json written");
-  wrote.push({ what: "tool surface + content roots", where: ueMcpJsonPath });
+  ok("ue-mcp.yml written");
+  wrote.push({ what: "tool surface + content roots", where: ueMcpYmlPath });
 
   // 11. Done — recap what landed where so the user can find / undo anything.
   console.log("");
