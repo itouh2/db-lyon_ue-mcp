@@ -181,6 +181,11 @@ function ensurePythonPlugin(uprojectPath: string): boolean {
 /* ------------------------------------------------------------------ */
 
 function deployCppPlugin(uprojectPath: string): boolean {
+  // [CCB-PATCH] auto-copy to Plugins/UE_MCP_Bridge/ disabled.
+  // Plugin is managed manually as Plugins/_gitX_ue_mcp_bridge_db-lyon/.
+  // Revert this return to re-enable native init/deploy/set_project copying.
+  return false;
+
   const projectDir = path.dirname(uprojectPath);
   const pluginsDir = path.join(projectDir, "Plugins");
 
