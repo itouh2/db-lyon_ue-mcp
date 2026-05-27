@@ -82,32 +82,4 @@ private:
 	// #186 — apply damage to PIE actor
 	static TSharedPtr<FJsonValue> ApplyDamageInPie(const TSharedPtr<FJsonObject>& Params);
 
-	// PIE input injection (inject_input + continuous + tape).
-	static TSharedPtr<FJsonValue> InjectInput(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> InjectInputStart(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> InjectInputUpdate(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> InjectInputStop(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> InjectInputTape(const TSharedPtr<FJsonObject>& Params);
-
-	// PIE record (arm/disarm/stop/status/list/read/delete/mark).
-	static TSharedPtr<FJsonValue> PieRecordArm(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieRecordDisarm(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieRecordStop(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieRecordStatus(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieRecordList(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieRecordRead(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieRecordDelete(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieMark(const TSharedPtr<FJsonObject>& Params);
-
-	// PIE replay (arm/disarm/stop/status).
-	static TSharedPtr<FJsonValue> PieReplayArm(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieReplayDisarm(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieReplayStop(const TSharedPtr<FJsonObject>& Params);
-	static TSharedPtr<FJsonValue> PieReplayStatus(const TSharedPtr<FJsonObject>& Params);
-
-	// Offline pawn-state diff of two recordings.
-	static TSharedPtr<FJsonValue> PieRecordDiff(const TSharedPtr<FJsonObject>& Params);
-
-	// Full UProperty dump of a live PIE actor to JSON (snapshots/<name>.json).
-	static TSharedPtr<FJsonValue> PieSnapshot(const TSharedPtr<FJsonObject>& Params);
 };

@@ -15,24 +15,39 @@ function findUEBuildTool(): string | null {
   const envPath = process.env.UE_BUILD_TOOL_PATH;
   if (envPath) return envPath;
 
-  // Preserve order: 5.7 first (newest likely to be used), fall back down.
   const versions = ["5.7", "5.6", "5.5", "5.4", "5.3"];
-  const searchRoots = [
-    "C:/Program Files/Epic Games",
-    "D:/Program Files/Epic Games",
-    "E:/Program Files/Epic Games",
-    "C:/Epic Games",
-    "D:/Epic Games",
-    "E:/Epic Games",
-  ];
+  const scriptName = IS_WINDOWS ? "Build.bat" : "Build.sh";
+
+  const searchRoots: string[] = IS_WINDOWS
+    ? [
+        "C:/Program Files/Epic Games",
+        "D:/Program Files/Epic Games",
+        "E:/Program Files/Epic Games",
+        "C:/Epic Games",
+        "D:/Epic Games",
+        "E:/Epic Games",
+      ]
+    : process.platform === "darwin"
+      ? ["/Users/Shared/Epic Games"]
+      : [
+          path.join(process.env.HOME ?? "/home", "UnrealEngine"),
+          "/opt/UnrealEngine",
+        ];
 
   for (const basePath of searchRoots) {
     for (const version of versions) {
-      const buildToolPath = path.join(basePath, `UE_${version}`, "Engine", "Build", "BatchFiles", "Build.bat");
+      const buildToolPath = path.join(basePath, `UE_${version}`, "Engine", "Build", "BatchFiles", scriptName);
       if (fs.existsSync(buildToolPath)) {
         return buildToolPath;
       }
     }
+  }
+
+  // Linux source builds: ~/UnrealEngine/Engine/Build/BatchFiles/Build.sh (no version subdir)
+  if (!IS_WINDOWS && process.platform !== "darwin") {
+    const home = process.env.HOME ?? "/home";
+    const sourceBuild = path.join(home, "UnrealEngine", "Engine", "Build", "BatchFiles", "Build.sh");
+    if (fs.existsSync(sourceBuild)) return sourceBuild;
   }
 
   return null;
@@ -232,4 +247,74 @@ export async function restartEditor(project: ProjectContext, bridge?: { connect:
   }
 
   return startResult;
+}
+
+export interface BuildResult {
+  success: boolean;
+  message: string;
+  exitCode: number | null;
+}
+
+function getPlatformString(): string {
+  if (IS_WINDOWS) return "Win64";
+  if (process.platform === "darwin") return "Mac";
+  return "Linux";
+}
+
+export async function buildProject(
+  projectPath: string,
+  opts: { onOutput?: (line: string) => void } = {},
+): Promise<BuildResult> {
+  const buildTool = findUEBuildTool();
+  if (!buildTool) {
+    return {
+      success: false,
+      exitCode: null,
+      message:
+        "Unreal Engine build tool not found. Set UE_BUILD_TOOL_PATH or install UE5.3+ to a default location.",
+    };
+  }
+
+  const resolvedPath = path.resolve(projectPath);
+  if (!fs.existsSync(resolvedPath)) {
+    return { success: false, exitCode: null, message: `Project file not found: ${resolvedPath}` };
+  }
+
+  const projectName = path.basename(resolvedPath, ".uproject");
+  const target = `${projectName}Editor`;
+  const platform = getPlatformString();
+
+  const buildArgs = [target, platform, "Development", `-Project="${resolvedPath}"`, "-WaitMutex", "-FromMsBuild"];
+
+  return new Promise((resolve) => {
+    let proc;
+    if (IS_WINDOWS) {
+      const quotedCommand = `"${buildTool}"`;
+      const fullCommand = `cmd /c "${quotedCommand} ${buildArgs.join(" ")}"`;
+      proc = spawn(fullCommand, [], { shell: true, stdio: "pipe" });
+    } else {
+      proc = spawn(buildTool, buildArgs, { stdio: "pipe" });
+    }
+
+    const forward = (data: Buffer) => {
+      const text = data.toString();
+      if (opts.onOutput) opts.onOutput(text);
+      else process.stdout.write(text);
+    };
+
+    if (proc.stdout) proc.stdout.on("data", forward);
+    if (proc.stderr) proc.stderr.on("data", forward);
+
+    proc.on("close", (code) => {
+      resolve(
+        code === 0
+          ? { success: true, exitCode: 0, message: "Build succeeded" }
+          : { success: false, exitCode: code, message: `Build failed with exit code ${code}` },
+      );
+    });
+
+    proc.on("error", (err) => {
+      resolve({ success: false, exitCode: null, message: `Build error: ${err.message}` });
+    });
+  });
 }

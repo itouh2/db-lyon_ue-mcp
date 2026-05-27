@@ -88,8 +88,8 @@ The `plugins:` array in **`ue-mcp.yml`** declares npm packages that inject new a
 
 ```yaml
 plugins:
-  - name: ue-mcp-plugin-voxel-plugin
-  - name: ue-mcp-plugin-my-other-thing
+  - name: pie-transport
+  - name: some-other-plugin
     version: "0.2.x"        # optional - npm semver range
 ```
 
@@ -108,7 +108,7 @@ Order matters: earlier entries win on inter-plugin action-name collisions. A plu
 
 A plugin can declare `uePluginDependency: <PluginName>` in its `ue-mcp.plugin.yml`. The MCP server checks the project's `.uproject` for `Plugins[].Name == "<PluginName>"` and exposes the result as `uePluginPresent` in `plugins(action="list")`. The npm side loads regardless — the flag is a signal that the host UE plugin needs to be enabled before the injected actions will actually run.
 
-For example, `ue-mcp-plugin-voxel-plugin` declares `uePluginDependency: Voxel`. Until `Voxel` is added to `<Project>.uproject`'s `Plugins` array (and the C++ modules are built), `voxel_build_scatter_graph` is loaded but will fail at execute time.
+For example, a plugin that declares `uePluginDependency: SomePlugin` will report `uePluginPresent: false` until `SomePlugin` is added to `<Project>.uproject`'s `Plugins` array and the C++ modules are built.
 
 ## Bridge Connection
 
@@ -151,7 +151,9 @@ The C++ bridge plugin enables these UE plugins (adding them to `.uproject` if mi
 | Command | Description |
 |---------|-------------|
 | `npx ue-mcp init` | Interactive setup wizard. Deploys the C++ bridge plugin, writes MCP client configs, scaffolds `ue-mcp.yml`, optionally installs Claude Code skills + feedback prompt hook, optionally runs the GitHub OAuth device flow. Migrates any legacy `.ue-mcp.json` / `ue-mcp.local.yml` it finds. |
-| `npx ue-mcp update` | Re-deploy the C++ bridge plugin to the project. Use after a ue-mcp version bump. |
+| `npx ue-mcp update` | Check npm for the latest version and install it. Pass `--deploy` to also redeploy the plugin sources. |
+| `npx ue-mcp deploy` | Copy the C++ bridge plugin sources into the project. Use after `ue-mcp update` or to force a redeploy. |
+| `npx ue-mcp build` | Build the project C++ code using Unreal Build Tool. Stop the editor first. |
 | `npx ue-mcp auth` | Run the GitHub device flow standalone so `feedback(submit)` can author issues as your real GitHub user. Same step that lives inside `init`; use this if you skipped it at init time. |
 | `npx ue-mcp uninstall-hooks` | Remove the feedback PostToolUse hook from every Claude Code settings file recorded for this project in `~/.ue-mcp/state.json`. |
 | `npx ue-mcp feedback mode [<mode>]` | Read or set your personal feedback approval mode (`interactive`, `auto-approve`, or `defer`). Stored in `~/.ue-mcp/state.json`. See [Feedback → modes](feedback.md#feedback-modes). |
@@ -170,3 +172,4 @@ The server can manage the editor process:
 | `editor(action="start_editor")` | Launch UE with the current project |
 | `editor(action="stop_editor")` | Gracefully stop the editor |
 | `editor(action="restart_editor")` | Stop and relaunch |
+| `editor(action="build_project")` | Build the project C++ code via UBT |

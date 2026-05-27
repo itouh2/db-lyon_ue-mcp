@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { EditorBridge } from "./bridge.js";
 import { ProjectContext } from "./project.js";
+import { attach, attachSummary } from "./deployer.js";
 import { SERVER_INSTRUCTIONS } from "./instructions.js";
 import { isDirectiveResponse, type ToolDef, type ToolContext, type PluginInfo, type ElicitFn } from "./types.js";
 import { McpError, ErrorCode } from "./errors.js";
@@ -50,9 +51,10 @@ async function main() {
       project.setProject(projectArg);
       console.error(`[ue-mcp] Project loaded: ${project.projectName} (engine ${project.engineAssociation ?? "unknown"})`);
 
-      // attach() was disabled: it writes PythonScriptPlugin / UE_MCP_Bridge
-      // into .uproject on every startup, producing churn in version control.
-      // Run `ue-mcp init` / `ue-mcp update` explicitly when bridge setup is needed.
+      // Non-destructive attach — never overwrites local bridge source.
+      // Source deployment is reserved for `ue-mcp init` / `ue-mcp deploy`.
+      const result = attach(project);
+      console.error(`[ue-mcp] ${attachSummary(result)}`);
     } catch (e) {
       console.error(`[ue-mcp] Failed to initialize project: ${e instanceof Error ? e.message : e}`);
     }
@@ -354,6 +356,9 @@ if (subcmd === "init") {
 } else if (subcmd === "update") {
   process.argv.splice(2, 1);
   import("./update.js");
+} else if (subcmd === "deploy") {
+  process.argv.splice(2, 1);
+  import("./deploy-cli.js");
 } else if (subcmd === "hook") {
   import("./hook-handler.js");
 } else if (subcmd === "uninstall-hooks") {
@@ -367,6 +372,9 @@ if (subcmd === "init") {
   import("./feedback-cli.js");
 } else if (subcmd === "resolve") {
   import("./resolve.js");
+} else if (subcmd === "build") {
+  process.argv.splice(2, 1);
+  import("./build-cli.js");
 } else if (subcmd === "plugin") {
   process.argv.splice(2, 1);
   import("./plugin-cli.js");

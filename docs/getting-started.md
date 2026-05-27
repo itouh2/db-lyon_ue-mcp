@@ -99,11 +99,28 @@ See the [Tool Reference](tool-reference.md) for everything available.
 
 ## Updating
 
-Run from your project directory whenever a new UE-MCP version ships:
+Update to the latest version and deploy the new plugin sources in one step:
 
 ```bash
-npx ue-mcp update
+npx ue-mcp update --deploy
 ```
+
+Or separately:
+
+```bash
+npx ue-mcp update              # pull the latest from npm
+npx ue-mcp deploy              # copy plugin sources into your project
+```
+
+## Building the project
+
+To build your project's C++ code from the command line:
+
+```bash
+npx ue-mcp build
+```
+
+Stop the editor first. Pass a `.uproject` path if you're not in the project directory. AI agents can also trigger builds via `editor(action="build_project")`.
 
 ## Unattended agent sessions
 
@@ -182,7 +199,7 @@ If you'd rather skip `npx ue-mcp init`, edit the MCP client config yourself.
     }
     ```
 
-The first run auto-deploys the C++ plugin. To deploy explicitly: `npx ue-mcp update <path>`, then restart the editor.
+The first run auto-deploys the C++ plugin. To deploy explicitly: `npx ue-mcp deploy`, then restart the editor.
 
 ## Where to next
 
