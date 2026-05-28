@@ -160,6 +160,12 @@ function readUpluginVersion(upluginPath: string): string | null {
 /* ------------------------------------------------------------------ */
 
 function ensurePythonPlugin(uprojectPath: string): boolean {
+  // [CCB-PATCH] .uproject auto-write disabled. CcbRace manages PythonScriptPlugin
+  // manually in CcbRace.uproject / _gitX_CcbRace.uproject. Even with the idempotent
+  // `already` guard, this function was observed adding entries at UE startup.
+  // Revert this return to re-enable native auto-enable behavior.
+  return false;
+
   const raw = fs.readFileSync(uprojectPath, "utf-8");
   const root = JSON.parse(raw);
 
@@ -243,6 +249,12 @@ function deployCppPlugin(uprojectPath: string): boolean {
 }
 
 function ensureCppPluginEnabled(uprojectPath: string): boolean {
+  // [CCB-PATCH] .uproject auto-write disabled. CcbRace manages UE_MCP_Bridge
+  // manually in CcbRace.uproject / _gitX_CcbRace.uproject. Even with the idempotent
+  // `already` guard, this function was observed adding entries at UE startup.
+  // Revert this return to re-enable native auto-enable behavior.
+  return false;
+
   const raw = fs.readFileSync(uprojectPath, "utf-8");
   const root = JSON.parse(raw);
 
