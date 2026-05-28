@@ -1,7 +1,7 @@
-# PIE Record / Replay / Observe
+# PIE Studio
 
 !!! note "Plugin required"
-    These actions are provided by the [`pie-transport`](https://github.com/db-lyon/pie-transport) plugin. Install with `ue-mcp plugin install pie-transport`, rebuild, and restart.
+    These actions are provided by the [`pie-studio`](https://github.com/db-lyon/pie-studio) plugin. Install with `ue-mcp plugin install pie-studio`, rebuild, and restart.
 
 Three independent systems for PIE sessions, each with its own domain:
 
@@ -17,9 +17,9 @@ All three can run simultaneously in the same PIE session.
 
 A **Record** button sits next to Play/Stop in the editor transport bar. Click it to arm the recorder and start PIE in one action.
 
-### MCP PIE panel
+### PIE Studio panel
 
-Open **Window > Tools > MCP PIE** for a dockable panel with:
+Open **Window > Tools > PIE Studio** for a dockable panel with:
 
 - **Recorder** - Record + Play, Arm, Disarm, Stop
 - **Replayer** - Disarm, Stop
