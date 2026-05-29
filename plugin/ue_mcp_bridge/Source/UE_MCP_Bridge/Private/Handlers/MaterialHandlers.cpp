@@ -3,6 +3,7 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerAssetCreate.h"
+#include "MaterialDomain.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInstanceConstant.h"
@@ -78,6 +79,15 @@ void FMaterialHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 
 	Registry.RegisterHandler(TEXT("create_material_simple"), &CreateMaterialSimple);
 	Registry.RegisterHandler(TEXT("set_material_usage"), &SetMaterialUsage);
+
+	// #463: MaterialFunction authoring.
+	Registry.RegisterHandler(TEXT("create_material_function"), &CreateMaterialFunction);
+	Registry.RegisterHandler(TEXT("add_material_function_expression"), &AddMaterialFunctionExpression);
+	Registry.RegisterHandler(TEXT("add_expression_in_function"), &AddMaterialFunctionExpression);
+	Registry.RegisterHandler(TEXT("connect_material_function_expressions"), &ConnectMaterialFunctionExpressions);
+	Registry.RegisterHandler(TEXT("connect_expressions_in_function"), &ConnectMaterialFunctionExpressions);
+	Registry.RegisterHandler(TEXT("list_material_function_expressions"), &ListMaterialFunctionExpressions);
+	Registry.RegisterHandler(TEXT("list_expressions_in_function"), &ListMaterialFunctionExpressions);
 }
 
 UMaterial* FMaterialHandlers::LoadMaterialFromPath(const FString& AssetPath)
@@ -825,17 +835,45 @@ TSharedPtr<FJsonValue> FMaterialHandlers::AddMaterialExpression(const TSharedPtr
 
 	// Constant3Vector: bare value assignment (the previous SetMaterialBaseColor
 	// pattern needed a wrapper helper; expose direct authoring here).
+	// #444: also accept {R,G,B,A} or {x,y,z,w} dict shapes.
+	auto ReadColorAny = [](const TSharedPtr<FJsonObject>& Obj, FLinearColor& Out) -> bool
+	{
+		double R = 0, G = 0, B = 0, A = 1; bool bAny = false;
+		auto Pick = [&](const TCHAR* L, const TCHAR* U, const TCHAR* Alt, double& Slot)
+		{
+			double V; if (Obj->TryGetNumberField(L, V) || Obj->TryGetNumberField(U, V) || Obj->TryGetNumberField(Alt, V)) { Slot = V; bAny = true; }
+		};
+		Pick(TEXT("r"), TEXT("R"), TEXT("x"), R);
+		Pick(TEXT("g"), TEXT("G"), TEXT("y"), G);
+		Pick(TEXT("b"), TEXT("B"), TEXT("z"), B);
+		Pick(TEXT("a"), TEXT("A"), TEXT("w"), A);
+		Out = FLinearColor((float)R, (float)G, (float)B, (float)A);
+		return bAny;
+	};
 	if (UMaterialExpressionConstant3Vector* Const3 = Cast<UMaterialExpressionConstant3Vector>(NewExpression))
 	{
 		const TSharedPtr<FJsonObject>* ConstColor = nullptr;
-		if (Params->TryGetObjectField(TEXT("value"), ConstColor) && ConstColor && (*ConstColor).IsValid())
+		FLinearColor Col = Const3->Constant;
+		if (Params->TryGetObjectField(TEXT("value"), ConstColor) && ConstColor && (*ConstColor).IsValid() && ReadColorAny(*ConstColor, Col))
 		{
-			double R = 0.0, G = 0.0, B = 0.0, A = 1.0;
-			(*ConstColor)->TryGetNumberField(TEXT("r"), R);
-			(*ConstColor)->TryGetNumberField(TEXT("g"), G);
-			(*ConstColor)->TryGetNumberField(TEXT("b"), B);
-			(*ConstColor)->TryGetNumberField(TEXT("a"), A);
-			Const3->Constant = FLinearColor((float)R, (float)G, (float)B, (float)A);
+			Const3->Constant = Col;
+		}
+		else if (Params->TryGetObjectField(TEXT("defaultValue"), ConstColor) && ConstColor && (*ConstColor).IsValid() && ReadColorAny(*ConstColor, Col))
+		{
+			Const3->Constant = Col;
+		}
+	}
+	if (UMaterialExpressionConstant4Vector* Const4 = Cast<UMaterialExpressionConstant4Vector>(NewExpression))
+	{
+		const TSharedPtr<FJsonObject>* ConstColor = nullptr;
+		FLinearColor Col = Const4->Constant;
+		if (Params->TryGetObjectField(TEXT("value"), ConstColor) && ConstColor && (*ConstColor).IsValid() && ReadColorAny(*ConstColor, Col))
+		{
+			Const4->Constant = Col;
+		}
+		else if (Params->TryGetObjectField(TEXT("defaultValue"), ConstColor) && ConstColor && (*ConstColor).IsValid() && ReadColorAny(*ConstColor, Col))
+		{
+			Const4->Constant = Col;
 		}
 	}
 	if (UMaterialExpressionConstant* Const1 = Cast<UMaterialExpressionConstant>(NewExpression))
@@ -1428,80 +1466,81 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetExpressionValue(const TSharedPtr<FJ
 	// Handle UMaterialExpressionConstant3Vector - has FLinearColor Constant
 	else if (UMaterialExpressionConstant3Vector* Const3Expr = Cast<UMaterialExpressionConstant3Vector>(Expression))
 	{
-		const TSharedPtr<FJsonObject>* ColorObj = nullptr;
-		if (Params->TryGetObjectField(TEXT("value"), ColorObj))
+		// #444: accept {r,g,b,a} or {R,G,B,A} or {x,y,z,w} in value object,
+		// or top-level r/g/b/a/x/y/z/w fields.
+		auto ReadColor = [](const TSharedPtr<FJsonObject>& Obj, FLinearColor& Out) -> bool
 		{
-			double R = 0.0, G = 0.0, B = 0.0, A = 1.0;
-			(*ColorObj)->TryGetNumberField(TEXT("r"), R);
-			(*ColorObj)->TryGetNumberField(TEXT("g"), G);
-			(*ColorObj)->TryGetNumberField(TEXT("b"), B);
-			(*ColorObj)->TryGetNumberField(TEXT("a"), A);
-			Const3Expr->Constant = FLinearColor(R, G, B, A);
-			bValueSet = true;
-
-			TSharedPtr<FJsonObject> ColorResult = MakeShared<FJsonObject>();
-			ColorResult->SetNumberField(TEXT("r"), R);
-			ColorResult->SetNumberField(TEXT("g"), G);
-			ColorResult->SetNumberField(TEXT("b"), B);
-			ColorResult->SetNumberField(TEXT("a"), A);
-			Result->SetObjectField(TEXT("value"), ColorResult);
-		}
-		else
-		{
-			// Also support individual r, g, b, a fields directly
-			double R = 0.0, G = 0.0, B = 0.0, A = 1.0;
-			bool bHasR = Params->TryGetNumberField(TEXT("r"), R);
-			bool bHasG = Params->TryGetNumberField(TEXT("g"), G);
-			bool bHasB = Params->TryGetNumberField(TEXT("b"), B);
-			Params->TryGetNumberField(TEXT("a"), A);
-			if (bHasR || bHasG || bHasB)
+			double R = 0, G = 0, B = 0, A = 1; bool bAny = false;
+			auto Pick = [&](const TCHAR* L, const TCHAR* U, const TCHAR* Alt, double& Slot)
 			{
-				Const3Expr->Constant = FLinearColor(R, G, B, A);
-				bValueSet = true;
-				Result->SetNumberField(TEXT("r"), R);
-				Result->SetNumberField(TEXT("g"), G);
-				Result->SetNumberField(TEXT("b"), B);
-				Result->SetNumberField(TEXT("a"), A);
-			}
+				double V; if (Obj->TryGetNumberField(L, V) || Obj->TryGetNumberField(U, V) || Obj->TryGetNumberField(Alt, V)) { Slot = V; bAny = true; }
+			};
+			Pick(TEXT("r"), TEXT("R"), TEXT("x"), R);
+			Pick(TEXT("g"), TEXT("G"), TEXT("y"), G);
+			Pick(TEXT("b"), TEXT("B"), TEXT("z"), B);
+			Pick(TEXT("a"), TEXT("A"), TEXT("w"), A);
+			Out = FLinearColor((float)R, (float)G, (float)B, (float)A);
+			return bAny;
+		};
+		const TSharedPtr<FJsonObject>* ColorObj = nullptr;
+		FLinearColor Color = Const3Expr->Constant;
+		if (Params->TryGetObjectField(TEXT("value"), ColorObj) && *ColorObj && ReadColor(*ColorObj, Color))
+		{
+			Const3Expr->Constant = Color;
+			bValueSet = true;
+		}
+		else if (ReadColor(Params, Color))
+		{
+			Const3Expr->Constant = Color;
+			bValueSet = true;
+		}
+		if (bValueSet)
+		{
+			TSharedPtr<FJsonObject> ColorResult = MakeShared<FJsonObject>();
+			ColorResult->SetNumberField(TEXT("r"), Const3Expr->Constant.R);
+			ColorResult->SetNumberField(TEXT("g"), Const3Expr->Constant.G);
+			ColorResult->SetNumberField(TEXT("b"), Const3Expr->Constant.B);
+			ColorResult->SetNumberField(TEXT("a"), Const3Expr->Constant.A);
+			Result->SetObjectField(TEXT("value"), ColorResult);
 		}
 	}
 	// Handle UMaterialExpressionConstant4Vector
 	else if (UMaterialExpressionConstant4Vector* Const4Expr = Cast<UMaterialExpressionConstant4Vector>(Expression))
 	{
-		const TSharedPtr<FJsonObject>* ColorObj = nullptr;
-		if (Params->TryGetObjectField(TEXT("value"), ColorObj))
+		auto ReadColor4 = [](const TSharedPtr<FJsonObject>& Obj, FLinearColor& Out) -> bool
 		{
-			double R = 0.0, G = 0.0, B = 0.0, A = 1.0;
-			(*ColorObj)->TryGetNumberField(TEXT("r"), R);
-			(*ColorObj)->TryGetNumberField(TEXT("g"), G);
-			(*ColorObj)->TryGetNumberField(TEXT("b"), B);
-			(*ColorObj)->TryGetNumberField(TEXT("a"), A);
-			Const4Expr->Constant = FLinearColor(R, G, B, A);
-			bValueSet = true;
-
-			TSharedPtr<FJsonObject> ColorResult = MakeShared<FJsonObject>();
-			ColorResult->SetNumberField(TEXT("r"), R);
-			ColorResult->SetNumberField(TEXT("g"), G);
-			ColorResult->SetNumberField(TEXT("b"), B);
-			ColorResult->SetNumberField(TEXT("a"), A);
-			Result->SetObjectField(TEXT("value"), ColorResult);
-		}
-		else
-		{
-			double R = 0.0, G = 0.0, B = 0.0, A = 1.0;
-			bool bHasR = Params->TryGetNumberField(TEXT("r"), R);
-			bool bHasG = Params->TryGetNumberField(TEXT("g"), G);
-			bool bHasB = Params->TryGetNumberField(TEXT("b"), B);
-			Params->TryGetNumberField(TEXT("a"), A);
-			if (bHasR || bHasG || bHasB)
+			double R = 0, G = 0, B = 0, A = 1; bool bAny = false;
+			auto Pick = [&](const TCHAR* L, const TCHAR* U, const TCHAR* Alt, double& Slot)
 			{
-				Const4Expr->Constant = FLinearColor(R, G, B, A);
-				bValueSet = true;
-				Result->SetNumberField(TEXT("r"), R);
-				Result->SetNumberField(TEXT("g"), G);
-				Result->SetNumberField(TEXT("b"), B);
-				Result->SetNumberField(TEXT("a"), A);
-			}
+				double V; if (Obj->TryGetNumberField(L, V) || Obj->TryGetNumberField(U, V) || Obj->TryGetNumberField(Alt, V)) { Slot = V; bAny = true; }
+			};
+			Pick(TEXT("r"), TEXT("R"), TEXT("x"), R);
+			Pick(TEXT("g"), TEXT("G"), TEXT("y"), G);
+			Pick(TEXT("b"), TEXT("B"), TEXT("z"), B);
+			Pick(TEXT("a"), TEXT("A"), TEXT("w"), A);
+			Out = FLinearColor((float)R, (float)G, (float)B, (float)A);
+			return bAny;
+		};
+		const TSharedPtr<FJsonObject>* ColorObj = nullptr;
+		FLinearColor Color = Const4Expr->Constant;
+		if (Params->TryGetObjectField(TEXT("value"), ColorObj) && *ColorObj && ReadColor4(*ColorObj, Color))
+		{
+			Const4Expr->Constant = Color;
+			bValueSet = true;
+		}
+		else if (ReadColor4(Params, Color))
+		{
+			Const4Expr->Constant = Color;
+			bValueSet = true;
+		}
+		if (bValueSet)
+		{
+			TSharedPtr<FJsonObject> ColorResult = MakeShared<FJsonObject>();
+			ColorResult->SetNumberField(TEXT("r"), Const4Expr->Constant.R);
+			ColorResult->SetNumberField(TEXT("g"), Const4Expr->Constant.G);
+			ColorResult->SetNumberField(TEXT("b"), Const4Expr->Constant.B);
+			ColorResult->SetNumberField(TEXT("a"), Const4Expr->Constant.A);
+			Result->SetObjectField(TEXT("value"), ColorResult);
 		}
 	}
 	// Handle UMaterialExpressionScalarParameter - has float DefaultValue

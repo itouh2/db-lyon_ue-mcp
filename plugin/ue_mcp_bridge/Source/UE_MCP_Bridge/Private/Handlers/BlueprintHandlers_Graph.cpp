@@ -27,6 +27,7 @@
 #include "K2Node_VariableGet.h"
 #include "K2Node_VariableSet.h"
 #include "K2Node_DynamicCast.h"
+#include "K2Node_ComponentBoundEvent.h"
 #include "K2Node_CustomEvent.h"
 #include "K2Node_CallDelegate.h"
 #include "K2Node_ConstructObjectFromClass.h"
@@ -38,6 +39,11 @@
 #include "Containers/Queue.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
 // Kismet libraries used by K2 node construction (AddNode etc.)
 #include "Kismet/GameplayStatics.h"
@@ -50,6 +56,51 @@
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/InheritableComponentHandler.h"
+
+namespace
+{
+	constexpr int32 DefaultSafeReadGraphLimit = 128;
+
+	FString MakeDefaultGraphDumpPath(const FString& AssetPath, const FString& GraphName)
+	{
+		const FString AssetName = FPackageName::GetLongPackageAssetName(AssetPath);
+		const FString PathHash = FString::Printf(TEXT("%08x"), GetTypeHash(AssetPath + TEXT(":") + GraphName));
+		const FString BaseName = FPaths::MakeValidFileName(AssetName + TEXT("_") + GraphName + TEXT("_") + PathHash);
+		return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("UE_MCP"), TEXT("GraphDumps"), BaseName + TEXT(".json"));
+	}
+
+	bool WriteJsonObjectToFile(const TSharedPtr<FJsonObject>& JsonObject, const FString& RequestedPath, const FString& AssetPath, const FString& GraphName, FString& OutResolvedPath, FString& OutError)
+	{
+		OutResolvedPath = RequestedPath.IsEmpty() ? MakeDefaultGraphDumpPath(AssetPath, GraphName) : RequestedPath;
+		if (FPaths::IsRelative(OutResolvedPath))
+		{
+			OutResolvedPath = FPaths::Combine(FPaths::ProjectSavedDir(), OutResolvedPath);
+		}
+
+		const FString Directory = FPaths::GetPath(OutResolvedPath);
+		if (!Directory.IsEmpty() && !IFileManager::Get().MakeDirectory(*Directory, true))
+		{
+			OutError = FString::Printf(TEXT("Failed to create dump directory: %s"), *Directory);
+			return false;
+		}
+
+		FString JsonText;
+		const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&JsonText);
+		if (!FJsonSerializer::Serialize(JsonObject.ToSharedRef(), Writer))
+		{
+			OutError = TEXT("Failed to serialize graph JSON");
+			return false;
+		}
+
+		if (!FFileHelper::SaveStringToFile(JsonText, *OutResolvedPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+		{
+			OutError = FString::Printf(TEXT("Failed to write graph dump: %s"), *OutResolvedPath);
+			return false;
+		}
+
+		return true;
+	}
+}
 
 
 TSharedPtr<FJsonValue> FBlueprintHandlers::AddNode(const TSharedPtr<FJsonObject>& Params)
@@ -429,6 +480,97 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::AddNode(const TSharedPtr<FJsonObject>
 		}
 	}
 
+	// #443: K2Node_EnhancedInputAction.InputAction must be set before AllocateDefaultPins,
+	// otherwise pins like ActionValue come out as bool instead of Vector2D and the
+	// node title stays "EnhancedInputAction None". Accept inputAction (path) or
+	// InputAction (nodeParams nested key).
+	if (NodeParams && NewNode->GetClass()->GetName() == TEXT("K2Node_EnhancedInputAction"))
+	{
+		FString InputActionPath;
+		if (!(*NodeParams)->TryGetStringField(TEXT("inputAction"), InputActionPath))
+			(*NodeParams)->TryGetStringField(TEXT("InputAction"), InputActionPath);
+		if (!InputActionPath.IsEmpty())
+		{
+			if (UObject* IA = StaticLoadObject(UObject::StaticClass(), nullptr, *InputActionPath))
+			{
+				if (FObjectProperty* Prop = CastField<FObjectProperty>(NewNode->GetClass()->FindPropertyByName(TEXT("InputAction"))))
+				{
+					Prop->SetObjectPropertyValue_InContainer(NewNode, IA);
+				}
+			}
+		}
+	}
+
+	// #427: K2Node_ComponentBoundEvent identity = (componentName,
+	// delegateName). Without these the node title shows "BoundEvent None"
+	// and pin types don't match the delegate signature. Resolve the
+	// component from the BP's SCS by name, find the multicast delegate by
+	// name on the component class, and call InitializeComponentBoundEventParams.
+	if (NodeParams && NewNode->GetClass()->GetName() == TEXT("K2Node_ComponentBoundEvent"))
+	{
+		FString ComponentName;
+		FString DelegateName;
+		(*NodeParams)->TryGetStringField(TEXT("componentName"), ComponentName);
+		if (!(*NodeParams)->TryGetStringField(TEXT("delegateName"), DelegateName))
+			(*NodeParams)->TryGetStringField(TEXT("eventName"), DelegateName);
+
+		if (!ComponentName.IsEmpty() && !DelegateName.IsEmpty())
+		{
+			// Find the FObjectProperty on the BP's generated class for the component.
+			FObjectProperty* CompProp = nullptr;
+			if (Blueprint->SkeletonGeneratedClass)
+			{
+				for (TFieldIterator<FObjectProperty> It(Blueprint->SkeletonGeneratedClass); It; ++It)
+				{
+					if (It->GetName() == ComponentName) { CompProp = *It; break; }
+				}
+			}
+			if (CompProp)
+			{
+				FMulticastDelegateProperty* DelegateProp = nullptr;
+				if (UClass* CompClass = CompProp->PropertyClass)
+				{
+					for (TFieldIterator<FMulticastDelegateProperty> It(CompClass); It; ++It)
+					{
+						if (It->GetName() == DelegateName) { DelegateProp = *It; break; }
+					}
+				}
+				if (DelegateProp)
+				{
+					if (auto* BoundEvent = Cast<UK2Node_ComponentBoundEvent>(NewNode))
+					{
+						BoundEvent->InitializeComponentBoundEventParams(CompProp, DelegateProp);
+					}
+				}
+			}
+		}
+	}
+
+	// #443: K2Node_GetSubsystem (and PC variant) need CustomClass set so pin types
+	// resolve to the concrete subsystem rather than UInvalidSubsystem. Accept
+	// customClass / CustomClass / subsystemClass (string class path).
+	if (NodeParams && (NewNode->GetClass()->GetName() == TEXT("K2Node_GetSubsystem")
+		|| NewNode->GetClass()->GetName() == TEXT("K2Node_GetSubsystemFromPC")))
+	{
+		FString SubsystemClass;
+		if (!(*NodeParams)->TryGetStringField(TEXT("customClass"), SubsystemClass))
+			if (!(*NodeParams)->TryGetStringField(TEXT("CustomClass"), SubsystemClass))
+				(*NodeParams)->TryGetStringField(TEXT("subsystemClass"), SubsystemClass);
+		if (!SubsystemClass.IsEmpty())
+		{
+			UClass* Resolved = LoadClass<UObject>(nullptr, *SubsystemClass);
+			if (!Resolved) Resolved = LoadObject<UClass>(nullptr, *SubsystemClass);
+			if (!Resolved) Resolved = FindClassByShortName(SubsystemClass);
+			if (Resolved)
+			{
+				if (FClassProperty* Prop = CastField<FClassProperty>(NewNode->GetClass()->FindPropertyByName(TEXT("CustomClass"))))
+				{
+					Prop->SetObjectPropertyValue_InContainer(NewNode, Resolved);
+				}
+			}
+		}
+	}
+
 	// #201/#231: K2Node_ConstructObjectFromClass-derived nodes (SpawnActorFromClass,
 	// ConstructObject, AddComponent, etc.) assert in PostPlacedNewNode if the
 	// owning graph has not been Modify()'d first - the assert lives in
@@ -506,6 +648,14 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprintGraph(const TSharedPtr<F
 	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
 
 	FString GraphName = OptionalString(Params, TEXT("graphName"), TEXT("EventGraph"));
+	const bool bIncludePins = OptionalBool(Params, TEXT("includePins"), true);
+	const bool bIncludeDefaults = OptionalBool(Params, TEXT("includeDefaults"), true);
+	const bool bIncludeComments = OptionalBool(Params, TEXT("includeComments"), true);
+	const bool bDumpToFile = OptionalBool(Params, TEXT("dumpToFile"), false);
+	const FString OutputPath = OptionalString(Params, TEXT("outputPath"), TEXT(""));
+	const bool bHasOffset = Params->HasField(TEXT("offset"));
+	const bool bHasLimit = Params->HasField(TEXT("limit"));
+	const int32 RequestedOffset = FMath::Max(0, OptionalInt(Params, TEXT("offset"), 0));
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint)
@@ -521,43 +671,122 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::ReadBlueprintGraph(const TSharedPtr<F
 		return MCPError(FString::Printf(TEXT("Graph not found: %s"), *GraphName));
 	}
 
-	TArray<TSharedPtr<FJsonValue>> Nodes;
-	for (UEdGraphNode* Node : TargetGraph->Nodes)
+	const int32 TotalNodeCount = TargetGraph->Nodes.Num();
+	int32 EffectiveLimit = OptionalInt(Params, TEXT("limit"), -1);
+	if (EffectiveLimit <= 0)
 	{
-		if (!Node) continue;
+		EffectiveLimit = bDumpToFile
+			? TotalNodeCount
+			: (bHasLimit ? TotalNodeCount : FMath::Min(TotalNodeCount, DefaultSafeReadGraphLimit));
+	}
+	EffectiveLimit = FMath::Max(0, EffectiveLimit);
 
-		TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
-		NodeObj->SetStringField(TEXT("id"), Node->NodeGuid.ToString());
-		NodeObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
-		NodeObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
-		NodeObj->SetNumberField(TEXT("posX"), Node->NodePosX);
-		NodeObj->SetNumberField(TEXT("posY"), Node->NodePosY);
-		NodeObj->SetStringField(TEXT("comment"), Node->NodeComment);
+	const int32 StartIndex = FMath::Min(RequestedOffset, TotalNodeCount);
+	const int32 EndIndex = FMath::Min(TotalNodeCount, StartIndex + EffectiveLimit);
+	const bool bAutoPaginated = !bDumpToFile && !bHasLimit && EndIndex < TotalNodeCount;
 
-		// List pins
-		TArray<TSharedPtr<FJsonValue>> Pins;
-		for (UEdGraphPin* Pin : Node->Pins)
+	auto BuildGraphResult = [&](int32 SliceStart, int32 SliceEnd) -> TSharedPtr<FJsonObject>
+	{
+		TArray<TSharedPtr<FJsonValue>> Nodes;
+		for (int32 Index = SliceStart; Index < SliceEnd; ++Index)
 		{
-			if (!Pin) continue;
-			TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
-			PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
-			PinObj->SetStringField(TEXT("type"), Pin->PinType.PinCategory.ToString());
-			PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("Input") : TEXT("Output"));
-			PinObj->SetStringField(TEXT("defaultValue"), Pin->DefaultValue);
-			PinObj->SetBoolField(TEXT("connected"), Pin->LinkedTo.Num() > 0);
-			Pins.Add(MakeShared<FJsonValueObject>(PinObj));
-		}
-		NodeObj->SetArrayField(TEXT("pins"), Pins);
+			UEdGraphNode* Node = TargetGraph->Nodes[Index];
+			if (!Node) continue;
 
-		Nodes.Add(MakeShared<FJsonValueObject>(NodeObj));
+			TSharedPtr<FJsonObject> NodeObj = MakeShared<FJsonObject>();
+			NodeObj->SetStringField(TEXT("id"), Node->NodeGuid.ToString());
+			NodeObj->SetStringField(TEXT("class"), Node->GetClass()->GetName());
+			NodeObj->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString());
+			NodeObj->SetNumberField(TEXT("posX"), Node->NodePosX);
+			NodeObj->SetNumberField(TEXT("posY"), Node->NodePosY);
+			if (bIncludeComments)
+			{
+				NodeObj->SetStringField(TEXT("comment"), Node->NodeComment);
+			}
+
+			if (bIncludePins)
+			{
+				TArray<TSharedPtr<FJsonValue>> Pins;
+				for (UEdGraphPin* Pin : Node->Pins)
+				{
+					if (!Pin) continue;
+					TSharedPtr<FJsonObject> PinObj = MakeShared<FJsonObject>();
+					PinObj->SetStringField(TEXT("name"), Pin->PinName.ToString());
+					PinObj->SetStringField(TEXT("type"), Pin->PinType.PinCategory.ToString());
+					PinObj->SetStringField(TEXT("direction"), Pin->Direction == EGPD_Input ? TEXT("Input") : TEXT("Output"));
+					if (bIncludeDefaults)
+					{
+						PinObj->SetStringField(TEXT("defaultValue"), Pin->DefaultValue);
+					}
+					PinObj->SetBoolField(TEXT("connected"), Pin->LinkedTo.Num() > 0);
+					Pins.Add(MakeShared<FJsonValueObject>(PinObj));
+				}
+				NodeObj->SetArrayField(TEXT("pins"), Pins);
+			}
+
+			Nodes.Add(MakeShared<FJsonValueObject>(NodeObj));
+		}
+
+		auto Result = MCPSuccess();
+		Result->SetStringField(TEXT("path"), AssetPath);
+		Result->SetStringField(TEXT("graphName"), GraphName);
+		Result->SetArrayField(TEXT("nodes"), Nodes);
+		Result->SetNumberField(TEXT("nodeCount"), Nodes.Num());
+		Result->SetNumberField(TEXT("totalNodeCount"), TotalNodeCount);
+		Result->SetNumberField(TEXT("offset"), SliceStart);
+		Result->SetNumberField(TEXT("limit"), SliceEnd - SliceStart);
+		Result->SetBoolField(TEXT("hasMore"), SliceEnd < TotalNodeCount);
+		Result->SetNumberField(TEXT("nextOffset"), SliceEnd < TotalNodeCount ? SliceEnd : -1);
+		if (bAutoPaginated)
+		{
+			Result->SetBoolField(TEXT("autoPaginated"), true);
+		}
+		if (!bIncludePins)
+		{
+			Result->SetBoolField(TEXT("includePins"), false);
+		}
+		if (!bIncludeDefaults)
+		{
+			Result->SetBoolField(TEXT("includeDefaults"), false);
+		}
+		if (!bIncludeComments)
+		{
+			Result->SetBoolField(TEXT("includeComments"), false);
+		}
+		return Result;
+	};
+
+	if (bDumpToFile)
+	{
+		const int32 DumpStartIndex = bHasOffset ? StartIndex : 0;
+		const int32 DumpEndIndex = (bHasOffset || bHasLimit) ? EndIndex : TotalNodeCount;
+		const TSharedPtr<FJsonObject> DumpResult = BuildGraphResult(DumpStartIndex, DumpEndIndex);
+		FString ResolvedDumpPath;
+		FString DumpError;
+		if (!WriteJsonObjectToFile(DumpResult, OutputPath, AssetPath, GraphName, ResolvedDumpPath, DumpError))
+		{
+			return MCPError(DumpError);
+		}
+
+		auto Result = MCPSuccess();
+		Result->SetStringField(TEXT("path"), AssetPath);
+		Result->SetStringField(TEXT("graphName"), GraphName);
+		Result->SetBoolField(TEXT("dumpedToFile"), true);
+		Result->SetStringField(TEXT("outputPath"), ResolvedDumpPath);
+		Result->SetNumberField(TEXT("nodeCount"), DumpResult->GetNumberField(TEXT("nodeCount")));
+		Result->SetNumberField(TEXT("totalNodeCount"), TotalNodeCount);
+		Result->SetNumberField(TEXT("offset"), DumpStartIndex);
+		Result->SetNumberField(TEXT("limit"), DumpEndIndex - DumpStartIndex);
+		Result->SetBoolField(TEXT("hasMore"), DumpEndIndex < TotalNodeCount);
+		Result->SetNumberField(TEXT("nextOffset"), DumpEndIndex < TotalNodeCount ? DumpEndIndex : -1);
+		if (bAutoPaginated)
+		{
+			Result->SetBoolField(TEXT("autoPaginated"), true);
+		}
+		return MCPResult(Result);
 	}
 
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("path"), AssetPath);
-	Result->SetStringField(TEXT("graphName"), GraphName);
-	Result->SetArrayField(TEXT("nodes"), Nodes);
-	Result->SetNumberField(TEXT("nodeCount"), Nodes.Num());
-	return MCPResult(Result);
+	return MCPResult(BuildGraphResult(StartIndex, EndIndex));
 }
 
 

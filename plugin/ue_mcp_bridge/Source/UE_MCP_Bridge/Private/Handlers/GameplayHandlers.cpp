@@ -91,7 +91,18 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("list_eqs_queries"), &ListEqsQueries);
 	Registry.RegisterHandler(TEXT("list_state_trees"), &ListStateTrees);
 	Registry.RegisterHandler(TEXT("project_point_to_navigation"), &ProjectPointToNavigation);
-	// create_input_action, create_input_mapping_context moved to pie-studio
+	// Enhanced Input asset authoring stays here. pie-studio owns PIE-time
+	// inject/record/replay; authoring InputAction / InputMappingContext
+	// assets and editing IMC mappings is core ue-mcp.
+	Registry.RegisterHandler(TEXT("create_input_action"), &CreateInputAction);
+	Registry.RegisterHandler(TEXT("create_input_mapping_context"), &CreateInputMappingContext);
+	Registry.RegisterHandler(TEXT("read_imc"), &ReadImc);
+	Registry.RegisterHandler(TEXT("list_imc_mappings"), &ReadImc);
+	Registry.RegisterHandler(TEXT("add_imc_mapping"), &AddImcMapping);
+	Registry.RegisterHandler(TEXT("set_mapping_modifiers"), &SetMappingModifiers);
+	Registry.RegisterHandler(TEXT("remove_imc_mapping"), &RemoveImcMapping);
+	Registry.RegisterHandler(TEXT("set_imc_mapping_key"), &SetImcMappingKey);
+	Registry.RegisterHandler(TEXT("set_imc_mapping_action"), &SetImcMappingAction);
 	Registry.RegisterHandler(TEXT("create_blackboard"), &CreateBlackboard);
 	Registry.RegisterHandler(TEXT("create_behavior_tree"), &CreateBehaviorTree);
 	Registry.RegisterHandler(TEXT("create_eqs_query"), &CreateEqsQuery);
@@ -104,6 +115,13 @@ void FGameplayHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("spawn_nav_modifier_volume"), &SpawnNavModifierVolume);
 	Registry.RegisterHandler(TEXT("set_world_game_mode"), &SetWorldGameMode);
 	Registry.RegisterHandler(TEXT("add_blackboard_key"), &AddBlackboardKey);
+	// #469: set parent on BlackboardData so a child Blackboard can extend the
+	// parent's keys (canonical UE pattern for extending third-party AI assets).
+	Registry.RegisterHandler(TEXT("set_blackboard_parent"), &SetBlackboardParent);
+	Registry.RegisterHandler(TEXT("remove_blackboard_key"), &RemoveBlackboardKey);
+	Registry.RegisterHandler(TEXT("read_blackboard"), &ReadBlackboard);
+	// #494: discover available BT node classes (composites, tasks, decorators, services).
+	Registry.RegisterHandler(TEXT("list_bt_node_classes"), &ListBTNodeClasses);
 	Registry.RegisterHandler(TEXT("set_behavior_tree_blackboard"), &SetBehaviorTreeBlackboard);
 	Registry.RegisterHandler(TEXT("rebuild_navigation"), &RebuildNavmesh);
 	Registry.RegisterHandler(TEXT("find_nav_path"), &FindNavPath);
@@ -1180,8 +1198,223 @@ TSharedPtr<FJsonValue> FGameplayHandlers::AddBlackboardKey(const TSharedPtr<FJso
 	Result->SetStringField(TEXT("keyName"), KeyName);
 	Result->SetStringField(TEXT("keyType"), KeyType);
 	Result->SetNumberField(TEXT("totalKeys"), BlackboardAsset->Keys.Num());
-	// No rollback: no paired remove_blackboard_key handler.
+	// #469: rollback via remove_blackboard_key.
+	TSharedPtr<FJsonObject> RollPayload = MakeShared<FJsonObject>();
+	RollPayload->SetStringField(TEXT("blackboardPath"), BlackboardPath);
+	RollPayload->SetStringField(TEXT("keyName"), KeyName);
+	MCPSetRollback(Result, TEXT("remove_blackboard_key"), RollPayload);
 
+	return MCPResult(Result);
+}
+
+// #469: set Parent on BlackboardData. Canonical UE pattern for extending a
+// third-party blackboard (e.g. plugin's ACFAIBB) without duplicating its
+// keys. Optionally prune duplicate own-keys that the parent already defines.
+TSharedPtr<FJsonValue> FGameplayHandlers::SetBlackboardParent(const TSharedPtr<FJsonObject>& Params)
+{
+	FString BlackboardPath;
+	if (auto Err = RequireString(Params, TEXT("blackboardPath"), BlackboardPath)) return Err;
+
+	FString ParentPath;
+	const bool bHasParent = Params->TryGetStringField(TEXT("parentPath"), ParentPath);
+
+	const bool bAutoPrune = OptionalBool(Params, TEXT("autoPruneDuplicateKeys"), true);
+
+	UBlackboardData* Child = LoadObject<UBlackboardData>(nullptr, *BlackboardPath);
+	if (!Child) return MCPError(FString::Printf(TEXT("BlackboardData not found: %s"), *BlackboardPath));
+
+	const FString PrevParentPath = Child->Parent ? Child->Parent->GetPathName() : TEXT("None");
+
+	UBlackboardData* Parent = nullptr;
+	if (bHasParent && !ParentPath.IsEmpty() && !ParentPath.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+	{
+		Parent = LoadObject<UBlackboardData>(nullptr, *ParentPath);
+		if (!Parent) return MCPError(FString::Printf(TEXT("Parent BlackboardData not found: %s"), *ParentPath));
+		if (Parent == Child) return MCPError(TEXT("Cannot set blackboard parent to itself"));
+		// Walk parent chain to guard against cycles.
+		for (UBlackboardData* Walk = Parent->Parent; Walk; Walk = Walk->Parent)
+		{
+			if (Walk == Child) return MCPError(TEXT("Cycle detected in blackboard parent chain"));
+		}
+	}
+
+	Child->Modify();
+	Child->Parent = Parent;
+
+	TArray<TSharedPtr<FJsonValue>> Pruned;
+	if (bAutoPrune && Parent)
+	{
+		// Collect parent keys for set-membership.
+		TSet<FName> ParentKeyNames;
+		for (UBlackboardData* Walk = Parent; Walk; Walk = Walk->Parent)
+		{
+			for (const FBlackboardEntry& E : Walk->Keys)
+			{
+				ParentKeyNames.Add(E.EntryName);
+			}
+		}
+		for (int32 i = Child->Keys.Num() - 1; i >= 0; --i)
+		{
+			if (ParentKeyNames.Contains(Child->Keys[i].EntryName))
+			{
+				Pruned.Add(MakeShared<FJsonValueString>(Child->Keys[i].EntryName.ToString()));
+				Child->Keys.RemoveAt(i);
+			}
+		}
+	}
+
+	// Refresh runtime key index cache.
+	Child->UpdateKeyIDs();
+
+	Child->MarkPackageDirty();
+	UEditorAssetLibrary::SaveAsset(Child->GetPathName());
+
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetStringField(TEXT("blackboardPath"), BlackboardPath);
+	Result->SetStringField(TEXT("parentPath"), Parent ? Parent->GetPathName() : TEXT("None"));
+	Result->SetArrayField(TEXT("prunedDuplicates"), Pruned);
+	Result->SetNumberField(TEXT("ownKeyCount"), Child->Keys.Num());
+
+	TSharedPtr<FJsonObject> RollPayload = MakeShared<FJsonObject>();
+	RollPayload->SetStringField(TEXT("blackboardPath"), BlackboardPath);
+	RollPayload->SetStringField(TEXT("parentPath"), PrevParentPath);
+	RollPayload->SetBoolField(TEXT("autoPruneDuplicateKeys"), false);
+	MCPSetRollback(Result, TEXT("set_blackboard_parent"), RollPayload);
+
+	return MCPResult(Result);
+}
+
+// #469: remove a single key from a Blackboard by name. Idempotent.
+TSharedPtr<FJsonValue> FGameplayHandlers::RemoveBlackboardKey(const TSharedPtr<FJsonObject>& Params)
+{
+	FString BlackboardPath;
+	if (auto Err = RequireString(Params, TEXT("blackboardPath"), BlackboardPath)) return Err;
+	FString KeyName;
+	if (auto Err = RequireString(Params, TEXT("keyName"), KeyName)) return Err;
+
+	UBlackboardData* BB = LoadObject<UBlackboardData>(nullptr, *BlackboardPath);
+	if (!BB) return MCPError(FString::Printf(TEXT("BlackboardData not found: %s"), *BlackboardPath));
+
+	const FName KeyFName(*KeyName);
+	int32 RemovedIdx = INDEX_NONE;
+	FString RemovedType;
+	for (int32 i = 0; i < BB->Keys.Num(); ++i)
+	{
+		if (BB->Keys[i].EntryName == KeyFName)
+		{
+			RemovedIdx = i;
+			RemovedType = BB->Keys[i].KeyType ? BB->Keys[i].KeyType->GetClass()->GetName() : TEXT("Unknown");
+			break;
+		}
+	}
+	if (RemovedIdx == INDEX_NONE)
+	{
+		auto Noop = MCPSuccess();
+		Noop->SetBoolField(TEXT("alreadyDeleted"), true);
+		Noop->SetStringField(TEXT("blackboardPath"), BlackboardPath);
+		Noop->SetStringField(TEXT("keyName"), KeyName);
+		return MCPResult(Noop);
+	}
+	BB->Modify();
+	BB->Keys.RemoveAt(RemovedIdx);
+	BB->UpdateKeyIDs();
+	BB->MarkPackageDirty();
+	UEditorAssetLibrary::SaveAsset(BB->GetPathName());
+
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetStringField(TEXT("blackboardPath"), BlackboardPath);
+	Result->SetStringField(TEXT("keyName"), KeyName);
+	Result->SetNumberField(TEXT("remainingKeys"), BB->Keys.Num());
+	return MCPResult(Result);
+}
+
+// #469: read parent + own keys + inherited keys for a Blackboard.
+TSharedPtr<FJsonValue> FGameplayHandlers::ReadBlackboard(const TSharedPtr<FJsonObject>& Params)
+{
+	FString BlackboardPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("blackboardPath"), TEXT("assetPath"), BlackboardPath)) return Err;
+
+	UBlackboardData* BB = LoadObject<UBlackboardData>(nullptr, *BlackboardPath);
+	if (!BB) return MCPError(FString::Printf(TEXT("BlackboardData not found: %s"), *BlackboardPath));
+
+	auto KeyArrayFor = [](UBlackboardData* From) -> TArray<TSharedPtr<FJsonValue>>
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		for (const FBlackboardEntry& E : From->Keys)
+		{
+			TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+			Obj->SetStringField(TEXT("name"), E.EntryName.ToString());
+			Obj->SetStringField(TEXT("type"), E.KeyType ? E.KeyType->GetClass()->GetName() : TEXT("Unknown"));
+			Out.Add(MakeShared<FJsonValueObject>(Obj));
+		}
+		return Out;
+	};
+
+	TArray<TSharedPtr<FJsonValue>> InheritedKeys;
+	for (UBlackboardData* Walk = BB->Parent; Walk; Walk = Walk->Parent)
+	{
+		for (const FBlackboardEntry& E : Walk->Keys)
+		{
+			TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+			Obj->SetStringField(TEXT("name"), E.EntryName.ToString());
+			Obj->SetStringField(TEXT("type"), E.KeyType ? E.KeyType->GetClass()->GetName() : TEXT("Unknown"));
+			Obj->SetStringField(TEXT("from"), Walk->GetPathName());
+			InheritedKeys.Add(MakeShared<FJsonValueObject>(Obj));
+		}
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("blackboardPath"), BlackboardPath);
+	Result->SetStringField(TEXT("parentPath"), BB->Parent ? BB->Parent->GetPathName() : TEXT("None"));
+	Result->SetArrayField(TEXT("ownKeys"), KeyArrayFor(BB));
+	Result->SetArrayField(TEXT("inheritedKeys"), InheritedKeys);
+	Result->SetNumberField(TEXT("ownKeyCount"), BB->Keys.Num());
+	Result->SetNumberField(TEXT("inheritedKeyCount"), InheritedKeys.Num());
+	return MCPResult(Result);
+}
+
+// #494: enumerate every concrete BT node class (composite, task, decorator,
+// service). Gives authoring scripts a discoverable list of node classes to
+// pass to a future add_bt_node handler, and lets them resolve plugin-supplied
+// custom decorators (UBTDecorator_*) without grepping engine + plugin source.
+//
+// Params: kind? ("composite"|"task"|"decorator"|"service" - default: all)
+TSharedPtr<FJsonValue> FGameplayHandlers::ListBTNodeClasses(const TSharedPtr<FJsonObject>& Params)
+{
+	const FString KindFilter = OptionalString(Params, TEXT("kind"), TEXT("")).ToLower();
+	const bool bAll = KindFilter.IsEmpty();
+
+	auto PushClass = [](TArray<TSharedPtr<FJsonValue>>& Out, UClass* C, const TCHAR* Kind)
+	{
+		if (!C || C->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)) return;
+		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetStringField(TEXT("name"), C->GetName());
+		Obj->SetStringField(TEXT("path"), C->GetPathName());
+		Obj->SetStringField(TEXT("kind"), Kind);
+		Out.Add(MakeShared<FJsonValueObject>(Obj));
+	};
+
+	TArray<TSharedPtr<FJsonValue>> Composites, Tasks, Decorators, Services;
+	for (TObjectIterator<UClass> It; It; ++It)
+	{
+		UClass* C = *It;
+		if (C->IsChildOf(UBTCompositeNode::StaticClass())) PushClass(Composites, C, TEXT("composite"));
+		else if (C->IsChildOf(UBTTaskNode::StaticClass())) PushClass(Tasks, C, TEXT("task"));
+		else if (C->IsChildOf(UBTDecorator::StaticClass())) PushClass(Decorators, C, TEXT("decorator"));
+		else if (C->IsChildOf(UBTService::StaticClass())) PushClass(Services, C, TEXT("service"));
+	}
+
+	auto Result = MCPSuccess();
+	if (bAll || KindFilter == TEXT("composite")) Result->SetArrayField(TEXT("composites"), Composites);
+	if (bAll || KindFilter == TEXT("task")) Result->SetArrayField(TEXT("tasks"), Tasks);
+	if (bAll || KindFilter == TEXT("decorator")) Result->SetArrayField(TEXT("decorators"), Decorators);
+	if (bAll || KindFilter == TEXT("service")) Result->SetArrayField(TEXT("services"), Services);
+	Result->SetNumberField(TEXT("compositeCount"), Composites.Num());
+	Result->SetNumberField(TEXT("taskCount"), Tasks.Num());
+	Result->SetNumberField(TEXT("decoratorCount"), Decorators.Num());
+	Result->SetNumberField(TEXT("serviceCount"), Services.Num());
 	return MCPResult(Result);
 }
 

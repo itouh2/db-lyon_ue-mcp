@@ -67,6 +67,8 @@
 
 void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 {
+	constexpr float ReadBlueprintGraphTimeoutSeconds = 180.0f;
+
 	Registry.RegisterHandler(TEXT("create_blueprint"), &CreateBlueprint);
 	Registry.RegisterHandler(TEXT("read_blueprint"), &ReadBlueprint);
 	Registry.RegisterHandler(TEXT("add_variable"), &AddVariable);
@@ -80,7 +82,7 @@ void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("create_function"), &CreateFunction);
 	Registry.RegisterHandler(TEXT("list_blueprint_functions"), &ListBlueprintFunctions);
 	Registry.RegisterHandler(TEXT("add_node"), &AddNode);
-	Registry.RegisterHandler(TEXT("read_blueprint_graph"), &ReadBlueprintGraph);
+	Registry.RegisterHandlerWithTimeout(TEXT("read_blueprint_graph"), &ReadBlueprintGraph, ReadBlueprintGraphTimeoutSeconds);
 	Registry.RegisterHandler(TEXT("add_event_dispatcher"), &AddEventDispatcher);
 	Registry.RegisterHandler(TEXT("rename_function"), &RenameFunction);
 	Registry.RegisterHandler(TEXT("delete_function"), &DeleteFunction);
@@ -90,6 +92,11 @@ void FBlueprintHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("set_node_property"), &SetNodeProperty);
 	Registry.RegisterHandler(TEXT("list_blueprint_graphs"), &ListGraphs);
 	Registry.RegisterHandler(TEXT("set_blueprint_component_property"), &SetComponentProperty);
+	// #442: dedicated OverrideMaterials writer that takes a materialPaths array
+	// directly, avoiding any value coercion concerns on the generic path.
+	Registry.RegisterHandler(TEXT("set_component_override_materials"), &SetComponentOverrideMaterials);
+	// #457: timeline track authoring (float/vector/color/event) on a Blueprint.
+	Registry.RegisterHandler(TEXT("add_timeline_track"), &AddTimelineTrack);
 	Registry.RegisterHandler(TEXT("set_capsule_size"), &SetCapsuleSize);
 	Registry.RegisterHandler(TEXT("set_class_default"), &SetClassDefault);
 	Registry.RegisterHandler(TEXT("remove_component"), &RemoveComponent);
@@ -1672,6 +1679,22 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::DuplicateBlueprint(const TSharedPtr<F
 	if (auto Err = RequireString(Params, TEXT("destinationPath"), DestinationPath)) return Err;
 
 	UObject* Dup = UEditorAssetLibrary::DuplicateAsset(SourcePath, DestinationPath);
+	if (!Dup)
+	{
+		// #441: DoesAssetExist can return false for valid Blueprint paths in
+		// 5.7. Fall back to loading the source and driving AssetTools directly.
+		UObject* SourceObj = UEditorAssetLibrary::LoadAsset(SourcePath);
+		if (!SourceObj) SourceObj = LoadObject<UObject>(nullptr, *SourcePath);
+		if (SourceObj)
+		{
+			FString DestPkg, DestName;
+			if (DestinationPath.Split(TEXT("/"), &DestPkg, &DestName, ESearchCase::CaseSensitive, ESearchDir::FromEnd))
+			{
+				IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+				Dup = AssetTools.DuplicateAsset(DestName, DestPkg, SourceObj);
+			}
+		}
+	}
 	if (!Dup) return MCPError(FString::Printf(TEXT("Failed to duplicate '%s'"), *SourcePath));
 
 	TSharedPtr<FJsonObject> Result = MCPSuccess();

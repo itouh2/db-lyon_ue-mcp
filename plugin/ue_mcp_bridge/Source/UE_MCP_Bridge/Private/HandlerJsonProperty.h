@@ -6,6 +6,9 @@
 #include "UObject/UnrealType.h"
 #include "UObject/PropertyPortFlags.h"
 #include "UObject/SoftObjectPtr.h"
+#include "GameplayTagContainer.h"
+#include "GameplayTagsManager.h"
+#include "Engine/Blueprint.h"
 
 // Shared recursive JSON→FProperty setter. Originally written for PCG
 // set_pcg_node_settings (#149); also used by set_component_property on
@@ -94,6 +97,72 @@ namespace MCPJsonProperty
 		// Struct: recurse on JSON object fields; otherwise fall through to ImportText
 		if (FStructProperty* StructProp = CastField<FStructProperty>(Prop))
 		{
+			// #503: FGameplayTag (and FGameplayTagContainer) can't be built
+			// from Python in 5.7 and ImportText("(TagName=\"X\")") is the only
+			// portable path. Coerce a plain string ("X.Y") or array of strings
+			// into the right runtime tag value via the GameplayTagsManager so
+			// callers don't have to format ImportText themselves.
+			static const FName GameplayTagName(TEXT("GameplayTag"));
+			static const FName GameplayTagContainerName(TEXT("GameplayTagContainer"));
+			const FName StructName = StructProp->Struct->GetFName();
+			if (StructName == GameplayTagName)
+			{
+				FString TagStr;
+				if (Value->TryGetString(TagStr))
+				{
+					FGameplayTag* TagPtr = static_cast<FGameplayTag*>(ValueAddr);
+					if (TagStr.IsEmpty())
+					{
+						*TagPtr = FGameplayTag();
+						return true;
+					}
+					FGameplayTag Resolved = UGameplayTagsManager::Get().RequestGameplayTag(FName(*TagStr), /*ErrorIfNotFound*/ false);
+					if (!Resolved.IsValid())
+					{
+						OutError = FString::Printf(TEXT("gameplay tag not found: %s"), *TagStr);
+						return false;
+					}
+					*TagPtr = Resolved;
+					return true;
+				}
+			}
+			else if (StructName == GameplayTagContainerName)
+			{
+				const TArray<TSharedPtr<FJsonValue>>* Arr = nullptr;
+				FString SingleStr;
+				if (Value->TryGetArray(Arr) && Arr)
+				{
+					FGameplayTagContainer* ContainerPtr = static_cast<FGameplayTagContainer*>(ValueAddr);
+					ContainerPtr->Reset();
+					for (const TSharedPtr<FJsonValue>& V : *Arr)
+					{
+						FString S;
+						if (!V->TryGetString(S) || S.IsEmpty()) continue;
+						FGameplayTag Resolved = UGameplayTagsManager::Get().RequestGameplayTag(FName(*S), false);
+						if (!Resolved.IsValid())
+						{
+							OutError = FString::Printf(TEXT("gameplay tag not found: %s"), *S);
+							return false;
+						}
+						ContainerPtr->AddTag(Resolved);
+					}
+					return true;
+				}
+				else if (Value->TryGetString(SingleStr) && !SingleStr.IsEmpty())
+				{
+					FGameplayTagContainer* ContainerPtr = static_cast<FGameplayTagContainer*>(ValueAddr);
+					ContainerPtr->Reset();
+					FGameplayTag Resolved = UGameplayTagsManager::Get().RequestGameplayTag(FName(*SingleStr), false);
+					if (!Resolved.IsValid())
+					{
+						OutError = FString::Printf(TEXT("gameplay tag not found: %s"), *SingleStr);
+						return false;
+					}
+					ContainerPtr->AddTag(Resolved);
+					return true;
+				}
+			}
+
 			const TSharedPtr<FJsonObject>* SubObj = nullptr;
 			if (Value->TryGetObject(SubObj) && SubObj && (*SubObj).IsValid())
 			{
@@ -132,8 +201,49 @@ namespace MCPJsonProperty
 			if (Value->TryGetString(Path) && !Path.IsEmpty())
 			{
 				UClass* Loaded = LoadClass<UObject>(nullptr, *Path);
+				if (!Loaded)
+				{
+					// #489: callers commonly pass a Blueprint asset path
+					// (/Game/Foo/BP_GameMode.BP_GameMode) for a TSubclassOf
+					// field. Retry with the generated-class suffix.
+					if (!Path.EndsWith(TEXT("_C")))
+					{
+						const FString WithSuffix = Path + TEXT("_C");
+						Loaded = LoadClass<UObject>(nullptr, *WithSuffix);
+					}
+				}
+				if (!Loaded)
+				{
+					// Last-ditch: load the asset as UBlueprint and grab its
+					// GeneratedClass. Covers paths that omit the .Name suffix.
+					if (UBlueprint* BP = Cast<UBlueprint>(StaticLoadObject(UBlueprint::StaticClass(), nullptr, *Path)))
+					{
+						Loaded = BP->GeneratedClass;
+					}
+				}
 				if (!Loaded) { OutError = FString::Printf(TEXT("class not found: %s"), *Path); return false; }
 				ClassProp->SetObjectPropertyValue(ValueAddr, Loaded);
+				return true;
+			}
+		}
+
+		// Soft class ref — accept class path string, same Blueprint suffix tolerance.
+		if (FSoftClassProperty* SoftClassProp = CastField<FSoftClassProperty>(Prop))
+		{
+			FString Path;
+			if (Value->TryGetString(Path))
+			{
+				if (Path.IsEmpty())
+				{
+					SoftClassProp->SetPropertyValue(ValueAddr, FSoftObjectPtr());
+					return true;
+				}
+				if (!Path.EndsWith(TEXT("_C")))
+				{
+					Path += TEXT("_C");
+				}
+				FSoftObjectPath PathObj(Path);
+				SoftClassProp->SetPropertyValue(ValueAddr, FSoftObjectPtr(PathObj));
 				return true;
 			}
 		}

@@ -34,9 +34,16 @@ private:
 	static TSharedPtr<FJsonValue> AddBlendSample(const TSharedPtr<FJsonObject>& Params);
 	// #272: move an existing sample to new coordinates / swap its animation.
 	static TSharedPtr<FJsonValue> SetBlendSample(const TSharedPtr<FJsonObject>& Params);
+	// #459: one-call axis-params + samples authoring for BlendSpace1D/2D.
+	static TSharedPtr<FJsonValue> PopulateBlendspace(const TSharedPtr<FJsonObject>& Params);
+	// #459 partner: explicit BlendSpace1D creation (defaults grid for 1D).
+	static TSharedPtr<FJsonValue> CreateBlendspace1D(const TSharedPtr<FJsonObject>& Params);
 
 	// Notify handlers
 	static TSharedPtr<FJsonValue> AddAnimNotify(const TSharedPtr<FJsonObject>& Params);
+	// #471: per-name removal so migration scripts can prune obsolete notifies
+	// without scanning through Python's AnimationLibrary.
+	static TSharedPtr<FJsonValue> RemoveAnimNotify(const TSharedPtr<FJsonObject>& Params);
 
 	// Animation sequence authoring
 	static TSharedPtr<FJsonValue> CreateSequence(const TSharedPtr<FJsonObject>& Params);
