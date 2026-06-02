@@ -9,7 +9,7 @@ ue-mcp's plugin system lets npm packages extend the server in three ways:
 Most plugins use only the first shape; the other two are available when injection is the wrong fit. This page covers both sides: installing and managing plugins (consumer), and writing and publishing one (author). The author section starts at [Authoring a plugin](#authoring-a-plugin) - if you're just trying to use a plugin somebody else wrote, you can stop after [Using plugins](#using-plugins).
 
 !!! info "Live reference"
-    [`pie-studio`](https://github.com/db-lyon/pie-studio) ([npm](https://www.npmjs.com/package/pie-studio)) is the canonical reference. It ships 33 native C++ handlers for PIE recording, replay, observation, and input injection - all injected into the `gameplay` category. The examples below mirror its real source.
+    [`pie-studio`](https://github.com/db-lyon/pie-studio) ([npm](https://www.npmjs.com/package/pie-studio)) is the canonical native-module reference. It ships C++ handlers for PIE recording, replay, observation, and input injection, surfaced as a `pie` category it provisions via `nativeModule.category`. See [Shipping native C++](#shipping-native-c).
 
 ## Quick start
 
@@ -53,7 +53,7 @@ Once `status: "active"`, the injected actions (e.g. `gameplay(action="pie_record
 A plugin is a normal npm package that ships:
 
 - A `ue-mcp.plugin.yml` manifest declaring an `actionPrefix`, the actions it injects into which host categories, and the task classes that back them.
-- Compiled task classes (one per injected action) under `dist/`, each extending `BaseTask` from [`@db-lyon/flowkit`](https://github.com/db-lyon/flowkit).
+- Compiled task classes (one per injected action) under `dist/`, each extending `UeMcpTask` from [`ue-mcp/task`](#writing-tasks).
 - Optional `knowledge/<category>.md` markdown that the server attaches to the host category's AI-facing docs at boot.
 - Optional `flows:` entries that compose injected actions with built-ins.
 
@@ -74,7 +74,7 @@ The injection happens before any tool is registered with the MCP client, so by t
 |-------|-----------------|----------------------|
 | **A. Inject only** | `inject:` | The action belongs inside an existing category. Default choice. |
 | **B. Provide a new category** | `provides:` (with or without `inject:`) | The plugin opens a whole new domain - audio middleware, build pipelines, networking layers - that doesn't fit inside any built-in category. |
-| **C. Ship native C++** | `nativeModule:` (plus `inject:` or `provides:`) | The plugin needs engine APIs ue-mcp's built-in handlers don't expose. The plugin ships a UE C++ module that registers handlers on the editor bridge. |
+| **C. Ship native C++** | `nativeModule:` (with `category:` to surface its handlers) | The plugin needs engine APIs ue-mcp's built-in handlers don't expose. The plugin ships a UE C++ module that registers handlers on the editor bridge; `nativeModule.category` surfaces them as actions with no TypeScript. |
 
 Shape A is overwhelmingly the right answer. An action that belongs inside an existing category is best discovered where agents are already working.
 
@@ -184,7 +184,7 @@ my-plugin/
   ue-mcp.plugin.yml          # author declaration: actionPrefix, inject, knowledge, tasks, flows
   src/                       # author writes TypeScript here
     tasks/
-      MyAction.ts            # one BaseTask subclass per file, default export
+      MyAction.ts            # one UeMcpTask subclass per file, default export
     shared/                  # optional cross-task helpers (never referenced from the declaration)
   dist/                      # tsc output - what actually ships and loads
     tasks/
@@ -196,7 +196,7 @@ my-plugin/
 
 Conventions:
 
-- One task class per file, default export, extending `BaseTask` from `@db-lyon/flowkit`.
+- One task class per file, default export, extending `UeMcpTask` from `ue-mcp/task`.
 - `class_path` in the declaration is resolved against the plugin's `dist/` (the loader tries `dist/<path>.js` then `dist/tasks/<path>.js`).
 - `src/shared/` holds helpers; never reference it from the declaration.
 - Compile to `dist/` with `tsc` so users need no TypeScript toolchain.
@@ -213,10 +213,10 @@ Conventions:
   "files": ["dist", "ue-mcp.plugin.yml", "knowledge", "README.md"],
   "keywords": ["unreal-engine"],
   "peerDependencies": {
-    "@db-lyon/flowkit": ">=0.5.0"
+    "ue-mcp": ">=1.0.65"
   },
   "devDependencies": {
-    "@db-lyon/flowkit": "~0.5.2",
+    "ue-mcp": "^1.0.65",
     "typescript": "^5.7.0"
   },
   "scripts": {
@@ -225,7 +225,7 @@ Conventions:
 }
 ```
 
-The peer-dep on `@db-lyon/flowkit` is what gives `BaseTask` its shape - your tasks must extend the same class the server uses, so a peer dep (not a regular dep) is what keeps the two copies in sync.
+`UeMcpTask` (and the types you import alongside it) come from `ue-mcp/task` - a thin, server-free entry point that the consumer's installed `ue-mcp` already provides. That's why `ue-mcp` is a **peer** dependency: the running server supplies the copy at load time, so your task extends the same base class the server uses. The matching **dev** dependency is only there to type-check your build. You never depend on the underlying flow runtime directly - it stays an implementation detail behind `ue-mcp/task`.
 
 ### `ue-mcp.plugin.yml`
 
@@ -297,16 +297,39 @@ When the plugin needs engine APIs ue-mcp's bridge doesn't already expose, ship a
 `pie-studio` is a real-world example of this shape. Its manifest:
 
 ```yaml
+actionPrefix: pie                    # used only when injecting into a built-in
+
 nativeModule:
   uePluginName: PIE_Studio           # name of the .uplugin that gets deployed
-  minBridgeApi: 1                       # gate against UEMCP_BRIDGE_API_VERSION
+  minBridgeApi: 1                    # gate against UEMCP_BRIDGE_API_VERSION
   source: ue/Plugins/PIE_Studio      # path inside your npm tarball
+  category: pie                      # surface handlers under a pie(...) tool
+  categoryDescription: "PIE record, replay, observe, and input injection"
   handlers:
-    inject_input:     { description: "Single-frame Enhanced Input inject" }
-    pie_record_arm:   { description: "Arm the PIE input recorder" }
-    pie_replay_arm:   { description: "Arm the PIE input replayer" }
-    # ... 30 more handlers
+    record_arm:   { description: "Arm the PIE input recorder" }
+    replay_arm:   { description: "Arm the PIE input replayer" }
+    inject_input:
+      description: "Single-frame Enhanced Input inject"
+      timeoutSeconds: 5
+      schema:
+        action_path: { type: string, description: "InputAction asset path (required)" }
+        value_x:     { type: number }
+    # ... more handlers
 ```
+
+#### How handlers become MCP actions
+
+Set `category` and ue-mcp surfaces every handler as an MCP action that dispatches to the bare bridge method your C++ registered (`record_arm` above). No TypeScript task class is involved - the C++ handler *is* the implementation. The category value picks one of two shapes:
+
+- **A new (non-built-in) category** - as in the `pie` example above - is **provisioned as its own top-level tool** the plugin owns. Actions are **not** prefixed (the category is the namespace): `pie(action="record_arm")`. Set `categoryDescription` for the tool's summary. This is the right choice when the handlers form their own domain. Cross-plugin name collisions resolve first-wins, like `provides:`.
+- **A built-in category** (e.g. `gameplay`) **injects** the handlers into that existing tool, prefixed with `actionPrefix`: handler `record_arm` becomes `gameplay(action="pie_record_arm")`. Choose this when the handlers belong inside a category that already exists.
+
+Two rules that bite if missed:
+
+- **Declare params under each handler's `schema:`.** The MCP SDK strips any param not in the action's schema before it reaches the bridge, so an undeclared param silently never arrives. Same field types as `inject:` schemas. Params-free handlers (status polls, list calls) need no schema. Leave params **optional** (ue-mcp forces them optional regardless): one flat schema backs every action in a category, so a required param would be forced onto unrelated actions - let your C++ handler validate and return a clear error, and note "(required)" in the param description.
+- **`timeoutSeconds`** sets the bridge-call timeout for that action (default 30s). Raise it for long-running handlers.
+
+Omit `category` entirely and handlers are still registered on the bridge but exposed as no MCP action - useful only if another task calls them internally. For an agent-facing plugin you almost always want `category`.
 
 #### Layout inside the npm tarball
 
@@ -372,7 +395,7 @@ void FPIE_StudioModule::ShutdownModule()
 }
 ```
 
-The handler's method name (`inject_input`) is what the plugin's TypeScript task addresses through `this.call("inject_input", ...)` or what the bridge looks up when an MCP action dispatches.
+The handler's method name (`inject_input`) is the bare bridge method. It's what an auto-surfaced action (`gameplay(action="pie_inject_input")`, via `nativeModule.category`) dispatches to, what a TypeScript task can address through `this.call(...)`, and what the bridge looks up on any dispatch. Register it bare - ue-mcp adds the `actionPrefix` when it surfaces the action.
 
 #### Install flow
 
@@ -401,14 +424,14 @@ The response includes `bridgeApiVersion` when a bridge is deployed.
 
 ```ts
 // src/tasks/InspectSomething.ts
-import { BaseTask, type TaskResult } from "@db-lyon/flowkit";
+import { UeMcpTask, type TaskResult } from "ue-mcp/task";
 
 interface Options {
   actorLabel: string;
   includeComponents?: boolean;
 }
 
-export default class InspectSomething extends BaseTask<Options> {
+export default class InspectSomething extends UeMcpTask<Options> {
   get taskName() { return "mypfx.inspect_something"; }
 
   async execute(): Promise<TaskResult> {
@@ -428,7 +451,7 @@ export default class InspectSomething extends BaseTask<Options> {
 
 Notes:
 
-- Compose existing actions through `this.call('<category>.<action>', params)`. Don't reach into the bridge directly unless you have to - composition gives you free observability and rollback hooks.
+- Compose existing actions through `this.call('<category>.<action>', params)`. Don't reach into the bridge directly unless you have to - composition gives you free observability and rollback hooks. When you do need a raw bridge method that no task wraps, `UeMcpTask` gives you a typed `this.bridge.call(method, params)` and a typed `this.ctx` (`bridge`, `project`) with no casting.
 - Use the **real** parameter names of the host task you're calling. Param name drift between TS and C++ is how silent failures start.
 - If your task makes multi-step mutations, return a `rollback` record so users can opt into `rollback_on_failure: true` on the wrapping flow.
 - Throw, don't return success-with-error-data. The runtime catches throws and turns them into structured failures.
