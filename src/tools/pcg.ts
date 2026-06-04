@@ -25,8 +25,9 @@ export const pcgTool: ToolDef = categoryTool(
     add_volume:           bp("Place PCG volume. Params: graphPath, location?, extent?", "add_pcg_volume"),
     import_graph:         bp("Bulk-author a PCG graph from JSON. Params: assetPath, nodes=[{name,class,posX?,posY?,settings?}], connections=[{from,fromPin?,to,toPin?}], replace? (default false). One call replaces N add_node + M connect_nodes + K set_node_settings (#213).", "import_pcg_graph", (p) => ({ assetPath: p.assetPath, nodes: p.nodes, connections: p.connections, replace: p.replace })),
     export_graph:         bp("Export a PCG graph as JSON. Params: assetPath, includeSettings? (default true). Round-trip safe with import_graph (#213).", "export_pcg_graph", (p) => ({ assetPath: p.assetPath, includeSettings: p.includeSettings })),
-    set_graph_parameter:  bp("Create or update a Graph Parameter on a PCG graph (primitive types). Params: assetPath, name, type (double|int|bool|string|name), value. Returns {success, name, type, value, created|updated, existed?}. Existing name with different type returns MCPError without overwrite.", "set_pcg_graph_parameter"),
+    set_graph_parameter:  bp("Create or update a Graph Parameter on a PCG graph. Params: assetPath, name, type (double|int|bool|string|name|vector|object), value, objectClass? (StaticMesh for object). Returns {success, name, type, value, created|updated}.", "set_pcg_graph_parameter"),
     get_graph_parameters: bp("List all Graph Parameters on a PCG graph. Params: assetPath. Returns {success, count, parameters: [{name, type, value}]}.", "get_pcg_graph_parameters"),
+    sync_instance_parameters: bp("Push graph parameter layout to level PCGComponent GraphInstance overrides (Details panel). Params: assetPath/graphPath and/or actorLabel. Returns syncedComponents.", "sync_pcg_instance_parameters"),
   },
   undefined,
   {
@@ -46,9 +47,17 @@ export const pcgTool: ToolDef = categoryTool(
     nodes: z.array(z.record(z.unknown())).optional().describe("import_graph: [{name, class, posX?, posY?, settings?}]"),
     connections: z.array(z.record(z.unknown())).optional().describe("import_graph: [{from, fromPin?, to, toPin?}]"),
     includeSettings: z.boolean().optional().describe("export_graph: include per-node editable settings in the response (default true)"),
-    type: z.enum(["double", "int", "bool", "string", "name"]).optional()
-      .describe("set_graph_parameter: parameter type (5 primitives, lowercase)"),
-    value: z.union([z.number(), z.boolean(), z.string()]).optional()
-      .describe("set_graph_parameter: JSON literal value matching declared type"),
+    type: z.enum(["double", "int", "bool", "string", "name", "vector", "object"]).optional()
+      .describe("set_graph_parameter: parameter type (lowercase)"),
+    value: z.union([
+      z.number(),
+      z.boolean(),
+      z.string(),
+      z.record(z.number()),
+      z.array(z.number()),
+    ]).optional()
+      .describe("set_graph_parameter: JSON value (object path string, vector {x,y,z} or [x,y,z])"),
+    objectClass: z.string().optional()
+      .describe("set_graph_parameter: UObject class for type=object (default StaticMesh)"),
   },
 );
