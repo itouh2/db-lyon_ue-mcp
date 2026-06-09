@@ -19,7 +19,7 @@ export const animationTool: ToolDef = categoryTool(
     create_blendspace:    bp("Create blendspace (2D). Params: skeletonPath, name?, packagePath?, axisHorizontal?, axisVertical?", "create_blendspace"),
     create_blendspace_1d: bp("Create BlendSpace1D. Params: skeletonPath, name?, packagePath?, axisName? (default Speed), axisMin?, axisMax?, gridNum? (#459)", "create_blendspace_1d", (p) => ({ name: p.name, skeletonPath: p.skeletonPath, packagePath: p.packagePath, axisName: p.axisName, axisMin: p.axisMin, axisMax: p.axisMax, gridNum: p.gridNum, onConflict: p.onConflict })),
     populate_blendspace:  bp("One-call axis params + samples authoring for BlendSpace 1D/2D. Params: assetPath, axis? ({name?, min?, max?, gridNum?}) for axis 0, blendspaceAxes? (per-axis array), axisHorizontal?/axisVertical? + horizontalMin/horizontalMax/verticalMin/verticalMax/gridNumHorizontal/gridNumVertical (back-compat), samples ([{animationPath, x, y?}]), clearExisting? (default true) (#459)", "populate_blendspace", (p) => ({ assetPath: p.assetPath, axis: p.axis, axes: p.blendspaceAxes, axisIndex: p.axisIndex, axisHorizontal: p.axisHorizontal, axisVertical: p.axisVertical, horizontalMin: p.horizontalMin, horizontalMax: p.horizontalMax, verticalMin: p.verticalMin, verticalMax: p.verticalMax, gridNumHorizontal: p.gridNumHorizontal, gridNumVertical: p.gridNumVertical, samples: p.samples, clearExisting: p.clearExisting })),
-    add_notify:           bp("Add notify. Params: assetPath, notifyName, triggerTime, notifyClass?", "add_anim_notify"),
+    add_notify:           bp("Add notify. For PlayMontageNotify the notifyName is also written onto the spawned notify object so OnPlayMontageNotifyBegin broadcasts it (not 'None'), and montage branching-point markers refresh (#528). Params: assetPath, notifyName, triggerTime, notifyClass?", "add_anim_notify"),
     remove_notify:        bp("Remove notify(s) by name and/or class. Pass at least one of notifyName/notifyClass; both filters AND. Idempotent: alreadyDeleted=true if no match. Params: assetPath, notifyName?, notifyClass? (#471)", "remove_anim_notify", (p) => ({ assetPath: p.assetPath, notifyName: p.notifyName, notifyClass: p.notifyClass })),
     get_skeleton_info:    bp("Read skeleton. Params: assetPath", "get_skeleton_info"),
     list_sockets:         bp("List sockets. Params: assetPath", "list_sockets"),
@@ -27,6 +27,7 @@ export const animationTool: ToolDef = categoryTool(
     get_physics_asset:    bp("Read physics asset. Params: assetPath", "get_physics_asset_info"),
     create_sequence:      bp("Create blank AnimSequence. Params: name, skeletonPath, packagePath?, numFrames?, frameRate?", "create_sequence"),
     set_bone_keyframes:   bp("Set bone transform keyframes. Params: assetPath, boneName, keyframes", "set_bone_keyframes"),
+    bake_keyframes_batch: bp("Bake per-bone keyframe arrays for many bones into an AnimSequence in one call. Auto-creates each bone track first (set_bone_keyframes silently leaves a T-pose if the track is missing), wraps the batch in one transaction, and raises if any bone fails instead of reporting hollow success (#540). Params: assetPath, tracks ([{bone, keyframes:[{location,rotation{x,y,z,w},scale?}]}]), save? (default true)", "bake_keyframes_batch", (p) => ({ assetPath: p.assetPath, tracks: p.tracks, save: p.save })),
     get_bone_transforms:  bp("Read reference pose transforms. Params: skeletonPath, boneNames?, space? ('local' default, or 'component' for composed parent-chain transforms - retarget-chain / anatomical-scale work) (#245)", "get_bone_transforms"),
     set_montage_sequence: bp("Replace animation sequence in a montage. Params: assetPath, animSequencePath, slotIndex?", "set_montage_sequence"),
     set_montage_properties: bp("Set montage properties. Params: assetPath, sequenceLength?, rateScale?, blendIn?, blendOut?", "set_montage_properties"),
@@ -152,6 +153,16 @@ export const animationTool: ToolDef = categoryTool(
       rotation: Quat.optional(),
       scale: Vec3.optional(),
     })).optional(),
+    tracks: z.array(z.object({
+      bone: z.string(),
+      keyframes: z.array(z.object({
+        frame: z.number().optional(),
+        location: Vec3.optional(),
+        rotation: Quat.optional(),
+        scale: Vec3.optional(),
+      })),
+    })).optional().describe("Per-bone keyframe arrays for bake_keyframes_batch (#540)"),
+    save: z.boolean().optional().describe("bake_keyframes_batch: save the asset after baking (default true)"),
     // PoseSearch (v0.7.15)
     schemaPath: z.string().optional().describe("Path to a UPoseSearchSchema asset"),
     sequencePath: z.string().optional().describe("Animation asset path to add to a PoseSearchDatabase"),

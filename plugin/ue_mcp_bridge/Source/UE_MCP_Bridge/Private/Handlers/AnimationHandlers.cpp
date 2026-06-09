@@ -90,6 +90,7 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("remove_animation_notify"), &RemoveAnimNotify);
 	Registry.RegisterHandler(TEXT("create_sequence"), &CreateSequence);
 	Registry.RegisterHandler(TEXT("set_bone_keyframes"), &SetBoneKeyframes);
+	Registry.RegisterHandler(TEXT("bake_keyframes_batch"), &BakeKeyframesBatch);
 	Registry.RegisterHandler(TEXT("get_bone_transforms"), &GetBoneTransforms);
 	Registry.RegisterHandler(TEXT("set_montage_sequence"), &SetMontageSequence);
 	Registry.RegisterHandler(TEXT("set_montage_properties"), &SetMontageProperties);
@@ -754,9 +755,24 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 	if (NewNotify)
 	{
 		NewEvent.Notify = NewNotify;
+
+		// #528: UAnimNotify_PlayMontageNotify::BranchingPointNotify broadcasts the
+		// NOTIFY OBJECT's own NotifyName, not the FAnimNotifyEvent's. We only set
+		// the event name above, so any name-based routing in user code received
+		// 'None'. Mirror the requested name onto the notify object's NotifyName
+		// property (present on PlayMontageNotify / PlayMontageNotifyWindow) so
+		// OnPlayMontageNotifyBegin broadcasts the correct name.
+		if (FNameProperty* NameProp = CastField<FNameProperty>(NewNotify->GetClass()->FindPropertyByName(TEXT("NotifyName"))))
+		{
+			NameProp->SetPropertyValue_InContainer(NewNotify, NotifyFName);
+		}
 	}
 
 	AnimAsset->SortNotifies();
+
+	// #528: PostEditChange + save rebuilds the montage's branching-point markers
+	// from the notifies (RefreshBranchingPointMarkers itself is private), so the
+	// notify fires as a branching point with the name just written.
 	AnimAsset->PostEditChange();
 	AnimAsset->MarkPackageDirty();
 
