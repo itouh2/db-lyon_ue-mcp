@@ -2283,7 +2283,11 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetStringTableEntry(const TSharedPtr<FJso
 	const bool bExisted = StringTable->GetStringTable()->GetSourceString(EntryKey, PreviousSourceString);
 
 	StringTable->Modify(true);
-#if WITH_EDITORONLY_DATA
+	// [CCB-PATCH] 3 引数版 SetSourceString は UE 5.8+ のみ。upstream は WITH_EDITORONLY_DATA で
+	// ガードしているが、これは UE 5.7 のエディタビルドでも真になり 3 引数版を選んで C2660 になる。
+	// engine バージョンで分岐して UE 5.7 では 2 引数版を使う。
+	// 詳細は docs/mcp/mcps/db-lyon/upstream-merge-checklist.md の 2026-07-08 v1.0.86 詳細。
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
 	StringTable->GetMutableStringTable()->SetSourceString(EntryKey, SourceString, FString());
 #else
 	StringTable->GetMutableStringTable()->SetSourceString(EntryKey, SourceString);
