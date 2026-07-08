@@ -1005,7 +1005,7 @@ TSharedPtr<FJsonValue> FPCGHandlers::SetPCGNodeSettings(const TSharedPtr<FJsonOb
 	{
 		for (const auto& Pair : (*SettingsObj)->Values)
 		{
-			PropertiesToSet.Add(TPair<FString, TSharedPtr<FJsonValue>>(Pair.Key, Pair.Value));
+			PropertiesToSet.Add(TPair<FString, TSharedPtr<FJsonValue>>(FString(*Pair.Key), Pair.Value));
 		}
 	}
 	else
@@ -1764,14 +1764,15 @@ TSharedPtr<FJsonValue> FPCGHandlers::ImportGraph(const TSharedPtr<FJsonObject>& 
 			DefaultSettings->Modify();
 			for (const auto& Pair : (*SettingsObj)->Values)
 			{
+				const FString SettingName(*Pair.Key);
 				FString SubErr;
-				if (SetDottedPropertyFromJson(DefaultSettings, Pair.Key, Pair.Value, SubErr))
+				if (SetDottedPropertyFromJson(DefaultSettings, SettingName, Pair.Value, SubErr))
 				{
 					++SettingsApplied;
 				}
 				else
 				{
-					Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("node '%s' setting '%s': %s"), *LocalName, *Pair.Key, *SubErr)));
+					Warnings.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("node '%s' setting '%s': %s"), *LocalName, *SettingName, *SubErr)));
 				}
 			}
 			DefaultSettings->PostEditChange();

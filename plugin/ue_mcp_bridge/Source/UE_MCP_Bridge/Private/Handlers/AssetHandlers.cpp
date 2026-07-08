@@ -2613,7 +2613,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetTextureSettingsByType(const TSharedPtr
 
 	for (const auto& Pair : (*GroupsObj)->Values)
 	{
-		const FString& Group = Pair.Key;
+		const FString Group(*Pair.Key);
 		const FProfile* Profile = Profiles.Find(Group);
 		if (!Profile)
 		{
@@ -2766,7 +2766,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateInterchangePipeline(const TSharedPt
 		for (const auto& Pair : (*OptionsObj)->Values)
 		{
 			// Caller key is a dotted path: "MeshPipeline.bImportSkeletalMeshes" etc.
-			const FString& Key = Pair.Key;
+			const FString Key(*Pair.Key);
 			int32 Dot = INDEX_NONE;
 			Key.FindLastChar('.', Dot);
 			if (Dot == INDEX_NONE)
