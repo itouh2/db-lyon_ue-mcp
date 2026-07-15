@@ -2,6 +2,7 @@ import { z } from "zod";
 import { categoryTool, bp, directive, type ToolDef, type ToolContext } from "../types.js";
 import { startEditor, stopEditor, restartEditor, buildProject } from "../editor-control.js";
 import { pushWorkaround, workaroundCount } from "../workaround-tracker.js";
+import { searchTools } from "../tool-search.js";
 import { Vec3, Rotator } from "../schemas.js";
 
 export const editorTool: ToolDef = categoryTool(
@@ -43,9 +44,47 @@ export const editorTool: ToolDef = categoryTool(
     },
     execute_command: bp("Run console command. Params: command", "execute_command"),
     execute_python: {
-      description: "Run Python in editor. Params: code",
+      description: "GATED LAST RESORT. execute_python is unreachable until a semantic tool search over your taskSummary has been run AND every candidate it returns is EXPLICITLY ruled out with a stated reason. Flow: (1) call with taskSummary (+code) - it returns the candidate actions; (2) re-call with the same taskSummary/code PLUS ruledOut=[{action, reason}] giving a specific reason each candidate does not fit. Python runs only once every candidate is ruled out. Params: code, taskSummary (required), ruledOut? (#704)",
       handler: async (ctx: ToolContext, params: Record<string, unknown>) => {
         const code = (params.code as string) ?? "";
+        const taskSummary = ((params.taskSummary as string) ?? "").trim();
+
+        // #704: hard gate. Require an intent statement, run the semantic search,
+        // and refuse to run Python until EVERY candidate action is explicitly
+        // ruled out with a stated reason.
+        if (!taskSummary) {
+          return {
+            blocked: true,
+            reason: "missing_task_summary",
+            message: "execute_python requires a 'taskSummary' (plain-words intent). It is searched against the tool registry and gated behind ruling out every candidate. Re-call with taskSummary.",
+          };
+        }
+
+        // Candidates = meaningful matches (a name/phrase hit), capped at 5.
+        const candidates = (await searchTools(taskSummary, 5)).filter((h) => h.score >= 4);
+        if (candidates.length > 0) {
+          const ruledRaw = Array.isArray(params.ruledOut) ? (params.ruledOut as Array<Record<string, unknown>>) : [];
+          const ruled = new Map<string, string>();
+          for (const r of ruledRaw) {
+            const action = String(r?.action ?? "").trim();
+            const reason = String(r?.reason ?? "").trim();
+            if (action && reason.length >= 12) ruled.set(action, reason); // non-trivial reason required
+          }
+          const unresolved = candidates.filter((c) => !ruled.has(c.action));
+          if (unresolved.length > 0) {
+            pushWorkaround({ code, timestamp: new Date().toISOString(), taskSummary, suggestedTool: candidates.map((c) => `${c.tool}(${c.action})`).join(", ") });
+            return {
+              blocked: true,
+              reason: "candidates_not_ruled_out",
+              taskSummary,
+              candidates,
+              needReasonFor: unresolved.map((c) => `${c.tool}(${c.action})`),
+              message: `execute_python is GATED. A tool search for "${taskSummary}" returned ${candidates.length} candidate action(s). Rule out EACH with a specific reason (>=12 chars) via ruledOut:[{action, reason}], then re-call. Still need a reason for: ${unresolved.map((c) => c.action).join(", ")}. If one of these actually does the task, call it instead of Python.`,
+            };
+          }
+        }
+
+        // Gate passed (no candidates, or every candidate ruled out) - run Python.
         const result = await ctx.bridge.call("execute_python", { code });
 
         // Track this workaround in memory, and side-channel to a tmp log so
@@ -53,7 +92,7 @@ export const editorTool: ToolDef = categoryTool(
         const snippet = typeof result === "object" && result !== null
           ? JSON.stringify(result).slice(0, 200)
           : String(result).slice(0, 200);
-        const entry = { code, timestamp: new Date().toISOString(), resultSnippet: snippet };
+        const entry = { code, timestamp: new Date().toISOString(), resultSnippet: snippet, taskSummary };
         pushWorkaround(entry);
         try {
           const os = await import("node:os");
@@ -105,7 +144,7 @@ export const editorTool: ToolDef = categoryTool(
       },
     },
     run_python_file: bp("Run a Python file from disk with __file__/__name__ populated (#142). Params: filePath, args?", "run_python_file", (p) => ({ filePath: p.filePath, args: p.args })),
-    set_property: bp("Set UObject property. Params: objectPath, propertyName, value", "set_property"),
+    set_property: bp("Set UObject property. Saves the package to disk by default; pass save=false to leave it dirty in-memory (batch many writes, then editor(save_dirty)/asset(save)) (#674). Params: objectPath, propertyName, value, save? (default true)", "set_property"),
     get_property: bp("Read UObject property. Params: objectPath, propertyName", "get_property"),
     describe_object: bp("Describe a UObject and optionally list/read properties. Params: objectPath, includeProperties?, includeValues?, propertyNames?", "describe_object"),
     play_in_editor: bp("PIE control. Params: pieAction (start|stop|status), waitForAssetRegistry? (start only; default true - block until the AssetRegistry initial scan completes before requesting PIE, otherwise PIE silently no-ops on cold editor starts), assetRegistryTimeoutSeconds? (default 180) (#406)", "pie_control", (p) => ({ action: p.pieAction ?? "status", waitForAssetRegistry: p.waitForAssetRegistry, assetRegistryTimeoutSeconds: p.assetRegistryTimeoutSeconds })),
@@ -123,7 +162,7 @@ export const editorTool: ToolDef = categoryTool(
     set_scalability: bp("Set rendering quality via the Scalability system (actually applies + persists, not just sg.* cvars). Params: level (Low|Medium|High|Epic|Cinematic). Returns appliedLevels (#591)", "set_scalability"),
     set_cvars: bp("Bulk-set console variables. Params: cvars ({name: value} object OR [{name, value}] array). Returns per-cvar old/new values and any notFound names (#591)", "set_cvars", (p) => ({ cvars: p.cvars })),
     capture_screenshot: bp("Screenshot. Params: filename?, resolution?, target? (auto|pie|editor; auto routes to PIE viewport when PIE is running) (#226)", "capture_screenshot"),
-    capture_scene_png: bp("Headless PNG screenshot via SceneCapture2D (works unfocused, guaranteed RGBA8 LDR). Params: outputPath, location?, rotation?, width? (default 1280), height? (default 720), fov? (default 90) (#148)", "capture_scene_png", (p) => ({ outputPath: p.outputPath, location: p.location, rotation: p.rotation, width: p.width, height: p.height, fov: p.fov })),
+    capture_scene_png: bp("Headless PNG screenshot via SceneCapture2D (works unfocused, guaranteed RGBA8 LDR). focusActorLabel auto-frames the camera on an actor's bounds; world:pie captures the running game world (#599). Params: outputPath, location?, rotation?, focusActorLabel?, focusDirection?, focusMargin?, world? (editor|pie), width? (default 1280), height? (default 720), fov? (default 90) (#148/#599)", "capture_scene_png", (p) => ({ outputPath: p.outputPath, location: p.location, rotation: p.rotation, focusActorLabel: p.focusActorLabel, focusDirection: p.focusDirection, focusMargin: p.focusMargin, world: p.world, width: p.width, height: p.height, fov: p.fov, fullyLoadTextures: p.fullyLoadTextures })),
     set_realtime: bp("Toggle realtime update on the level editor viewports so the editor-world sim (Niagara, anims) ticks - otherwise capture_scene_png renders an unticked, empty sim. Params: enabled (default true) (#537)", "set_realtime", (p) => ({ enabled: p.enabled })),
     get_viewport: bp("Get viewport camera", "get_viewport_info"),
     hit_test_viewport_pixel: bp("Ray-cast from a screen pixel through the active editor viewport and return the first hit. Builds the ray from the live viewport's projection matrix (no FOV/aspect guessing). Returns hit + actorLabel/actorClass/componentName/componentClass/materialPath/location/impactPoint/normal/distance/faceIndex/boneName/physicalMaterial. Params: x, y (pixel coords), width? height? (override viewport size when picking from a different-resolution screenshot), maxDistance? (default 200000), ignoreActors? (array of actor labels) (#418)", "hit_test_viewport_pixel", (p) => ({ x: p.x, y: p.y, width: p.width, height: p.height, maxDistance: p.maxDistance, ignoreActors: p.ignoreActors })),
@@ -157,14 +196,20 @@ export const editorTool: ToolDef = categoryTool(
     open_asset: bp("Open asset in its editor. Params: assetPath", "open_asset"),
     reload_bridge: bp("Hot-reload Python bridge handlers from disk", "reload_handlers"),
     save_dirty: bp("Flush every dirty package and return a per-package saved/failed map. Use after multi-step CDO/component edits when set_class_default leaves the asset dirty without persisting (#378). Params: includeMaps? (default true), includeContent? (default true)", "save_dirty", (p) => ({ includeMaps: p.includeMaps, includeContent: p.includeContent })),
-    configure_pie: bp("Set ULevelEditorPlaySettings - multi-client PIE, net mode, single-process flag. Params: numClients?, netMode? (standalone|listen|client), runUnderOneProcess?, launchSeparateServer? (#384)", "configure_pie", (p) => ({ numClients: p.numClients, netMode: p.netMode, runUnderOneProcess: p.runUnderOneProcess, launchSeparateServer: p.launchSeparateServer })),
+    configure_pie: bp("Set ULevelEditorPlaySettings - multi-client PIE, net mode, single-process flag, Play-in-New-Window resolution. Params: numClients?, netMode? (standalone|listen|client), runUnderOneProcess?, launchSeparateServer?, newWindowWidth?, newWindowHeight? (#384/#671)", "configure_pie", (p) => ({ numClients: p.numClients, netMode: p.netMode, runUnderOneProcess: p.runUnderOneProcess, launchSeparateServer: p.launchSeparateServer, newWindowWidth: p.newWindowWidth, newWindowHeight: p.newWindowHeight })),
     get_pie_config: bp("Read current ULevelEditorPlaySettings (numClients, netMode, single-process, separate-server) (#384)", "get_pie_config"),
+    pie_set_player_view: bp("Point the running PIE player's view (control rotation) at a pitch/yaw/roll so a capture frames the intended direction. Requires PIE. Params: pitch?, yaw?, roll? (#671)", "pie_set_player_view", (p) => ({ pitch: p.pitch, yaw: p.yaw, roll: p.roll })),
+    stage_game_input: bp("Stage input for the running game: set input mode (gameOnly|gameAndUI|uiOnly) and mouse cursor so injected/simulated input reaches the pawn. Requires PIE. Params: inputMode? (default gameOnly), showMouseCursor? (#671)", "stage_game_input", (p) => ({ inputMode: p.inputMode, showMouseCursor: p.showMouseCursor })),
+    run_automation_tests: bp("Headlessly run registered Automation tests whose name matches a filter and report pass/fail + error messages (non-latent tests run fully; latent commands are flushed best-effort). Params: filter? (name substring, empty = all), maxTests? (default 50) (#693)", "run_automation_tests", (p) => ({ filter: p.filter, maxTests: p.maxTests })),
+    invoke_function_repeating: bp("Fire a parameterless UFUNCTION on an actor repeatedly at an interval for sustained on-demand triggering (human visual verification). Returns immediately; the remaining calls run in the background. Params: actorLabel, functionName, count? (default 5), intervalSeconds? (default 1.0), world? (editor|pie|auto) (#583)", "invoke_function_repeating", (p) => ({ actorLabel: p.actorLabel, functionName: p.functionName, count: p.count, intervalSeconds: p.intervalSeconds, world: p.world })),
     list_dirty_packages: bp("Enumerate currently-dirty content + map packages (#340)", "list_dirty_packages"),
   },
   undefined,
   {
     command: z.string().optional(),
     code: z.string().optional(),
+    taskSummary: z.string().optional().describe("execute_python: plain-words intent, searched against the tool registry to gate the call (#704)"),
+    ruledOut: z.array(z.object({ action: z.string(), reason: z.string() })).optional().describe("execute_python: reason each searched candidate action does not fit; every candidate must be ruled out before Python runs (#704)"),
     filePath: z.string().optional().describe("Absolute path to a .py file for run_python_file"),
     args: z.union([
       z.array(z.string()),
@@ -174,6 +219,8 @@ export const editorTool: ToolDef = categoryTool(
     target: z.string().optional().describe("capture_screenshot target: auto (default) | pie | editor"),
     playerIndex: z.number().optional().describe("get_pie_pawn: 0-based player index (default 0)"),
     functionName: z.string().optional(),
+    count: z.number().optional().describe("invoke_function_repeating: total number of calls (default 5) (#583)"),
+    intervalSeconds: z.number().optional().describe("invoke_function_repeating: seconds between calls (default 1.0) (#583)"),
     component: z.string().optional().describe("invoke_function: optional component subobject name to call the function on instead of the actor (#382)"),
     actorArgs: z.record(z.string()).optional().describe("invoke_function: map of UObject* parameter name to actor label, resolved against live actors in the active world (#383)"),
     className: z.string().optional().describe("invoke_static_function: UBlueprintFunctionLibrary class - short name or /Script/Module.Class path"),
@@ -184,6 +231,7 @@ export const editorTool: ToolDef = categoryTool(
     includeProperties: z.boolean().optional().describe("describe_object: include reflected property metadata (default true)"),
     includeValues: z.boolean().optional().describe("describe_object: include current property values (default false)"),
     value: z.unknown().optional(),
+    save: z.boolean().optional().describe("set_property: save package to disk after the write (default true; false leaves it dirty) (#674)"),
     pieAction: z.enum(["start", "stop", "status"]).optional(),
     waitForAssetRegistry: z.boolean().optional().describe("play_in_editor start: block until AssetRegistry finishes the initial scan (default true)"),
     assetRegistryTimeoutSeconds: z.number().optional().describe("play_in_editor start: wait budget for the AssetRegistry scan (default 180s)"),
@@ -210,6 +258,7 @@ export const editorTool: ToolDef = categoryTool(
     platform: z.string().optional(),
     maxLines: z.number().optional(),
     filter: z.string().optional(),
+    maxTests: z.number().optional().describe("run_automation_tests: cap on tests to run (default 50) (#693)"),
     category: z.string().optional(),
     query: z.string().optional(),
     logName: z.string().optional(),
@@ -226,6 +275,10 @@ export const editorTool: ToolDef = categoryTool(
     width: z.number().optional().describe("Capture width in pixels"),
     height: z.number().optional().describe("Capture height in pixels"),
     fov: z.number().optional().describe("Capture FOV in degrees"),
+    focusActorLabel: z.string().optional().describe("capture_scene_png: auto-frame the camera on this actor's bounds (#599)"),
+    focusDirection: Vec3.optional().describe("capture_scene_png: framing direction from the actor (default front/above) (#599)"),
+    focusMargin: z.number().optional().describe("capture_scene_png: bounds fill margin, higher pulls back (default 1.5) (#599)"),
+    fullyLoadTextures: z.boolean().optional().describe("capture_scene_png: force-stream textures + flush render thread before capture to avoid the checker/stale frame (default true) (#662)"),
     x: z.number().optional().describe("hit_test_viewport_pixel: viewport pixel X"),
     y: z.number().optional().describe("hit_test_viewport_pixel: viewport pixel Y"),
     maxDistance: z.number().optional().describe("hit_test_viewport_pixel: max ray length in cm (default 200000)"),
@@ -239,5 +292,12 @@ export const editorTool: ToolDef = categoryTool(
     netMode: z.string().optional().describe("configure_pie: standalone | listen | client"),
     runUnderOneProcess: z.boolean().optional().describe("configure_pie: single-process flag"),
     launchSeparateServer: z.boolean().optional().describe("configure_pie: separate dedicated server"),
+    newWindowWidth: z.number().optional().describe("configure_pie: Play-in-New-Window width (#671)"),
+    newWindowHeight: z.number().optional().describe("configure_pie: Play-in-New-Window height (#671)"),
+    pitch: z.number().optional().describe("pie_set_player_view: control-rotation pitch (#671)"),
+    yaw: z.number().optional().describe("pie_set_player_view: control-rotation yaw (#671)"),
+    roll: z.number().optional().describe("pie_set_player_view: control-rotation roll (#671)"),
+    inputMode: z.string().optional().describe("stage_game_input: gameOnly|gameAndUI|uiOnly (#671)"),
+    showMouseCursor: z.boolean().optional().describe("stage_game_input: show mouse cursor (#671)"),
   },
 );

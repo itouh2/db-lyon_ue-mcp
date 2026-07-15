@@ -9,6 +9,10 @@
 #include "Engine/AssetManager.h"
 #include "Engine/AssetManagerTypes.h"
 #include "Engine/Blueprint.h"
+#include "Engine/World.h"
+#include "Engine/Level.h"
+#include "Engine/LevelScriptBlueprint.h"
+#include "Kismet2/KismetEditorUtilities.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Editor.h"
 #include "FileHelpers.h"
@@ -179,6 +183,9 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// Texture handlers
 	Registry.RegisterHandler(TEXT("import_texture"), &ImportTexture);
 	Registry.RegisterHandler(TEXT("import_texture_batch"), &ImportTextureBatch);
+	// #697: texture export + compare.
+	Registry.RegisterHandler(TEXT("export_texture"), &ExportTexture);
+	Registry.RegisterHandler(TEXT("compare_textures"), &CompareTextures);
 	Registry.RegisterHandler(TEXT("get_texture_info"), &ListTextureProperties);
 	Registry.RegisterHandler(TEXT("set_texture_settings"), &SetTextureProperties);
 
@@ -250,6 +257,9 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("get_asset_referencers"), &GetReferencers);
 	Registry.RegisterHandler(TEXT("get_asset_dependencies"), &GetDependencies);
 	Registry.RegisterHandler(TEXT("list_skeleton_bones"), &ListSkeletonBones);
+	// #595: Chaos cloth read/write.
+	Registry.RegisterHandler(TEXT("read_cloth_data"), &ReadClothData);
+	Registry.RegisterHandler(TEXT("set_cloth_config"), &SetClothConfig);
 	Registry.RegisterHandler(TEXT("get_primary_asset_ids"), &GetPrimaryAssetIds);
 
 	// v1.0.0-rc.2 — #155 (asset gaps)
@@ -265,6 +275,11 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("move_folder"), &MoveFolder);
 	Registry.RegisterHandler(TEXT("create_folder"), &CreateFolder);
 	Registry.RegisterHandler(TEXT("delete_folder"), &DeleteFolder);
+
+	// #686 — UserDefinedEnum authoring
+	Registry.RegisterHandler(TEXT("create_user_defined_enum"), &CreateUserDefinedEnum);
+	Registry.RegisterHandler(TEXT("list_enum_values"), &ListEnumValues);
+	Registry.RegisterHandler(TEXT("edit_user_defined_enum"), &EditUserDefinedEnum);
 }
 
 // ---------------------------------------------------------------------------
@@ -821,6 +836,28 @@ TSharedPtr<FJsonValue> FAssetHandlers::DuplicateAsset(const TSharedPtr<FJsonObje
 	Result->SetStringField(TEXT("sourcePath"), SourcePath);
 	Result->SetStringField(TEXT("destinationPath"), DestPath);
 	Result->SetBoolField(TEXT("success"), Dup != nullptr);
+
+	// #589: duplicating a .umap that has a Level Blueprint leaves the copy's
+	// persistent level pointing its level-script class reference at the SOURCE
+	// world's generated class (a dangling cross-world ref), which crashes the
+	// editor when the copy is later loaded. Recompile the duplicated world's
+	// level-script blueprint so its class regenerates against the new package,
+	// then resave, breaking the dangling reference.
+	if (UWorld* DupWorld = Cast<UWorld>(Dup))
+	{
+		bool bRecompiledScript = false;
+		if (ULevel* PersistentLevel = DupWorld->PersistentLevel)
+		{
+			if (UBlueprint* LSB = PersistentLevel->GetLevelScriptBlueprint(/*bDontCreate*/ true))
+			{
+				FKismetEditorUtilities::CompileBlueprint(LSB);
+				bRecompiledScript = true;
+			}
+		}
+		SaveAssetPackage(DupWorld);
+		Result->SetBoolField(TEXT("isWorld"), true);
+		Result->SetBoolField(TEXT("recompiledLevelScript"), bRecompiledScript);
+	}
 
 	if (Dup)
 	{

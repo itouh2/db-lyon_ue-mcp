@@ -27,6 +27,7 @@
 #include "NiagaraNodeCustomHlsl.h"
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraEditorUtilities.h"
+#include "NiagaraEmitterFactoryNew.h"
 #include "Editor.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -61,7 +62,6 @@ void FNiagaraHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("spawn_niagara_actor"), &SpawnNiagaraActor);
 	Registry.RegisterHandler(TEXT("reactivate_niagara"), &ReactivateNiagara);
 	Registry.RegisterHandler(TEXT("set_niagara_parameter"), &SetNiagaraParameter);
-	Registry.RegisterHandler(TEXT("create_niagara_system_from_emitter"), &CreateNiagaraSystemFromEmitter);
 	Registry.RegisterHandler(TEXT("add_emitter_to_system"), &AddEmitterToSystem);
 	Registry.RegisterHandler(TEXT("set_emitter_property"), &SetEmitterProperty);
 	Registry.RegisterHandler(TEXT("get_emitter_info"), &GetEmitterInfo);
@@ -254,7 +254,18 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraEmitter(const TSharedPtr<F
 		return MCPError(TEXT("NiagaraEmitter class not found - factory not available"));
 	}
 
-	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("NiagaraEmitter"), EmitterClass, nullptr);
+	// Build the emitter through UNiagaraEmitterFactoryNew, not a bare NewObject.
+	// The factory's empty-emitter path initializes a UNiagaraScriptSource +
+	// graph (GraphSource) plus default modules and a sprite renderer - the same
+	// asset the "Niagara Emitter" content-browser action produces. A bare
+	// NewObject'd emitter has GraphSource==nullptr, "succeeds" here, then
+	// crashes the editor the moment it is added to a system. IAssetTools::
+	// CreateAsset runs FactoryCreateNew headlessly (no ConfigureProperties UI),
+	// and the factory defaults (EmitterToCopy=null) select the empty path.
+	UNiagaraEmitterFactoryNew* Factory = NewObject<UNiagaraEmitterFactoryNew>();
+	FGCRootScope FactoryRoot(Factory);
+
+	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("NiagaraEmitter"), EmitterClass, Factory);
 	if (Created.EarlyReturn) return Created.EarlyReturn;
 
 	UEditorAssetLibrary::SaveAsset(Created.Asset->GetPathName());
@@ -535,64 +546,22 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::SetNiagaraParameter(const TSharedPtr<FJ
 	return MCPResult(Result);
 }
 
-TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraSystemFromEmitter(const TSharedPtr<FJsonObject>& Params)
+// [CCB] CreateNiagaraSystemFromEmitter は upstream v1.1.20 で削除された
+// (gate 済み add_emitter_to_system に統合)。孤立した RegisterHandler と .h 宣言も除去済み。
+// An emitter is only safely addable to a system when its target version has a
+// GraphSource. A bare NewObject'd UNiagaraEmitter (how create_niagara_emitter
+// used to build them) or any asset left in a broken state has
+// GraphSource==nullptr; passing one to FNiagaraEditorUtilities::AddEmitterToSystem
+// makes Niagara's RebuildEmitterNodes dereference it and hard-crashes the editor
+// (ensure GraphSource != nullptr at NiagaraEmitter.cpp, then an access violation).
+// Every add-path must gate on this instead of trusting the emitter loaded clean.
+static bool EmitterHasGraphSource(UNiagaraEmitter* Emitter, const FGuid& Version)
 {
-	FString SystemName;
-	if (auto Err = RequireString(Params, TEXT("systemName"), SystemName)) return Err;
-
-	FString EmitterPath;
-	if (auto Err = RequireString(Params, TEXT("emitterPath"), EmitterPath)) return Err;
-
-	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/VFX"));
-	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
-	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
-
-	if (auto Existing = MCPCheckAssetExists(PackagePath, SystemName, OnConflict, TEXT("NiagaraSystem")))
-	{
-		return Existing;
-	}
-
-	UNiagaraEmitter* Emitter = LoadObject<UNiagaraEmitter>(nullptr, *EmitterPath);
-	if (!Emitter)
-	{
-		return MCPError(FString::Printf(TEXT("NiagaraEmitter not found: %s"), *EmitterPath));
-	}
-
-	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-	IAssetTools& AssetTools = AssetToolsModule.Get();
-
-	UObject* NewAsset = AssetTools.CreateAsset(SystemName, PackagePath, UNiagaraSystem::StaticClass(), nullptr);
-	if (!NewAsset)
-	{
-		return MCPError(TEXT("Failed to create NiagaraSystem"));
-	}
-
-	UNiagaraSystem* NewSystem = Cast<UNiagaraSystem>(NewAsset);
-	if (!NewSystem)
-	{
-		return MCPError(TEXT("Created asset is not a NiagaraSystem"));
-	}
-
-	NewSystem->MarkPackageDirty();
-	// #275: same crash-on-zero-emitters pattern as add_emitter_to_system.
-	// Route through the editor helper instead of raw AddEmitterHandle.
-	const FGuid HandleId = FNiagaraEditorUtilities::AddEmitterToSystem(*NewSystem, *Emitter, Emitter->GetExposedVersion().VersionGuid);
-	FName HandleName = NAME_None;
-	for (const FNiagaraEmitterHandle& H : NewSystem->GetEmitterHandles())
-	{
-		if (H.GetId() == HandleId) { HandleName = H.GetName(); break; }
-	}
-
-	UEditorAssetLibrary::SaveAsset(NewAsset->GetPathName());
-
-	auto Result = MCPSuccess();
-	MCPSetCreated(Result);
-	Result->SetStringField(TEXT("systemPath"), NewAsset->GetPathName());
-	Result->SetStringField(TEXT("systemName"), SystemName);
-	Result->SetStringField(TEXT("emitterPath"), EmitterPath);
-	Result->SetStringField(TEXT("emitterHandleName"), HandleName.ToString());
-	MCPSetDeleteAssetRollback(Result, NewAsset->GetPathName());
-	return MCPResult(Result);
+	if (!Emitter) return false;
+	const FVersionedNiagaraEmitterData* Data = Version.IsValid()
+		? Emitter->GetEmitterData(Version)
+		: Emitter->GetLatestEmitterData();
+	return Data != nullptr && Data->GraphSource != nullptr;
 }
 
 TSharedPtr<FJsonValue> FNiagaraHandlers::AddEmitterToSystem(const TSharedPtr<FJsonObject>& Params)
@@ -654,6 +623,13 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::AddEmitterToSystem(const TSharedPtr<FJs
 	// system's overview graph. This is the same path the editor uses for
 	// "Add Emitter to System" in the Niagara System editor.
 	const FGuid EmitterVersion = Emitter->GetExposedVersion().VersionGuid;
+	// Guard: a GraphSource-less emitter crashes AddEmitterToSystem. Fail cleanly.
+	if (!EmitterHasGraphSource(Emitter, EmitterVersion))
+	{
+		return MCPError(FString::Printf(
+			TEXT("Emitter '%s' has no GraphSource - it was created empty/invalid and cannot be added to a system (adding it would crash the editor). Recreate it with create_niagara_emitter, which now initializes a valid graph."),
+			*EmitterPath));
+	}
 	const FGuid HandleId = FNiagaraEditorUtilities::AddEmitterToSystem(*System, *Emitter, EmitterVersion);
 	if (!HandleId.IsValid())
 	{
@@ -1105,11 +1081,23 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraSystemFromSpec(const TShar
 	const TArray<TSharedPtr<FJsonValue>>* EmittersArr = nullptr;
 	Params->TryGetArrayField(TEXT("emitters"), EmittersArr);
 
-	auto Created = MCPCreateAssetIdempotentNewObject<UNiagaraSystem>(Name, PackagePath, OptionalString(Params, TEXT("onConflict"), TEXT("skip")), TEXT("NiagaraSystem"));
+	// Create the system through UNiagaraSystemFactoryNew, not a bare NewObject.
+	// A NewObject'd UNiagaraSystem has no system spawn/update scripts and no
+	// editor data; FNiagaraEditorUtilities::AddEmitterToSystem then dereferences
+	// that missing state and hard-crashes the editor (access violation). The
+	// factory's InitializeSystem sets up the scripts + editor data + default
+	// nodes - the same asset the plain `create` action produces. (Mirrors
+	// CreateNiagaraSystem.)
+	UClass* SystemFactoryClass = FindObject<UClass>(nullptr, TEXT("/Script/NiagaraEditor.NiagaraSystemFactoryNew"));
+	UFactory* SystemFactory = SystemFactoryClass
+		? Cast<UFactory>(NewObject<UObject>(GetTransientPackage(), SystemFactoryClass))
+		: nullptr;
+	auto Created = MCPCreateAssetIdempotent<UNiagaraSystem>(Name, PackagePath, OptionalString(Params, TEXT("onConflict"), TEXT("skip")), TEXT("NiagaraSystem"), SystemFactory);
 	if (Created.EarlyReturn) return Created.EarlyReturn;
 	UNiagaraSystem* System = Created.Asset;
 
 	int32 AddedEmitters = 0;
+	TArray<FString> SkippedEmitters;
 	if (EmittersArr)
 	{
 		for (const TSharedPtr<FJsonValue>& V : *EmittersArr)
@@ -1129,6 +1117,14 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraSystemFromSpec(const TShar
 			if (!Source) Source = Cast<UNiagaraEmitter>(UEditorAssetLibrary::LoadAsset(EmitterPath));
 			if (!Source) continue;
 			const FGuid Version = Source->GetExposedVersion().VersionGuid;
+			// Guard: skip GraphSource-less emitters instead of crashing the
+			// editor. Surfaced in the result so the caller knows which ones
+			// failed and can recreate them.
+			if (!EmitterHasGraphSource(Source, Version))
+			{
+				SkippedEmitters.Add(EmitterPath);
+				continue;
+			}
 			// #275: route through FNiagaraEditorUtilities so we get
 			// KillSystemInstances + RebuildEmitterNodes + unique-name
 			// resolution instead of mutating the handle list raw.
@@ -1144,6 +1140,15 @@ TSharedPtr<FJsonValue> FNiagaraHandlers::CreateNiagaraSystemFromSpec(const TShar
 	MCPSetCreated(Res);
 	Res->SetStringField(TEXT("path"), System->GetPathName());
 	Res->SetNumberField(TEXT("emittersAdded"), AddedEmitters);
+	if (SkippedEmitters.Num() > 0)
+	{
+		TArray<TSharedPtr<FJsonValue>> Skipped;
+		for (const FString& S : SkippedEmitters) Skipped.Add(MakeShared<FJsonValueString>(S));
+		Res->SetArrayField(TEXT("skippedEmitters"), Skipped);
+		Res->SetStringField(TEXT("warning"), FString::Printf(
+			TEXT("%d emitter(s) were skipped because they have no GraphSource (created empty/invalid). Recreate them with create_niagara_emitter."),
+			SkippedEmitters.Num()));
+	}
 	MCPSetDeleteAssetRollback(Res, System->GetPathName());
 	return MCPResult(Res);
 }

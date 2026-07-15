@@ -54,6 +54,9 @@ private:
 	// FBX import handlers
 	static TSharedPtr<FJsonValue> ImportStaticMesh(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ImportSkeletalMesh(const TSharedPtr<FJsonObject>& Params);
+	// #595: read/write Chaos cloth data on a skeletal mesh's clothing assets.
+	static TSharedPtr<FJsonValue> ReadClothData(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetClothConfig(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ImportAnimation(const TSharedPtr<FJsonObject>& Params);
 
 	// Mesh material handlers
@@ -66,6 +69,9 @@ private:
 	static TSharedPtr<FJsonValue> ListTextureProperties(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetTextureProperties(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ImportTexture(const TSharedPtr<FJsonObject>& Params);
+	// #697: export a texture to PNG on disk, and compare two textures.
+	static TSharedPtr<FJsonValue> ExportTexture(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> CompareTextures(const TSharedPtr<FJsonObject>& Params);
 	// #430: one-call batch of texture imports - loops AssetImportTasks inside the editor.
 	static TSharedPtr<FJsonValue> ImportTextureBatch(const TSharedPtr<FJsonObject>& Params);
 
@@ -136,4 +142,9 @@ private:
 	// #279: detect stuck-unloadable assets and recover without editor restart
 	static TSharedPtr<FJsonValue> HealthCheck(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ForceReload(const TSharedPtr<FJsonObject>& Params);
+
+	// #686: UserDefinedEnum authoring (create, list values, add/rename/remove enumerator)
+	static TSharedPtr<FJsonValue> CreateUserDefinedEnum(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListEnumValues(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> EditUserDefinedEnum(const TSharedPtr<FJsonObject>& Params);
 };
