@@ -28,6 +28,17 @@ export interface UeMcpConfig {
     enabled?: boolean;
     exclude?: string[];
   };
+  /** Editor bridge WebSocket. `port` pins the bridge port instead of deriving
+   *  it from the project root path (see port.ts). Unset = derived per-worktree port. */
+  bridge?: {
+    port?: number;
+  };
+  /** Per-asset exclusive locking for concurrent agents (see locking.ts).
+   *  Opt-in; disabled by default. */
+  locking?: {
+    enabled?: boolean;
+    ttlSeconds?: number;
+  };
   /** Optional HTTP surface for flow.run (#144). Disabled by default. */
   http?: {
     enabled?: boolean;
@@ -257,7 +268,7 @@ export class ProjectContext {
 }
 
 /**
- * Load the `ue-mcp:` block with the full CumulusCI-style layer cascade, each
+ * Load the `ue-mcp:` block with the full layered cascade, each
  * layer deep-merged over the one before (low -> high precedence):
  *
  *     ~/.ue-mcp/config.yml   (user-global, untracked)

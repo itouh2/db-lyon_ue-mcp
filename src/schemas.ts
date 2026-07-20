@@ -41,6 +41,25 @@ export const UeMcpConfigSchema = z
         exclude: z.array(z.string()).optional(),
       })
       .optional(),
+    // Editor bridge WebSocket. `port` pins the port instead of deriving it
+    // from the project root path (see port.ts). Pin it only when you need a
+    // fixed, well-known port; leaving it unset gives each worktree a stable,
+    // collision-resistant derived port.
+    bridge: z
+      .object({
+        port: z.number().int().min(1).max(65535).optional(),
+      })
+      .optional(),
+    // Per-asset exclusive locking for concurrent agents. Opt-in: `enabled`
+    // wraps mutating dispatch in acquire/release around the shared bridge
+    // registry. `ttlSeconds` is the lease length a crashed agent's locks
+    // survive before auto-release (default 300). See locking.ts.
+    locking: z
+      .object({
+        enabled: z.boolean().optional(),
+        ttlSeconds: z.number().int().min(1).optional(),
+      })
+      .optional(),
     http: z
       .object({
         enabled: z.boolean().optional(),

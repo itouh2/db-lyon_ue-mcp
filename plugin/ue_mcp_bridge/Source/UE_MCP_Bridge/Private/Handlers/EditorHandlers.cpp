@@ -17,6 +17,12 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "IPythonScriptPlugin.h"
+#include "LevelSequence.h"
+#include "LevelSequenceEditorBlueprintLibrary.h"
+#include "Framework/Docking/TabManager.h"
+#include "Widgets/Docking/SDockTab.h"
+#include "ISettingsModule.h"
+#include "Modules/ModuleManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/ConfigContext.h"
 #include "Misc/Paths.h"
@@ -24,6 +30,7 @@
 #include "Misc/FileHelper.h"
 #include "LevelEditorViewport.h"
 #include "UnrealClient.h"
+#include "Engine/GameViewportClient.h"
 #include "ContentStreaming.h"
 #include "RenderingThread.h"
 #include "Misc/AutomationTest.h"
@@ -33,6 +40,10 @@
 #include "Misc/App.h"
 #include "Logging/MessageLog.h"
 #include "HighResScreenshot.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Widgets/SWindow.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
 #include "Engine/SceneCapture2D.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Components/SceneCaptureComponent2D.h"
@@ -211,6 +222,13 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// Kismet, anything user-defined). Pair with editor.invoke_function to
 	// drive GeometryScript ops from MCP without hand-writing each handler.
 	Registry.RegisterHandler(TEXT("list_function_libraries"), &ListFunctionLibraries);
+	// #718: close the open Level Sequence editor before destructive actor ops.
+	Registry.RegisterHandler(TEXT("close_sequence"), &CloseSequence);
+	// #719: purge cached embedded-Python modules by prefix for tool-dev iteration.
+	Registry.RegisterHandler(TEXT("purge_python_modules"), &PurgePythonModules);
+	// #727: open a registered editor tab / Project Settings viewer for visual evidence.
+	Registry.RegisterHandler(TEXT("open_tab"), &OpenTab);
+	Registry.RegisterHandler(TEXT("open_settings"), &OpenSettings);
 }
 
 TSharedPtr<FJsonValue> FEditorHandlers::ExecuteCommand(const TSharedPtr<FJsonObject>& Params)
@@ -245,9 +263,35 @@ TSharedPtr<FJsonValue> FEditorHandlers::ExecutePython(const TSharedPtr<FJsonObje
 
 	bool bSuccess = PythonPlugin->ExecPythonCommandEx(PythonCommand);
 
+	// #732: a first-class result channel. In ExecuteFile mode CommandResult is
+	// normally empty and a top-level `return` is illegal, so scripts were forced
+	// to use print() as transport - mixing application data with diagnostics and
+	// duplicating it across log_output/output. When the caller names a
+	// resultVariable, evaluate it in the Public (__main__) scope the script just
+	// ran in and surface it as `result`, leaving print()/log as diagnostics only.
+	FString ResultText = PythonCommand.CommandResult;
+	const FString ResultVariable = OptionalString(Params, TEXT("resultVariable"));
+	bool bResultVariableResolved = false;
+	if (bSuccess && !ResultVariable.IsEmpty())
+	{
+		FPythonCommandEx EvalCommand;
+		EvalCommand.Command = ResultVariable;
+		EvalCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
+		EvalCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
+		if (PythonPlugin->ExecPythonCommandEx(EvalCommand))
+		{
+			ResultText = EvalCommand.CommandResult;
+			bResultVariableResolved = true;
+		}
+	}
+
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), bSuccess);
-	Result->SetStringField(TEXT("result"), PythonCommand.CommandResult);
+	Result->SetStringField(TEXT("result"), ResultText);
+	if (!ResultVariable.IsEmpty())
+	{
+		Result->SetBoolField(TEXT("resultVariableResolved"), bResultVariableResolved);
+	}
 
 	TArray<TSharedPtr<FJsonValue>> LogArray;
 	for (const FPythonLogOutputEntry& Entry : PythonCommand.LogOutput)
@@ -313,10 +357,32 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunPythonFile(const TSharedPtr<FJsonObje
 
 	bool bSuccess = PythonPlugin->ExecPythonCommandEx(PythonCommand);
 
+	// #732: same first-class result channel as execute_python. The file runs in
+	// the Public (__main__) scope, so a named resultVariable can be read back.
+	FString ResultText = PythonCommand.CommandResult;
+	const FString ResultVariable = OptionalString(Params, TEXT("resultVariable"));
+	bool bResultVariableResolved = false;
+	if (bSuccess && !ResultVariable.IsEmpty())
+	{
+		FPythonCommandEx EvalCommand;
+		EvalCommand.Command = ResultVariable;
+		EvalCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
+		EvalCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
+		if (PythonPlugin->ExecPythonCommandEx(EvalCommand))
+		{
+			ResultText = EvalCommand.CommandResult;
+			bResultVariableResolved = true;
+		}
+	}
+
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), bSuccess);
 	Result->SetStringField(TEXT("path"), FilePath);
-	Result->SetStringField(TEXT("result"), PythonCommand.CommandResult);
+	Result->SetStringField(TEXT("result"), ResultText);
+	if (!ResultVariable.IsEmpty())
+	{
+		Result->SetBoolField(TEXT("resultVariableResolved"), bResultVariableResolved);
+	}
 
 	TArray<TSharedPtr<FJsonValue>> LogArray;
 	FString CombinedOutput;
@@ -332,6 +398,150 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunPythonFile(const TSharedPtr<FJsonObje
 	Result->SetArrayField(TEXT("log_output"), LogArray);
 	Result->SetStringField(TEXT("output"), CombinedOutput);
 
+	return MCPResult(Result);
+}
+
+// #719: UE's embedded Python caches imported modules for the whole editor
+// session, so after editing a pipeline tool on disk the editor keeps running
+// stale code until the modules are purged from sys.modules. sys.modules is
+// Python-runtime state with no C++ accessor, so the interpreter (a hard plugin
+// dependency) is the correct owner to drive. We emit per-module markers rather
+// than rely on eval repr/str ambiguity, then rebuild the list in C++.
+TSharedPtr<FJsonValue> FEditorHandlers::PurgePythonModules(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Prefix;
+	if (auto Err = RequireString(Params, TEXT("prefix"), Prefix)) return Err;
+	if (Prefix.TrimStartAndEnd().IsEmpty())
+	{
+		return MCPError(TEXT("'prefix' must be non-empty (an empty prefix would purge every module)"));
+	}
+
+	IPythonScriptPlugin* PythonPlugin = IPythonScriptPlugin::Get();
+	if (!PythonPlugin || !PythonPlugin->IsPythonAvailable())
+	{
+		return MCPError(TEXT("Python scripting is not available"));
+	}
+
+	// Escape the prefix into a Python single-quoted literal.
+	FString Escaped = Prefix.Replace(TEXT("\\"), TEXT("\\\\")).Replace(TEXT("'"), TEXT("\\'"));
+
+	FString Code;
+	Code += TEXT("import sys as __mcp_sys\n");
+	Code += FString::Printf(TEXT("__mcp_names = [__m for __m in list(__mcp_sys.modules) if __m.startswith('%s')]\n"), *Escaped);
+	Code += TEXT("for __m in __mcp_names:\n");
+	Code += TEXT("    del __mcp_sys.modules[__m]\n");
+	Code += TEXT("    print('MCP_PURGED_ITEM:' + __m)\n");
+
+	FPythonCommandEx PythonCommand;
+	PythonCommand.Command = Code;
+	PythonCommand.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
+	PythonCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
+	const bool bSuccess = PythonPlugin->ExecPythonCommandEx(PythonCommand);
+	if (!bSuccess)
+	{
+		return MCPError(TEXT("Failed to purge Python modules (interpreter error)"));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Purged;
+	const FString Marker = TEXT("MCP_PURGED_ITEM:");
+	for (const FPythonLogOutputEntry& Entry : PythonCommand.LogOutput)
+	{
+		FString Line = Entry.Output;
+		int32 Idx = Line.Find(Marker);
+		if (Idx != INDEX_NONE)
+		{
+			FString Name = Line.RightChop(Idx + Marker.Len()).TrimStartAndEnd();
+			if (!Name.IsEmpty())
+			{
+				Purged.Add(MakeShared<FJsonValueString>(Name));
+			}
+		}
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("prefix"), Prefix);
+	Result->SetArrayField(TEXT("purged"), Purged);
+	Result->SetNumberField(TEXT("count"), Purged.Num());
+	return MCPResult(Result);
+}
+
+// #718: close the currently open Level Sequence editor. Open sequences
+// re-resolve possessables by name during actor destruction, which can mis-bind
+// or destabilize the editor, so bulk actor ops want the sequencer closed first.
+TSharedPtr<FJsonValue> FEditorHandlers::CloseSequence(const TSharedPtr<FJsonObject>& /*Params*/)
+{
+	ULevelSequence* Current = ULevelSequenceEditorBlueprintLibrary::GetCurrentLevelSequence();
+	const bool bWasOpen = Current != nullptr;
+	const FString OpenPath = bWasOpen ? Current->GetPathName() : FString();
+
+	ULevelSequenceEditorBlueprintLibrary::CloseLevelSequence();
+
+	auto Result = MCPSuccess();
+	Result->SetBoolField(TEXT("wasOpen"), bWasOpen);
+	if (bWasOpen)
+	{
+		Result->SetStringField(TEXT("closedSequence"), OpenPath);
+	}
+	return MCPResult(Result);
+}
+
+// #727: open a registered editor tab by ID (e.g. "ProjectSettings", "OutputLog")
+// so an agent can screenshot editor UI as evidence.
+TSharedPtr<FJsonValue> FEditorHandlers::OpenTab(const TSharedPtr<FJsonObject>& Params)
+{
+	FString TabId;
+	if (auto Err = RequireString(Params, TEXT("tabId"), TabId)) return Err;
+
+	TSharedPtr<SDockTab> Tab = FGlobalTabmanager::Get()->TryInvokeTab(FTabId(*TabId));
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("tabId"), TabId);
+	Result->SetBoolField(TEXT("opened"), Tab.IsValid());
+	if (!Tab.IsValid())
+	{
+		Result->SetBoolField(TEXT("success"), false);
+		Result->SetStringField(TEXT("error"), FString::Printf(TEXT("No registered tab with id '%s' (try 'ProjectSettings', 'OutputLog', 'ContentBrowserTab1', ...)"), *TabId));
+	}
+	return MCPResult(Result);
+}
+
+// #727: open (and navigate) a settings viewer - Project Settings / Editor
+// Preferences. section may be a bare section name (with category) or a dotted
+// "Category.Section" pair for convenience.
+TSharedPtr<FJsonValue> FEditorHandlers::OpenSettings(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Container = OptionalString(Params, TEXT("container"), TEXT("Project"));
+	FString Category = OptionalString(Params, TEXT("category"));
+	FString Section = OptionalString(Params, TEXT("section"));
+
+	// Accept a combined "Category.Section" in `section` when `category` is absent.
+	if (Category.IsEmpty() && Section.Contains(TEXT(".")))
+	{
+		FString Left, Right;
+		if (Section.Split(TEXT("."), &Left, &Right))
+		{
+			Category = Left;
+			Section = Right;
+		}
+	}
+
+	ISettingsModule* SettingsModule = FModuleManager::GetModulePtr<ISettingsModule>("Settings");
+	if (!SettingsModule)
+	{
+		return MCPError(TEXT("Settings module not available"));
+	}
+
+	// Make sure the viewer tab exists, then show the requested section.
+	FGlobalTabmanager::Get()->TryInvokeTab(FTabId(Container == TEXT("Editor") ? TEXT("EditorSettings") : TEXT("ProjectSettings")));
+	if (!Category.IsEmpty())
+	{
+		SettingsModule->ShowViewer(FName(*Container), FName(*Category), FName(*Section));
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("container"), Container);
+	Result->SetStringField(TEXT("category"), Category);
+	Result->SetStringField(TEXT("section"), Section);
 	return MCPResult(Result);
 }
 
@@ -1033,6 +1243,84 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJson
 	// HighResShot in the active PIE world so we capture the player viewport
 	// instead of whatever the editor camera was last looking at.
 	const FString Target = OptionalString(Params, TEXT("target"), TEXT("auto")).ToLower();
+
+	// target=window: synchronous FSlateApplication::TakeScreenshot of the whole
+	// active (or last visible) Slate window. Unlike the FScreenshotRequest paths
+	// this is pixel-true for ALL Slate content (painted UMG/Slate widgets that
+	// showUI compositing can miss), returns only after the PNG is on disk, and
+	// works even when the window is off-screen or unfocused - which makes it the
+	// reliable way for an agent to visually QA game UI.
+	if (Target == TEXT("window"))
+	{
+		if (!FSlateApplication::IsInitialized())
+		{
+			return MCPError(TEXT("Slate is not initialized"));
+		}
+		TSharedPtr<SWindow> CaptureWindow = FSlateApplication::Get().GetActiveTopLevelWindow();
+		if (!CaptureWindow.IsValid())
+		{
+			TArray<TSharedRef<SWindow>> VisibleWindows;
+			FSlateApplication::Get().GetAllVisibleWindowsOrdered(VisibleWindows);
+			if (VisibleWindows.Num() > 0)
+			{
+				CaptureWindow = VisibleWindows.Last();
+			}
+		}
+		if (!CaptureWindow.IsValid())
+		{
+			return MCPError(TEXT("No visible Slate window to capture"));
+		}
+
+		TArray<FColor> Pixels;
+		FIntVector CaptureSize = FIntVector::ZeroValue;
+		if (!FSlateApplication::Get().TakeScreenshot(CaptureWindow.ToSharedRef(), Pixels, CaptureSize)
+			|| Pixels.Num() == 0)
+		{
+			return MCPError(TEXT("Slate window screenshot failed"));
+		}
+		// Slate hands back per-widget alpha; force opaque so the PNG is viewable.
+		for (FColor& Pixel : Pixels)
+		{
+			Pixel.A = 255;
+		}
+
+		FString WindowFullPath = Filename;
+		if (FPaths::IsRelative(WindowFullPath))
+		{
+			WindowFullPath = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"), Filename);
+		}
+
+		IImageWrapperModule& ImageWrapperModule =
+			FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+		TSharedPtr<IImageWrapper> PngWrapper =
+			ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+		if (!PngWrapper.IsValid()
+			|| !PngWrapper->SetRaw(
+				Pixels.GetData(),
+				Pixels.Num() * sizeof(FColor),
+				CaptureSize.X,
+				CaptureSize.Y,
+				ERGBFormat::BGRA,
+				8))
+		{
+			return MCPError(TEXT("PNG encode failed"));
+		}
+		const TArray64<uint8> PngData = PngWrapper->GetCompressed(100);
+		if (!FFileHelper::SaveArrayToFile(PngData, *WindowFullPath))
+		{
+			return MCPError(FString::Printf(TEXT("Could not write %s"), *WindowFullPath));
+		}
+
+		auto Result = MCPSuccess();
+		Result->SetStringField(TEXT("filename"), WindowFullPath);
+		Result->SetStringField(TEXT("target"), TEXT("window"));
+		Result->SetStringField(TEXT("window"), CaptureWindow->GetTitle().ToString());
+		Result->SetNumberField(TEXT("width"), CaptureSize.X);
+		Result->SetNumberField(TEXT("height"), CaptureSize.Y);
+		Result->SetStringField(TEXT("note"), TEXT("Synchronous Slate window capture including all UI."));
+		return MCPResult(Result);
+	}
+
 	UWorld* PieWorld = nullptr;
 	if (FWorldContext* PieCtx = GEditor->GetPIEWorldContext())
 	{
@@ -1042,9 +1330,37 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJson
 
 	if (bUsePie && PieWorld)
 	{
+		// #724: HighResShot renders the PIE world offscreen and (a) strips the
+		// debug canvas (AddOnScreenDebugMessage overlays) and (b) in
+		// Play-in-New-Window did not reliably resolve to the PIE game window.
+		// Capture the actual PIE game viewport with a normal screenshot request
+		// and bShowUI=true, so we get exactly what the player sees - HUD and the
+		// on-screen debug canvas included. The running game viewport consumes the
+		// pending request on its next Draw, so this targets the PIE window even
+		// in new-window mode. Fall back to HighResShot only if no game viewport.
+		FString FullPath = Filename;
+		if (FPaths::IsRelative(Filename))
+		{
+			FullPath = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"), Filename);
+		}
+
+		UGameViewportClient* GameViewport = PieWorld->GetGameViewport();
+		if (GameViewport && GameViewport->Viewport)
+		{
+			FScreenshotRequest::RequestScreenshot(FullPath, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+			GameViewport->Viewport->Invalidate();
+
+			auto Result = MCPSuccess();
+			Result->SetStringField(TEXT("filename"), FullPath);
+			Result->SetStringField(TEXT("target"), TEXT("pie"));
+			Result->SetBoolField(TEXT("includesDebugCanvas"), true);
+			Result->SetStringField(TEXT("note"), TEXT("PIE game-viewport screenshot queued (UI + on-screen debug canvas included); written asynchronously."));
+			return MCPResult(Result);
+		}
+
+		// Fallback: no resolvable game viewport (unusual) - dispatch HighResShot.
 		int32 Width = OptionalInt(Params, TEXT("width"), 1920);
 		int32 Height = OptionalInt(Params, TEXT("height"), 1080);
-		// Some callers pass a single 'resolution' (long edge); honour it as width.
 		double ResolutionScalar = 0.0;
 		if (Params->TryGetNumberField(TEXT("resolution"), ResolutionScalar) && ResolutionScalar > 0)
 		{
@@ -1057,7 +1373,8 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJson
 		Result->SetStringField(TEXT("filename"), Filename);
 		Result->SetStringField(TEXT("target"), TEXT("pie"));
 		Result->SetStringField(TEXT("consoleCommand"), ConsoleCmd);
-		Result->SetStringField(TEXT("note"), TEXT("HighResShot dispatched into PIE world; output lands in Saved/Screenshots/<map>/."));
+		Result->SetBoolField(TEXT("includesDebugCanvas"), false);
+		Result->SetStringField(TEXT("note"), TEXT("No game viewport resolved; HighResShot dispatched (debug canvas not captured). Output in Saved/Screenshots/<map>/."));
 		return MCPResult(Result);
 	}
 
@@ -1509,7 +1826,25 @@ TSharedPtr<FJsonValue> FEditorHandlers::OpenAsset(const TSharedPtr<FJsonObject>&
 
 TSharedPtr<FJsonValue> FEditorHandlers::RunStatCommand(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Command = OptionalString(Params, TEXT("command"), TEXT("stat fps"));
+	// #722: callers naturally pass the stat name (e.g. name="unit"); the old
+	// handler only read "command" and silently defaulted to "stat fps" when the
+	// stat was passed as "name", so "unit" ran the FPS counter. Accept either:
+	// an explicit full "command", or a bare stat "name" that we prefix.
+	FString Command = OptionalString(Params, TEXT("command"));
+	if (Command.IsEmpty())
+	{
+		const FString StatName = OptionalString(Params, TEXT("name"));
+		if (!StatName.IsEmpty())
+		{
+			Command = StatName.StartsWith(TEXT("stat "), ESearchCase::IgnoreCase)
+				? StatName
+				: FString::Printf(TEXT("stat %s"), *StatName);
+		}
+		else
+		{
+			Command = TEXT("stat fps");
+		}
+	}
 
 	REQUIRE_EDITOR_WORLD(World);
 

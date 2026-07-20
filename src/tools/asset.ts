@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { categoryTool, bp, type ToolDef } from "../types.js";
 import { Vec3, Rotator } from "../schemas.js";
+import { SESSION_ID } from "../locking.js";
 
 export const assetTool: ToolDef = categoryTool(
   "asset",
@@ -49,6 +50,7 @@ export const assetTool: ToolDef = categoryTool(
     delete:         bp("Delete asset. On failure returns reason (open_in_editor / has_referencers / in_memory_referenced / package_read_only / package_dirty / unknown) plus referencers, inMemoryReferencers, packageReadOnly, packageDirty diagnostics (#601). Pass force=true to auto-close any open asset editors before deleting (#278). Params: assetPath, force?", "delete_asset"),
     delete_batch:   bp("Batch-delete assets. Per-path status (deleted/absent/failed) plus reason+referencers on failed entries (#278). Params: assetPaths[], force?", "delete_asset_batch"),
     create_data_asset: bp("Create UDataAsset instance of custom class. Params: name, className (/Script/Module.ClassName or loaded name), packagePath?, properties? (key/value map)", "create_data_asset"),
+    create_asset_by_class: bp("Create an asset of ANY concrete UObject class (not just UDataAsset) - physical-material subclasses, curves, settings objects. Params: name, className (/Script/Module.ClassName or loaded name), packagePath?, properties? (key/value map), onConflict? (skip|replace|rename). Actors/components and specialized assets (Blueprint/Material) have dedicated actions (#726)", "create_asset_by_class", (p) => ({ name: p.name, className: p.className, packagePath: p.packagePath, properties: p.properties, onConflict: p.onConflict })),
     save:           bp("Save asset(s). Params: assetPath?", "save_asset"),
     save_all_dirty: bp("Flush every dirty package to disk in one call. End-of-workflow shortcut after bulk import/edit. Params: saveMapPackages? (default true), saveContentPackages? (default true). Returns savedAll boolean (#429)", "save_all_dirty", (p) => ({ saveMapPackages: p.saveMapPackages, saveContentPackages: p.saveContentPackages })),
     set_mesh_material:    bp("Assign material to static mesh slot. Params: assetPath, materialPath, slotIndex?", "set_mesh_material"),
@@ -108,9 +110,9 @@ export const assetTool: ToolDef = categoryTool(
     add_input_mapping:    bp("Append an Enhanced Input key mapping to an InputMappingContext (InputAction + key by name string e.g. 'Mouse2D','LeftMouseButton'). Idempotent on (action,key). For modifiers/triggers use gameplay(set_mapping_modifiers). Same as gameplay(add_imc_mapping) (#525). Params: mappingContext (IMC path), inputAction (IA path), key", "add_imc_mapping", (p) => ({ imcPath: p.mappingContext ?? p.imcPath ?? p.assetPath, inputActionPath: p.inputAction ?? p.inputActionPath, key: p.key })),
     remove_input_mapping: bp("Remove an IMC key mapping. Same as gameplay(remove_imc_mapping) (#525). Params: mappingContext (IMC path), mappingIndex? | (inputAction? + key?)", "remove_imc_mapping", (p) => ({ imcPath: p.mappingContext ?? p.imcPath ?? p.assetPath, mappingIndex: p.mappingIndex, inputActionPath: p.inputAction ?? p.inputActionPath, key: p.key })),
     list_input_mappings:  bp("List an IMC's key->action bindings with triggers/modifiers. Same as gameplay(read_imc) (#525). Params: mappingContext (IMC path)", "read_imc", (p) => ({ imcPath: p.mappingContext ?? p.imcPath ?? p.assetPath })),
-    add_socket:           bp("Add socket to StaticMesh or SkeletalMesh. Idempotent on socket name; pass onConflict='update' to overwrite an existing socket's transform with the supplied relativeLocation/relativeRotation/relativeScale (#412). Params: assetPath, socketName, boneName? (SkeletalMesh only, default 'root'), relativeLocation?, relativeRotation?, relativeScale?, onConflict? (skip\\|update\\|error, default skip)", "add_socket"),
+    add_socket:           bp("Add socket to StaticMesh or SkeletalMesh. SkeletalMesh writes mesh-local sockets by default; pass a Skeleton asset path to edit skeleton-level sockets. Idempotent on socket name; pass onConflict='update' to overwrite an existing socket's transform with the supplied relativeLocation/relativeRotation/relativeScale (#412). Params: assetPath, socketName, boneName? (SkeletalMesh only, default 'root'), relativeLocation?, relativeRotation?, relativeScale?, onConflict? (skip\\|update\\|error, default skip)", "add_socket"),
     remove_socket:        bp("Remove socket by name. Params: assetPath, socketName", "remove_socket"),
-    list_sockets:         bp("List sockets on a mesh (StaticMesh or SkeletalMesh). Params: assetPath", "list_asset_sockets", (p) => ({ assetPath: p.assetPath })),
+    list_sockets:         bp("List sockets on a mesh (StaticMesh or SkeletalMesh). SkeletalMesh results include mesh-local sockets plus assigned Skeleton sockets, each with source='mesh' or source='skeleton'. Params: assetPath", "list_asset_sockets", (p) => ({ assetPath: p.assetPath })),
     set_socket_transform: bp("Update an existing socket's relative transform on StaticMesh or SkeletalMesh. Pass any subset of relativeLocation/relativeRotation/relativeScale; omitted fields stay at their current values. Errors if the socket does not exist (use add_socket to create). Common after FBX import when SOCKET_* empties land with scale=(100,100,100) (#412). Params: assetPath, socketName, relativeLocation?, relativeRotation?, relativeScale?", "set_socket_transform"),
     set_property:         bp("Set a UPROPERTY on any loaded asset (Material, DataAsset, DataTable, SubsurfaceProfile, etc.) using a dotted path. Blueprint paths resolve to the generated-class CDO so you can author its defaults + Instanced sub-object arrays (#568). Walks nested structs, array elements by index, and instanced subobjects internally - no more read-modify-write copies (e.g. `settings.mean_free_path_distance` on a UMaterial, or `Config.Traits[1].Params.Field` on a config asset #527). Value goes through MCPJsonProperty::SetJsonOnProperty so JSON null clears object refs, structs accept {x,y,z}, arrays/maps round-trip. Params: assetPath, propertyName (dotted path), value (#420)", "set_asset_property", (p) => ({ assetPath: p.assetPath ?? p.path, propertyName: p.propertyName, value: p.value })),
     set_texture_settings_by_type: bp("Apply the canonical (compressionSettings, sRGB, LOD group) combo to every texture in each group: normal -> Normalmap, grayscale -> Grayscale, baseColor -> Default sRGB, hdr -> HDR. Params: groups (object: {normal?:[paths], grayscale?:[paths], baseColor?:[paths], hdr?:[paths]}) (#421)", "set_texture_settings_by_type", (p) => ({ groups: p.groups })),
@@ -139,6 +141,17 @@ export const assetTool: ToolDef = categoryTool(
     create_user_defined_enum: bp("Create a UserDefinedEnum content asset, optionally pre-populated with values. Params: name, packagePath? (default /Game), values? ([display-name strings]), onConflict? (#686)", "create_user_defined_enum", (p) => ({ name: p.name, packagePath: p.packagePath, values: p.values, onConflict: p.onConflict })),
     list_enum_values:     bp("List a UEnum's enumerators (index, authored short name, display name, value). Works on native and UserDefinedEnum assets. Params: assetPath (#686)", "list_enum_values", (p) => ({ assetPath: p.assetPath })),
     edit_user_defined_enum: bp("Author a UserDefinedEnum content asset. op=add_value appends an enumerator (authored name is auto-assigned; pass displayName - or name - to set the editable display text). op=rename_value sets a new displayName on the enumerator resolved by index or name (matches short or display name). op=remove_value deletes it. Recompiles dependents automatically. Native UEnums are not editable. Params: assetPath, op (add_value|rename_value|remove_value), displayName?, name?, index? (#686)", "edit_user_defined_enum", (p) => ({ assetPath: p.assetPath, op: p.op, displayName: p.displayName, name: p.name, index: p.index })),
+    create_user_defined_struct: bp("Create a UserDefinedStruct content asset, optionally pre-populated with fields. Each field is {name, type} where type is a MakePinType string (bool|int|int64|float|string|name|text|byte, a struct like Vector, an enum, or an object ref like Actor). Params: name, packagePath? (default /Game), structFields? ([{name, type}]), onConflict? (#735)", "create_user_defined_struct", (p) => ({ name: p.name, packagePath: p.packagePath, fields: p.structFields, onConflict: p.onConflict })),
+    list_struct_fields:   bp("List a UserDefinedStruct's members (index, internal name, friendly/display name, GUID, type label). Use this to find the GUID for a stable rename/retype. Native structs are not editable. Params: assetPath (#735)", "list_struct_fields", (p) => ({ assetPath: p.assetPath ?? p.path })),
+    edit_user_defined_struct: bp("Author a UserDefinedStruct content asset. op=add_field appends a member (type via MakePinType string; pass fieldName for its display name). op=rename_field sets a new newDisplayName on the member resolved by fieldGuid or fieldName - the member GUID is preserved so existing Blueprint pins and DataTable rows survive. op=set_field_type changes a member's type. op=remove_field deletes it. Recompiles dependents automatically. Native structs are not editable. Params: assetPath, op (add_field|rename_field|set_field_type|remove_field), fieldName?, fieldGuid?, newDisplayName?, type? (#735)", "edit_user_defined_struct", (p) => ({ assetPath: p.assetPath ?? p.path, op: p.op, fieldName: p.fieldName, fieldGuid: p.fieldGuid, newDisplayName: p.newDisplayName, type: p.type })),
+    rename_struct_field:  bp("Rename a UserDefinedStruct field's display name while preserving its member GUID, so Blueprint pins and DataTable rows keyed off it survive. Convenience wrapper over edit_user_defined_struct(op=rename_field). Resolve the field by fieldGuid or fieldName (matches friendly or internal name). Params: assetPath, fieldName | fieldGuid, newDisplayName (#735)", "edit_user_defined_struct", (p) => ({ assetPath: p.assetPath ?? p.path, op: "rename_field", fieldName: p.fieldName, fieldGuid: p.fieldGuid, newDisplayName: p.newDisplayName })),
+    // Per-asset exclusive locking for concurrent agents. The lock registry
+    // lives in the bridge (the shared editor), keyed by asset path with a TTL
+    // so a crashed session never wedges an asset. sessionId defaults to this
+    // server process; pass it explicitly to coordinate across processes.
+    lock:                 bp("Acquire an exclusive lock on an asset for this session. Returns acquired=true, or acquired=false with holder{sessionId,ttlSecondsRemaining} when another session holds it. Params: assetPath, ttlSeconds? (default 300), sessionId?", "acquire_lock", (p) => ({ path: p.assetPath ?? p.path, sessionId: p.sessionId ?? SESSION_ID, ttlSeconds: p.ttlSeconds })),
+    unlock:               bp("Release an asset lock held by this session (or force=true to break any holder's lock). Params: assetPath, force?, sessionId?", "release_lock", (p) => ({ path: p.assetPath ?? p.path, sessionId: p.sessionId ?? SESSION_ID, force: p.force })),
+    list_locks:           bp("List all currently-held asset locks with holder session id, acquiredAt, and ttlSecondsRemaining.", "list_locks"),
   },
   undefined,
   {
@@ -187,7 +200,7 @@ export const assetTool: ToolDef = categoryTool(
     keyFilter: z.string().optional().describe("Filter StringTable keys by substring"),
     csvPath: z.string().optional().describe("StringTable CSV import path"),
     mappingIndex: z.number().optional().describe("Index of an IMC mapping for remove_input_mapping (#525)"),
-    fieldName: z.string().optional().describe("DataTable field/column name for set_datatable_cell (#535)"),
+    fieldName: z.string().optional().describe("DataTable field/column name for set_datatable_cell (#535); also resolves a UserDefinedStruct member by friendly/internal name for edit_user_defined_struct/rename_struct_field, or names the new member for add_field (#735)"),
     oldName: z.string().optional().describe("Existing row key for rename_datatable_row (#535)"),
     rows: z.record(z.unknown()).optional().describe("DataTable bulk rows { rowName: {field: value} } for fill_datatable_from_json (#535)"),
     jsonPath: z.string().optional(), jsonString: z.string().optional(),
@@ -238,7 +251,7 @@ export const assetTool: ToolDef = categoryTool(
     hard: z.boolean().optional().describe("get_dependencies: include hard dependencies (default true)"),
     soft: z.boolean().optional().describe("get_dependencies: include soft dependencies (default true)"),
     includeTransforms: z.boolean().optional().describe("list_skeleton_bones: include rest-pose transforms (default true)"),
-    type: z.string().optional().describe("get_primary_asset_ids: FPrimaryAssetType filter (omit for all types) (#579)"),
+    type: z.string().optional().describe("get_primary_asset_ids: FPrimaryAssetType filter (omit for all types) (#579); also the member type (MakePinType string) for edit_user_defined_struct add_field/set_field_type (#735)"),
     // #155
     slots: z.array(z.object({
       slotName: z.string().optional(),
@@ -246,10 +259,16 @@ export const assetTool: ToolDef = categoryTool(
       materialPath: z.string(),
     })).optional().describe("Per-slot material assignments for set_sk_material_slots"),
     path: z.string().optional().describe("Content path (e.g. /Game/Foo) - used by diagnose_registry, create_folder"),
-    op: z.string().optional().describe("edit_user_defined_enum op: add_value | rename_value | remove_value"),
+    op: z.string().optional().describe("edit_user_defined_enum op: add_value | rename_value | remove_value. edit_user_defined_struct op: add_field | rename_field | set_field_type | remove_field"),
     values: z.array(z.string()).optional().describe("create_user_defined_enum: initial value display names"),
     displayName: z.string().optional().describe("edit_user_defined_enum: display text for the enumerator"),
     index: z.number().optional().describe("edit_user_defined_enum: enumerator index for rename/remove"),
+    structFields: z.array(z.object({
+      name: z.string(),
+      type: z.string().optional(),
+    })).optional().describe("create_user_defined_struct: initial members as [{name, type}] (type is a MakePinType string, default bool)"),
+    fieldGuid: z.string().optional().describe("edit_user_defined_struct/rename_struct_field: resolve a field by its member GUID (stable across renames)"),
+    newDisplayName: z.string().optional().describe("edit_user_defined_struct/rename_struct_field: new display name for rename_field"),
     paths: z.array(z.string()).optional().describe("Multiple content paths for create_folder"),
     reconcile: z.boolean().optional().describe("diagnose_registry: force synchronous rescan (evicts pending-kill ghosts)"),
     bHasNavigationData: z.boolean().optional().describe("Toggle nav data generation for set_mesh_nav"),

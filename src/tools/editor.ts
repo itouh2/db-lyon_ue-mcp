@@ -44,7 +44,7 @@ export const editorTool: ToolDef = categoryTool(
     },
     execute_command: bp("Run console command. Params: command", "execute_command"),
     execute_python: {
-      description: "GATED LAST RESORT. execute_python is unreachable until a semantic tool search over your taskSummary has been run AND every candidate it returns is EXPLICITLY ruled out with a stated reason. Flow: (1) call with taskSummary (+code) - it returns the candidate actions; (2) re-call with the same taskSummary/code PLUS ruledOut=[{action, reason}] giving a specific reason each candidate does not fit. Python runs only once every candidate is ruled out. Params: code, taskSummary (required), ruledOut? (#704)",
+      description: "GATED LAST RESORT. execute_python is unreachable until a semantic tool search over your taskSummary has been run AND every candidate it returns is EXPLICITLY ruled out with a stated reason. Flow: (1) call with taskSummary (+code) - it returns the candidate actions; (2) re-call with the same taskSummary/code PLUS ruledOut=[{action, reason}] giving a specific reason each candidate does not fit. Python runs only once every candidate is ruled out. Params: code, taskSummary (required), ruledOut?, resultVariable? (name of a top-level variable to return as `result`, separate from print()/log; #732) (#704)",
       handler: async (ctx: ToolContext, params: Record<string, unknown>) => {
         const code = (params.code as string) ?? "";
         const taskSummary = ((params.taskSummary as string) ?? "").trim();
@@ -85,7 +85,9 @@ export const editorTool: ToolDef = categoryTool(
         }
 
         // Gate passed (no candidates, or every candidate ruled out) - run Python.
-        const result = await ctx.bridge.call("execute_python", { code });
+        // #732: forward an optional resultVariable so scripts can return a value
+        // through a first-class `result` channel instead of print()/log.
+        const result = await ctx.bridge.call("execute_python", { code, resultVariable: params.resultVariable });
 
         // Track this workaround in memory, and side-channel to a tmp log so
         // the record survives even if the agent ignores the directive.
@@ -143,7 +145,11 @@ export const editorTool: ToolDef = categoryTool(
         );
       },
     },
-    run_python_file: bp("Run a Python file from disk with __file__/__name__ populated (#142). Params: filePath, args?", "run_python_file", (p) => ({ filePath: p.filePath, args: p.args })),
+    run_python_file: bp("Run a Python file from disk with __file__/__name__ populated (#142). Params: filePath, args?, resultVariable? (name of a top-level variable to return as `result`, separate from logs; #732)", "run_python_file", (p) => ({ filePath: p.filePath, args: p.args, resultVariable: p.resultVariable })),
+    purge_python_modules: bp("Purge cached embedded-Python modules whose name starts with a prefix, so the editor drops stale code after you edit a Python tool on disk. Returns the purged module names + count. Params: prefix (required, non-empty) (#719)", "purge_python_modules", (p) => ({ prefix: p.prefix })),
+    close_sequence: bp("Close the currently open Level Sequence editor (Sequencer). Do this before bulk-deleting actors a sequence may possess - open sequences re-resolve possessables by name during destruction and can mis-bind. Returns wasOpen + closedSequence (#718)", "close_sequence"),
+    open_tab: bp("Open a registered editor tab by ID so its UI can be screenshotted as evidence (e.g. 'ProjectSettings', 'OutputLog', 'ContentBrowserTab1'). Params: tabId (#727)", "open_tab", (p) => ({ tabId: p.tabId })),
+    open_settings: bp("Open (and navigate) a settings viewer for visual settings evidence. Params: container? (Project|Editor; default Project), category? (e.g. 'Engine'), section? (e.g. 'Physics', or a combined 'Engine.Physics') (#727)", "open_settings", (p) => ({ container: p.container, category: p.category, section: p.section })),
     set_property: bp("Set UObject property. Saves the package to disk by default; pass save=false to leave it dirty in-memory (batch many writes, then editor(save_dirty)/asset(save)) (#674). Params: objectPath, propertyName, value, save? (default true)", "set_property"),
     get_property: bp("Read UObject property. Params: objectPath, propertyName", "get_property"),
     describe_object: bp("Describe a UObject and optionally list/read properties. Params: objectPath, includeProperties?, includeValues?, propertyNames?", "describe_object"),
@@ -158,10 +164,10 @@ export const editorTool: ToolDef = categoryTool(
     undo: bp("Undo last transaction", "undo"),
     redo: bp("Redo last transaction", "redo"),
     get_perf_stats: bp("Editor performance stats", "get_editor_performance_stats"),
-    run_stat: bp("Run stat command. Params: command", "run_stat_command"),
+    run_stat: bp("Run a stat overlay. Params: name (bare stat name, e.g. 'unit','fps','game','gpu') OR command (full console command). A bare name is prefixed with 'stat ' (#722).", "run_stat_command", (p) => ({ command: p.command, name: p.name })),
     set_scalability: bp("Set rendering quality via the Scalability system (actually applies + persists, not just sg.* cvars). Params: level (Low|Medium|High|Epic|Cinematic). Returns appliedLevels (#591)", "set_scalability"),
     set_cvars: bp("Bulk-set console variables. Params: cvars ({name: value} object OR [{name, value}] array). Returns per-cvar old/new values and any notFound names (#591)", "set_cvars", (p) => ({ cvars: p.cvars })),
-    capture_screenshot: bp("Screenshot. Params: filename?, resolution?, target? (auto|pie|editor; auto routes to PIE viewport when PIE is running) (#226)", "capture_screenshot"),
+    capture_screenshot: bp("Screenshot. target=pie captures the actual PIE game viewport with UI + on-screen debug canvas (what the player sees), even in Play-in-New-Window; target=editor captures the level viewport; target=window synchronously captures the whole active Slate window via FSlateApplication::TakeScreenshot - pixel-true for ALL Slate/UMG UI (painted widgets the compositing paths can miss), returns after the PNG is written, and works while the window is unfocused or off-screen, so it is the reliable mode for agent visual QA of game UI. Params: filename?, resolution?, target? (auto|pie|editor|window; auto routes to PIE when running). Returns includesDebugCanvas (#226/#724), and window title + width/height for target=window", "capture_screenshot"),
     capture_scene_png: bp("Headless PNG screenshot via SceneCapture2D (works unfocused, guaranteed RGBA8 LDR). focusActorLabel auto-frames the camera on an actor's bounds; world:pie captures the running game world (#599). Params: outputPath, location?, rotation?, focusActorLabel?, focusDirection?, focusMargin?, world? (editor|pie), width? (default 1280), height? (default 720), fov? (default 90) (#148/#599)", "capture_scene_png", (p) => ({ outputPath: p.outputPath, location: p.location, rotation: p.rotation, focusActorLabel: p.focusActorLabel, focusDirection: p.focusDirection, focusMargin: p.focusMargin, world: p.world, width: p.width, height: p.height, fov: p.fov, fullyLoadTextures: p.fullyLoadTextures })),
     set_realtime: bp("Toggle realtime update on the level editor viewports so the editor-world sim (Niagara, anims) ticks - otherwise capture_scene_png renders an unticked, empty sim. Params: enabled (default true) (#537)", "set_realtime", (p) => ({ enabled: p.enabled })),
     get_viewport: bp("Get viewport camera", "get_viewport_info"),
@@ -208,6 +214,11 @@ export const editorTool: ToolDef = categoryTool(
   {
     command: z.string().optional(),
     code: z.string().optional(),
+    resultVariable: z.string().optional().describe("execute_python/run_python_file: name of a top-level Python variable to return as `result`, separate from print()/log output (#732)"),
+    prefix: z.string().optional().describe("purge_python_modules: purge sys.modules entries starting with this prefix (#719)"),
+    tabId: z.string().optional().describe("open_tab: registered editor tab ID, e.g. 'ProjectSettings' (#727)"),
+    container: z.string().optional().describe("open_settings: settings container - Project | Editor (#727)"),
+    section: z.string().optional().describe("open_settings: settings section, e.g. 'Physics' or 'Engine.Physics' (#727)"),
     taskSummary: z.string().optional().describe("execute_python: plain-words intent, searched against the tool registry to gate the call (#704)"),
     ruledOut: z.array(z.object({ action: z.string(), reason: z.string() })).optional().describe("execute_python: reason each searched candidate action does not fit; every candidate must be ruled out before Python runs (#704)"),
     filePath: z.string().optional().describe("Absolute path to a .py file for run_python_file"),
@@ -216,7 +227,7 @@ export const editorTool: ToolDef = categoryTool(
       z.record(z.unknown()),
     ]).optional().describe("run_python_file: array of positional args. invoke_function: object mapping parameter name to value"),
     objectPath: z.string().optional(),
-    target: z.string().optional().describe("capture_screenshot target: auto (default) | pie | editor"),
+    target: z.string().optional().describe("capture_screenshot target: auto (default) | pie | editor | window (synchronous whole-Slate-window capture, pixel-true for painted UI)"),
     playerIndex: z.number().optional().describe("get_pie_pawn: 0-based player index (default 0)"),
     functionName: z.string().optional(),
     count: z.number().optional().describe("invoke_function_repeating: total number of calls (default 5) (#583)"),

@@ -23,6 +23,9 @@ private:
 	static TSharedPtr<FJsonValue> DeleteAssetBatch(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> BulkRename(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateDataAsset(const TSharedPtr<FJsonObject>& Params);
+	// #726: create an asset of any concrete UObject class via its registered
+	// factory (or NewObject fallback), not just UDataAsset subclasses.
+	static TSharedPtr<FJsonValue> CreateAssetByClass(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SaveAsset(const TSharedPtr<FJsonObject>& Params);
 	// #429: bulk save of every dirty package - one-shot end-of-workflow flush.
 	static TSharedPtr<FJsonValue> SaveAllDirty(const TSharedPtr<FJsonObject>& Params);
@@ -147,4 +150,10 @@ private:
 	static TSharedPtr<FJsonValue> CreateUserDefinedEnum(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ListEnumValues(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> EditUserDefinedEnum(const TSharedPtr<FJsonObject>& Params);
+
+	// #735: UserDefinedStruct authoring (create, list fields, add/rename/retype/remove member).
+	// rename_field preserves the member GUID so Blueprint pins and DataTable rows survive.
+	static TSharedPtr<FJsonValue> CreateUserDefinedStruct(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListStructFields(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> EditUserDefinedStruct(const TSharedPtr<FJsonObject>& Params);
 };

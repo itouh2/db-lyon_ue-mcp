@@ -21,6 +21,7 @@ import { startFlowHttpServer } from "./flow/http-server.js";
 import type { FlowContext } from "./flow/context.js";
 import type { FlowConfig, PluginEntry } from "./flow/schema.js";
 import { loadPlugins, type PluginRecord } from "./plugin/loader.js";
+import { withAssetLocks, resolveLockingConfig } from "./locking.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import yaml from "js-yaml";
@@ -59,8 +60,11 @@ async function main() {
 
       // #492: pass the .uproject path to the bridge so it can read the
       // per-project port lockfile when connecting (lets multiple editors
-      // coexist on adjacent ports).
-      bridge.projectPathForLockfile = project.projectPath;
+      // coexist on adjacent ports). setProjectContext also derives this
+      // project's stable per-worktree port from its root path unless the port
+      // was explicitly pinned (UE_MCP_PORT env or ue-mcp.yml bridge.port).
+      bridge.setConfigPort(project.config.bridge?.port);
+      bridge.setProjectContext(project.projectPath);
 
       // Non-destructive attach — never overwrites local bridge source.
       // Source deployment is reserved for `ue-mcp init` / `ue-mcp deploy`.
@@ -213,6 +217,13 @@ async function main() {
   const guardedBridge = new GuardedBridge(bridge, guardRegistry, makeResolveExistingFile(project));
   const ctx: ToolContext = { bridge: guardedBridge, project, getFlows, getPlugins };
 
+  // Per-asset locking for concurrent agents. Opt-in; when off, withAssetLocks
+  // is a passthrough. The registry itself lives in the C++ bridge.
+  const lockingCfg = resolveLockingConfig(project.config.locking);
+  if (lockingCfg.enabled) {
+    console.error(`[ue-mcp] Per-asset locking enabled (TTL ${lockingCfg.ttlSeconds}s)`);
+  }
+
   // ── Flow engine: task registry ──────────────────────────────────
   const registry = buildFlowRegistry(registryTools);
   for (const { name, ctor } of pluginLoad.taskRegistrations) {
@@ -273,7 +284,7 @@ async function main() {
 
       try {
         const task = await registry.create(taskName, flowCtx, taskParams);
-        const result = await task.run();
+        const result = await withAssetLocks(bridge, lockingCfg, taskName, taskParams, () => task.run());
 
         if (!result.success) {
           const msg = result.error?.message ?? `Task ${taskName} failed`;
@@ -488,6 +499,18 @@ if (subcmd === "init") {
   // own "am I the entry point" guard never fires. Call the export directly.
   import("./auth-cli.js").then((m) => m.runFeedbackAuthStep()).catch((e) => {
     console.error(`[ue-mcp] auth failed: ${e instanceof Error ? e.message : e}`);
+    process.exit(1);
+  });
+} else if (subcmd === "login") {
+  process.argv.splice(2, 1);
+  import("./login-cli.js").then((m) => m.runLogin()).catch((e) => {
+    console.error(`[ue-mcp] login failed: ${e instanceof Error ? e.message : e}`);
+    process.exit(1);
+  });
+} else if (subcmd === "logout") {
+  process.argv.splice(2, 1);
+  import("./login-cli.js").then((m) => m.runLogout()).catch((e) => {
+    console.error(`[ue-mcp] logout failed: ${e instanceof Error ? e.message : e}`);
     process.exit(1);
   });
 } else if (subcmd === "feedback") {
