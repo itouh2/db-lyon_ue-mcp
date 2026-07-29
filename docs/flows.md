@@ -34,7 +34,7 @@ That's it. The config is **hot-reloaded on every call** — edit the YAML and ru
 
 ### Tasks
 
-A task is a named unit of work. UE-MCP ships with **<!-- count:actions -->678+<!-- /count --> built-in tasks** across <!-- count:tools -->23<!-- /count --> categories - every action available through the MCP tools is also a flow task.
+A task is a named unit of work. UE-MCP ships with **<!-- count:actions -->736+<!-- /count --> built-in tasks** across <!-- count:tools -->24<!-- /count --> categories - every action available through the MCP tools is also a flow task.
 
 Tasks are defined in the `tasks:` section of your config:
 
@@ -57,7 +57,7 @@ The fields:
 | `group` | No | Category for organization |
 | `options` | No | Default options passed to the task (can be overridden per-step) |
 
-You rarely need to define tasks yourself - the built-in defaults cover all <!-- count:actions -->678+<!-- /count --> actions. You define tasks when you want to **override** or **add** custom ones.
+You rarely need to define tasks yourself - the built-in defaults cover all <!-- count:actions -->736+<!-- /count --> actions. You define tasks when you want to **override** or **add** custom ones.
 
 ### Flows
 
@@ -377,6 +377,20 @@ flow(action="plan", flowName="<name>")
 flow(action="run", flowName="<name>")
 ```
 
+### Niagara Fire
+
+Builds a fire Niagara system from scratch and verifies it emits - a 0-to-1, best-practice starting point rather than a demo. Creates an emitter and system, tunes continuous spawn rate, upward velocity, and an HDR orange colour, then runs the `niagara(action="validate")` verify gate as the final step so the run tells you whether the system actually emits (catching the empty-shell failure).
+
+```
+flow(action="run", flowName="niagara_fire")
+```
+
+Lands at `/Game/VFX/Fire/NS_Fire`. Override the name or location with runtime params:
+
+```
+flow(action="run", flowName="niagara_fire", params={ "name": "NS_Torch", "packagePath": "/Game/VFX/Torches" })
+```
+
 ### Beacon
 
 A 56-step demo that builds a complete shrine scene from scratch — geometry, materials, lighting, atmosphere, and camera.
@@ -617,7 +631,7 @@ Configuration is loaded with [`@db-lyon/flowkit`'s config loader](https://github
 
 | Layer | File | Purpose |
 |-------|------|---------|
-| 1 (base) | Built-in defaults | All <!-- count:actions -->678+<!-- /count --> tasks, no flows |
+| 1 (base) | Built-in defaults | All <!-- count:actions -->736+<!-- /count --> tasks, no flows |
 | 2 | `ue-mcp.yml` | Your project config |
 | 3 | `ue-mcp.{env}.yml` | Environment overlay (set `UE_MCP_ENV`) |
 | 4 | `ue-mcp.local.yml` | Local-only overrides (gitignore this) |
