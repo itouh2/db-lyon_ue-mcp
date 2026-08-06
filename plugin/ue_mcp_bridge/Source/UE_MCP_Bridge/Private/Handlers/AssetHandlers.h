@@ -23,6 +23,12 @@ private:
 	static TSharedPtr<FJsonValue> DeleteAssetBatch(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> BulkRename(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateDataAsset(const TSharedPtr<FJsonObject>& Params);
+	// Bounded batch create-or-update of UDataAsset instances. Lives in
+	// AssetHandlers_BulkUpsert.cpp.
+	static TSharedPtr<FJsonValue> BulkUpsertDataAssets(const TSharedPtr<FJsonObject>& Params);
+	// Inverse of BulkUpsertDataAssets, driven by the rollback descriptor that
+	// call emits. Not a first-class action.
+	static TSharedPtr<FJsonValue> BulkRestoreDataAssets(const TSharedPtr<FJsonObject>& Params);
 	// #726: create an asset of any concrete UObject class via its registered
 	// factory (or NewObject fallback), not just UDataAsset subclasses.
 	static TSharedPtr<FJsonValue> CreateAssetByClass(const TSharedPtr<FJsonObject>& Params);
@@ -64,6 +70,9 @@ private:
 
 	// Mesh material handlers
 	static TSharedPtr<FJsonValue> SetMeshMaterial(const TSharedPtr<FJsonObject>& Params);
+	// #822: batch counterpart to SetMeshMaterial. Slots are addressable by name
+	// as well as index, for static and skeletal meshes alike.
+	static TSharedPtr<FJsonValue> SetMeshMaterialsBatch(const TSharedPtr<FJsonObject>& Params);
 
 	// Mesh pivot handlers
 	static TSharedPtr<FJsonValue> RecenterPivot(const TSharedPtr<FJsonObject>& Params);
@@ -77,6 +86,8 @@ private:
 	static TSharedPtr<FJsonValue> CompareTextures(const TSharedPtr<FJsonObject>& Params);
 	// #430: one-call batch of texture imports - loops AssetImportTasks inside the editor.
 	static TSharedPtr<FJsonValue> ImportTextureBatch(const TSharedPtr<FJsonObject>& Params);
+	// Create and persist a TextureRenderTarget2D with explicit render settings.
+	static TSharedPtr<FJsonValue> CreateRenderTarget2D(const TSharedPtr<FJsonObject>& Params);
 
 	// StringTable handlers
 	static TSharedPtr<FJsonValue> CreateStringTable(const TSharedPtr<FJsonObject>& Params);
@@ -102,6 +113,12 @@ private:
 	// #420: nested-path UPROPERTY setter for any asset (materials, datatables,
 	// data assets, etc.) so callers don't read-modify-write struct copies.
 	static TSharedPtr<FJsonValue> SetAssetProperty(const TSharedPtr<FJsonObject>& Params);
+	// Append prevalidated JSON values to a reflected TArray without replacing
+	// existing entries. Supports native and user-defined struct elements.
+	static TSharedPtr<FJsonValue> AppendAssetArrayElements(const TSharedPtr<FJsonObject>& Params);
+	// Batch counterpart to SetAssetProperty. Preflights every asset/property
+	// before mutating any package and emits a replayable rollback payload.
+	static TSharedPtr<FJsonValue> BulkSetAssetProperties(const TSharedPtr<FJsonObject>& Params);
 	// #421: batch texture settings by canonical type (Normal/Grayscale/BaseColor/HDR).
 	static TSharedPtr<FJsonValue> SetTextureSettingsByType(const TSharedPtr<FJsonObject>& Params);
 	// #421: one-call factory for an Interchange pipeline asset with the
@@ -109,24 +126,24 @@ private:
 	static TSharedPtr<FJsonValue> CreateInterchangePipeline(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReloadPackage(const TSharedPtr<FJsonObject>& Params);
 
-	// v0.7.8 — FTS5-backed asset search (stubs)
+	// v0.7.8 - FTS5-backed asset search (stubs)
 	static TSharedPtr<FJsonValue> SearchAssetsFTS(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReindexAssetsFTS(const TSharedPtr<FJsonObject>& Params);
 
-	// v0.7.19 issue #150 — AssetRegistry referencers for a set of packages
+	// v0.7.19 issue #150 - AssetRegistry referencers for a set of packages
 	static TSharedPtr<FJsonValue> GetReferencers(const TSharedPtr<FJsonObject>& Params);
 
-	// issue #588 — AssetRegistry forward dependencies for a set of packages
+	// issue #588 - AssetRegistry forward dependencies for a set of packages
 	static TSharedPtr<FJsonValue> GetDependencies(const TSharedPtr<FJsonObject>& Params);
 
-	// issue #579 — AssetManager primary-asset-id enumeration / verification
+	// issue #579 - AssetManager primary-asset-id enumeration / verification
 	static TSharedPtr<FJsonValue> GetPrimaryAssetIds(const TSharedPtr<FJsonObject>& Params);
 
-	// v1.0.0-rc.2 — #155 (asset gaps)
+	// v1.0.0-rc.2 - #155 (asset gaps)
 	static TSharedPtr<FJsonValue> SetSkeletalMeshMaterialSlots(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DiagnoseRegistry(const TSharedPtr<FJsonObject>& Params);
 
-	// v1.0.0-rc.3 — #177, #192, #193
+	// v1.0.0-rc.3 - #177, #192, #193
 	static TSharedPtr<FJsonValue> GetMeshBounds(const TSharedPtr<FJsonObject>& Params);
 	// #431: one-call mesh QA - bounds + materials + LOD/vertex/skeleton.
 	static TSharedPtr<FJsonValue> GetMeshInfo(const TSharedPtr<FJsonObject>& Params);
@@ -139,6 +156,7 @@ private:
 	static TSharedPtr<FJsonValue> CreateFolder(const TSharedPtr<FJsonObject>& Params);
 	// Delete content browser folder(s) - empty by default; force=true also removes contained assets.
 	static TSharedPtr<FJsonValue> DeleteFolder(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> MigrateAssets(const TSharedPtr<FJsonObject>& Params);
 	// #270: read AssetImportData source filenames from imported assets
 	static TSharedPtr<FJsonValue> ReadImportSources(const TSharedPtr<FJsonObject>& Params);
 

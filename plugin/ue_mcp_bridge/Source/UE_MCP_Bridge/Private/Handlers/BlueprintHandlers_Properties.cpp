@@ -8,6 +8,8 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerJsonProperty.h"
+#include "HandlerPropertyText.h"
+#include "JsonSerializer.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "BlueprintEditorLibrary.h"
@@ -76,7 +78,15 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetVariableProperties(const TSharedPt
 	}
 
 	// Capture previous values for rollback
-	const bool bPrevInstanceEditable = (FoundVar->PropertyFlags & CPF_Edit) != 0;
+	// Must match list_variables' definition (#744): CPF_Edit alone is also set
+	// by EditDefaultsOnly, so the distinguishing flag is CPF_DisableEditOnInstance.
+	// MD_Private is a Blueprint-GRAPH access flag - it hides the variable from
+	// other Blueprints' graphs, not from a placed instance's details panel - so
+	// it is deliberately NOT folded in here. Doing so made the no-op check
+	// report "already not instance editable" for a variable that still was.
+	const bool bPrevInstanceEditable =
+		(FoundVar->PropertyFlags & CPF_Edit) != 0 &&
+		(FoundVar->PropertyFlags & CPF_DisableEditOnInstance) == 0;
 	FString PrevCategory;
 	if (FoundVar->HasMetaData(FBlueprintMetadata::MD_FunctionCategory))
 	{
@@ -88,10 +98,92 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetVariableProperties(const TSharedPt
 		PrevTooltip = FoundVar->GetMetaData(FBlueprintMetadata::MD_Tooltip);
 	}
 
-	// Set expose on spawn
+	// Read every request and capture every previous value FIRST. Nothing below
+	// this point writes until the no-op check has run.
 	bool bExposeOnSpawn = false;
 	const bool bHasExposeOnSpawn = Params->TryGetBoolField(TEXT("exposeOnSpawn"), bExposeOnSpawn);
-	const bool bPrevExposeOnSpawn = FoundVar->HasMetaData(FBlueprintMetadata::MD_ExposeOnSpawn);
+	// Compare the effective state, not merely the presence of the metadata key:
+	// the key can exist with value "false", or exist while CPF_ExposeOnSpawn is
+	// clear, and treating that as "already true" hid a real change.
+	const bool bPrevExposeOnSpawn =
+		(FoundVar->PropertyFlags & CPF_ExposeOnSpawn) != 0 ||
+		(FoundVar->HasMetaData(FBlueprintMetadata::MD_ExposeOnSpawn) &&
+		 FoundVar->GetMetaData(FBlueprintMetadata::MD_ExposeOnSpawn).ToBool());
+
+	bool bInstanceEditable = false;
+	const bool bHasInstanceEditable = Params->TryGetBoolField(TEXT("instanceEditable"), bInstanceEditable);
+	const bool bWasEditableAtAll = (FoundVar->PropertyFlags & CPF_Edit) != 0;
+	// Read the VALUE, not just presence - the engine's own readers use it, so a
+	// key present with "false" is NOT private. GetMetaData asserts outright
+	// when the key is absent (FBPVariableDescription::GetMetaData ->
+	// check(EntryIndex != INDEX_NONE)), so it must stay behind HasMetaData.
+	const bool bWasPrivate =
+		FoundVar->HasMetaData(FBlueprintMetadata::MD_Private) &&
+		FoundVar->GetMetaData(FBlueprintMetadata::MD_Private).ToBool();
+
+	// `instanceEditable` is a boolean over a three-state setting, so it cannot
+	// express (and therefore cannot restore) every state a variable can be in:
+	// a variable that was EditAnywhere AND private, or one that was not exposed
+	// at all, both round-trip wrong. `editFlag` mirrors exactly what
+	// list_variables reports, which makes read -> write -> read closed, and
+	// makes the rollback below able to name the state it is restoring.
+	const FString PrevEditFlag =
+		!bWasEditableAtAll                                            ? TEXT("none") :
+		(FoundVar->PropertyFlags & CPF_DisableEditOnInstance) != 0    ? TEXT("EditDefaultsOnly") :
+		(FoundVar->PropertyFlags & CPF_DisableEditOnTemplate) != 0    ? TEXT("EditInstanceOnly") :
+		                                                                TEXT("EditAnywhere");
+	// MD_Private is orthogonal to the edit flags - the Blueprint editor's
+	// "Private" checkbox does not clear EditAnywhere - so it is its own param
+	// rather than a fifth enum value. Folding it in would lose a bit, which is
+	// exactly what made the old rollback unable to restore the original state.
+	bool bPrivate = false;
+	const bool bHasPrivate = Params->TryGetBoolField(TEXT("private"), bPrivate);
+	FString EditFlag = OptionalString(Params, TEXT("editFlag"));
+	if (!EditFlag.IsEmpty())
+	{
+		const FString L = EditFlag.ToLower();
+		if      (L == TEXT("editanywhere"))      EditFlag = TEXT("EditAnywhere");
+		else if (L == TEXT("editdefaultsonly"))  EditFlag = TEXT("EditDefaultsOnly");
+		else if (L == TEXT("editinstanceonly"))  EditFlag = TEXT("EditInstanceOnly");
+		else if (L == TEXT("none"))              EditFlag = TEXT("none");
+		else
+		{
+			return MCPError(FString::Printf(
+				TEXT("Unknown editFlag '%s'. Expected EditAnywhere, EditDefaultsOnly, EditInstanceOnly or none (the values list_variables reports)."),
+				*EditFlag));
+		}
+	}
+	const bool bHasEditFlag = !EditFlag.IsEmpty();
+	if (bHasEditFlag && bHasInstanceEditable)
+	{
+		return MCPError(TEXT("Pass editFlag or instanceEditable, not both - instanceEditable is the two-state shorthand for editFlag."));
+	}
+
+	FString CategoryStr;
+	const bool bHasCategory = Params->TryGetStringField(TEXT("category"), CategoryStr);
+	FString TooltipStr;
+	const bool bHasTooltip = Params->TryGetStringField(TEXT("tooltip"), TooltipStr);
+
+	// Detect no-op BEFORE writing anything. Previously every branch above had
+	// already mutated PropertyFlags by the time this ran, so a "nothing
+	// changed" return still left the in-memory Blueprint altered and never
+	// compiled or saved - divergence from disk with no record of it.
+	const bool bAnyChanged =
+		(bHasExposeOnSpawn && bExposeOnSpawn != bPrevExposeOnSpawn) ||
+		(bHasInstanceEditable && bInstanceEditable != bPrevInstanceEditable) ||
+		(bHasEditFlag && EditFlag != PrevEditFlag) ||
+		(bHasPrivate && bPrivate != bWasPrivate) ||
+		(bHasCategory && CategoryStr != PrevCategory) ||
+		(bHasTooltip && TooltipStr != PrevTooltip);
+	if (!bAnyChanged)
+	{
+		auto Noop = MCPSuccess();
+		MCPSetExisted(Noop);
+		Noop->SetStringField(TEXT("path"), AssetPath);
+		Noop->SetStringField(TEXT("name"), VarName);
+		return MCPResult(Noop);
+	}
+
 	if (bHasExposeOnSpawn)
 	{
 		if (bExposeOnSpawn)
@@ -105,52 +197,66 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetVariableProperties(const TSharedPt
 			FoundVar->PropertyFlags &= ~CPF_ExposeOnSpawn;
 		}
 	}
-
-	// Set instance editable
-	bool bInstanceEditable = false;
-	const bool bHasInstanceEditable = Params->TryGetBoolField(TEXT("instanceEditable"), bInstanceEditable);
-	if (bHasInstanceEditable)
-	{
-		if (bInstanceEditable)
-		{
-			FoundVar->PropertyFlags |= CPF_Edit;
-			FoundVar->RemoveMetaData(FBlueprintMetadata::MD_Private);
-		}
-		else
-		{
-			FoundVar->PropertyFlags &= ~CPF_Edit;
-		}
-	}
-
-	// Set category
-	FString CategoryStr;
-	const bool bHasCategory = Params->TryGetStringField(TEXT("category"), CategoryStr);
 	if (bHasCategory)
 	{
 		FoundVar->SetMetaData(FBlueprintMetadata::MD_FunctionCategory, *CategoryStr);
 	}
-
-	// Set tooltip
-	FString TooltipStr;
-	const bool bHasTooltip = Params->TryGetStringField(TEXT("tooltip"), TooltipStr);
 	if (bHasTooltip)
 	{
 		FoundVar->SetMetaData(FBlueprintMetadata::MD_Tooltip, *TooltipStr);
 	}
-
-	// Detect no-op: nothing requested OR every requested field already matches
-	const bool bAnyChanged =
-		(bHasExposeOnSpawn && bExposeOnSpawn != bPrevExposeOnSpawn) ||
-		(bHasInstanceEditable && bInstanceEditable != bPrevInstanceEditable) ||
-		(bHasCategory && CategoryStr != PrevCategory) ||
-		(bHasTooltip && TooltipStr != PrevTooltip);
-	if (!bAnyChanged)
+	if (bHasEditFlag)
 	{
-		auto Noop = MCPSuccess();
-		MCPSetExisted(Noop);
-		Noop->SetStringField(TEXT("path"), AssetPath);
-		Noop->SetStringField(TEXT("name"), VarName);
-		return MCPResult(Noop);
+		// Write the flag trio directly. Every state is reachable from every
+		// other, which is what makes the rollback exact. MD_Private is left
+		// alone - it is the `private` param's business, not this one's.
+		FoundVar->PropertyFlags &= ~(CPF_Edit | CPF_DisableEditOnInstance | CPF_DisableEditOnTemplate);
+		if (EditFlag == TEXT("EditAnywhere"))
+		{
+			FoundVar->PropertyFlags |= CPF_Edit;
+		}
+		else if (EditFlag == TEXT("EditDefaultsOnly"))
+		{
+			FoundVar->PropertyFlags |= CPF_Edit | CPF_DisableEditOnInstance;
+		}
+		else if (EditFlag == TEXT("EditInstanceOnly"))
+		{
+			FoundVar->PropertyFlags |= CPF_Edit | CPF_DisableEditOnTemplate;
+		}
+		// "none" leaves every edit flag clear: the variable is not exposed on
+		// the details panel at all.
+	}
+	// instanceEditable runs BEFORE private, and no longer touches MD_Private at
+	// all: it used to clear it as a side effect, so (instanceEditable=true,
+	// private=true) wrote private and then silently undid it in the next block.
+	// The two settings are orthogonal and are now applied as such.
+	if (bHasInstanceEditable)
+	{
+		if (bInstanceEditable)
+		{
+			// Clear BOTH disable flags. OR-ing DisableEditOnInstance on top of
+			// an existing DisableEditOnTemplate produced a variable hidden from
+			// the class-defaults AND the instance panel, which no editFlag
+			// value can describe and which list_variables mis-reported as
+			// EditDefaultsOnly.
+			FoundVar->PropertyFlags |= CPF_Edit;
+			FoundVar->PropertyFlags &= ~(CPF_DisableEditOnInstance | CPF_DisableEditOnTemplate);
+		}
+		else if (bWasEditableAtAll)
+		{
+			// "Not instance editable" on an editable variable means
+			// EditDefaultsOnly. Only do this when it was already editable -
+			// otherwise a non-editable variable would be silently PROMOTED into
+			// the class-defaults panel, and the rollback would re-apply the
+			// promotion rather than undo it.
+			FoundVar->PropertyFlags &= ~CPF_DisableEditOnTemplate;
+			FoundVar->PropertyFlags |= CPF_DisableEditOnInstance;
+		}
+	}
+	if (bHasPrivate)
+	{
+		if (bPrivate) FoundVar->SetMetaData(FBlueprintMetadata::MD_Private, TEXT("true"));
+		else          FoundVar->RemoveMetaData(FBlueprintMetadata::MD_Private);
 	}
 
 	// Compile and save
@@ -167,7 +273,18 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetVariableProperties(const TSharedPt
 	Payload->SetStringField(TEXT("path"), AssetPath);
 	Payload->SetStringField(TEXT("name"), VarName);
 	if (bHasExposeOnSpawn) Payload->SetBoolField(TEXT("exposeOnSpawn"), bPrevExposeOnSpawn);
-	if (bHasInstanceEditable) Payload->SetBoolField(TEXT("instanceEditable"), bPrevInstanceEditable);
+	// Always restore the edit state via editFlag, never via instanceEditable:
+	// the boolean cannot express "was not exposed at all", so replaying it left
+	// the variable promoted into the class-defaults panel. private is restored
+	// independently because the two are orthogonal.
+	if (bHasInstanceEditable || bHasEditFlag)
+	{
+		Payload->SetStringField(TEXT("editFlag"), PrevEditFlag);
+	}
+	if (bHasPrivate)
+	{
+		Payload->SetBoolField(TEXT("private"), bWasPrivate);
+	}
 	if (bHasCategory) Payload->SetStringField(TEXT("category"), PrevCategory);
 	if (bHasTooltip) Payload->SetStringField(TEXT("tooltip"), PrevTooltip);
 	MCPSetRollback(Result, TEXT("set_variable_properties"), Payload);
@@ -186,7 +303,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetComponentProperty(const TSharedPtr
 	FString PropertyName;
 	if (auto Err = RequireString(Params, TEXT("propertyName"), PropertyName)) return Err;
 
-	// #152: accept any JSON value type — scalars, numbers, booleans, or structured
+	// #152: accept any JSON value type - scalars, numbers, booleans, or structured
 	// objects like {x,y,z} for FVector. Previous impl only accepted strings, so
 	// RelativeLocation etc. couldn't be set without pre-formatting "(X=1,Y=2,Z=3)".
 	TSharedPtr<FJsonValue> ValueField = Params->TryGetField(TEXT("value"));
@@ -313,6 +430,16 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetComponentProperty(const TSharedPtr
 	FString PrevValue;
 	FinalProp->ExportText_Direct(PrevValue, ValuePtr, ValuePtr, nullptr, PPF_None);
 
+	// #820: export text cannot carry a struct-keyed TMap back, so a rollback
+	// built from it would replay as an empty map. Keep the structured value for
+	// map-bearing properties and roll back with that instead.
+	const bool bMapBearing = MCPPropertyText::ContainsMap(FinalProp);
+	TSharedPtr<FJsonValue> PrevStructured;
+	if (bMapBearing)
+	{
+		PrevStructured = FMCPJsonSerializer::SerializeValue(ValuePtr, FinalProp);
+	}
+
 	Template->Modify();
 	FString SetErr;
 	if (!MCPJsonProperty::SetJsonOnProperty(FinalProp, ValuePtr, ValueField, SetErr))
@@ -347,13 +474,28 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetComponentProperty(const TSharedPtr
 	Result->SetStringField(TEXT("propertyName"), PropertyName);
 	Result->SetStringField(TEXT("value"), NewValue);
 	Result->SetBoolField(TEXT("inherited"), bIsInherited);
+	if (bMapBearing)
+	{
+		// #820: `value` is export text and cannot show a struct-keyed map
+		// faithfully. Report what landed, and the structured form the setter
+		// reads back.
+		Result->SetNumberField(TEXT("mapPairCount"), MCPPropertyText::CountMapPairs(FinalProp, ValuePtr));
+		Result->SetField(TEXT("valueJson"), FMCPJsonSerializer::SerializeValue(ValuePtr, FinalProp));
+	}
 
 	// Rollback: self-inverse with previous value
 	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("path"), AssetPath);
 	Payload->SetStringField(TEXT("componentName"), ComponentName);
 	Payload->SetStringField(TEXT("propertyName"), PropertyName);
-	Payload->SetStringField(TEXT("value"), PrevValue);
+	if (PrevStructured.IsValid())
+	{
+		Payload->SetField(TEXT("value"), PrevStructured);
+	}
+	else
+	{
+		Payload->SetStringField(TEXT("value"), PrevValue);
+	}
 	MCPSetRollback(Result, TEXT("set_component_property"), Payload);
 
 	return MCPResult(Result);
@@ -814,7 +956,7 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetVariableDefault(const TSharedPtr<F
 }
 
 // ===========================================================================
-// v0.7.11 — Blueprint authoring depth
+// v0.7.11 - Blueprint authoring depth
 // ===========================================================================
 
 
@@ -916,14 +1058,14 @@ TSharedPtr<FJsonValue> FBlueprintHandlers::SetActorTickSettings(const TSharedPtr
 	return MCPResult(Result);
 }
 
-// ─── #128 get_component_property — inherited-aware single-prop read ──
+// ─── #128 get_component_property - inherited-aware single-prop read ──
 // Params: assetPath, componentName, propertyName
 // Returns the effective default for the given child BP: the ICH override
 // if one exists, otherwise the parent template value. Supports dotted
 // property paths ("RelativeLocation.X").
 
 
-// ─── #128 get_component_property — inherited-aware single-prop read ──
+// ─── #128 get_component_property - inherited-aware single-prop read ──
 // Params: assetPath, componentName, propertyName
 // Returns the effective default for the given child BP: the ICH override
 // if one exists, otherwise the parent template value. Supports dotted

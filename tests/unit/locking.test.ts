@@ -27,6 +27,17 @@ describe("classifyAction", () => {
     expect(classifyAction("asset.bulk_rename", { renames: [{ sourcePath: "/Game/A" }, { assetPath: "/Game/C" }] }).paths.sort()).toEqual(["/Game/A", "/Game/C"]);
   });
 
+  it("extracts asset paths from bulk property descriptors", () => {
+    const c = classifyAction("asset.bulk_set_properties", {
+      items: [
+        { assetPath: "/Game/A", properties: { Enabled: true } },
+        { assetPath: "/Game/B", properties: { "Config.Weight": 2 } },
+      ],
+    });
+    expect(c.mutates).toBe(true);
+    expect(c.paths.sort()).toEqual(["/Game/A", "/Game/B"]);
+  });
+
   it("does not treat a filesystem source (filePath) as an asset path", () => {
     // import uses filePath (disk) + packagePath; we only lock things that look
     // like content paths pulled from known asset-path keys.
@@ -48,6 +59,8 @@ function fakeBridge(calls: Array<[string, Record<string, unknown>]>, responder: 
   return {
     isConnected: true,
     connect: async () => {},
+    retargetProject: () => ({ projectPath: null, port: 0, portSource: "default" as const, verified: true }),
+    getTarget: () => ({ projectPath: null, port: 0, portSource: "default" as const, verified: true }),
     call: async (method: string, params?: Record<string, unknown>) => {
       calls.push([method, params ?? {}]);
       return responder(method, params ?? {});

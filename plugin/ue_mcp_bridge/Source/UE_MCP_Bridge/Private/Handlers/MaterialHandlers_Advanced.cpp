@@ -49,96 +49,8 @@
 #include "TextureResource.h"
 
 
-TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterialFromTexture(const TSharedPtr<FJsonObject>& Params)
-{
-	FString TexturePath;
-	if (auto Err = RequireString(Params, TEXT("texturePath"), TexturePath)) return Err;
-
-	FString MaterialName = OptionalString(Params, TEXT("materialName"));
-	if (MaterialName.IsEmpty())
-	{
-		FString TextureName = FPaths::GetBaseFilename(TexturePath);
-		MaterialName = TEXT("M_") + TextureName;
-	}
-
-	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/Materials"));
-	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
-	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
-
-	if (auto Existing = MCPCheckAssetExists(PackagePath, MaterialName, OnConflict, TEXT("Material")))
-	{
-		return Existing;
-	}
-
-	// Load the texture
-	UTexture* Texture = Cast<UTexture>(StaticLoadObject(UTexture::StaticClass(), nullptr, *TexturePath));
-	if (!Texture)
-	{
-		Texture = Cast<UTexture>(StaticLoadObject(UTexture::StaticClass(), nullptr,
-			*(TEXT("Texture2D'") + TexturePath + TEXT("'"))));
-	}
-	if (!Texture)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load texture at '%s'"), *TexturePath));
-	}
-
-	UE_LOG(LogMCPBridge, Log, TEXT("[UE-MCP] CreateMaterialFromTexture: texture=%s materialName=%s packagePath=%s"), *TexturePath, *MaterialName, *PackagePath);
-
-	// Create the material
-	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
-	IAssetTools& AssetTools = AssetToolsModule.Get();
-
-	UMaterialFactoryNew* MaterialFactory = NewObject<UMaterialFactoryNew>();
-	UObject* NewAsset = AssetTools.CreateAsset(MaterialName, PackagePath, UMaterial::StaticClass(), MaterialFactory);
-
-	if (!NewAsset)
-	{
-		return MCPError(TEXT("Failed to create material asset"));
-	}
-
-	UMaterial* NewMaterial = Cast<UMaterial>(NewAsset);
-	if (!NewMaterial)
-	{
-		return MCPError(TEXT("Created asset is not a material"));
-	}
-
-	NewMaterial->PreEditChange(nullptr);
-
-	// Create a TextureSample expression
-	UMaterialExpressionTextureSample* TextureSampleExpr = NewObject<UMaterialExpressionTextureSample>(NewMaterial);
-	TextureSampleExpr->Texture = Texture;
-	TextureSampleExpr->MaterialExpressionEditorX = -300;
-	TextureSampleExpr->MaterialExpressionEditorY = 0;
-
-	// Add expression to material
-	NewMaterial->GetExpressionCollection().AddExpression(TextureSampleExpr);
-
-	// Connect the RGB output (index 0) to the BaseColor input
-	if (UMaterialEditorOnlyData* EOD = NewMaterial->GetEditorOnlyData())
-	{
-		EOD->BaseColor.Connect(0, TextureSampleExpr);
-	}
-
-	NewMaterial->PostEditChange();
-
-	// Save the package
-	SaveAssetPackage(NewMaterial);
-
-	auto Result = MCPSuccess();
-	MCPSetCreated(Result);
-	Result->SetStringField(TEXT("materialPath"), NewMaterial->GetPathName());
-	Result->SetStringField(TEXT("materialName"), MaterialName);
-	Result->SetStringField(TEXT("texturePath"), Texture->GetPathName());
-	Result->SetStringField(TEXT("packagePath"), PackagePath);
-	Result->SetNumberField(TEXT("expressionCount"), NewMaterial->GetExpressions().Num());
-	MCPSetDeleteAssetRollback(Result, NewMaterial->GetPathName());
-
-	return MCPResult(Result);
-}
-
-
 // ===========================================================================
-// v0.7.9 — Material depth
+// v0.7.9 - Material depth
 // ===========================================================================
 
 TSharedPtr<FJsonValue> FMaterialHandlers::DuplicateMaterial(const TSharedPtr<FJsonObject>& Params)
@@ -298,7 +210,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::GetMaterialShaderStats(const TSharedPt
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 
-	// Texture sampler usage — count texture-sample expressions directly.
+	// Texture sampler usage - count texture-sample expressions directly.
 	int32 NumTextures = 0;
 	for (UMaterialExpression* Expr : Material->GetExpressions())
 	{
@@ -342,7 +254,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::ExportMaterialGraph(const TSharedPtr<F
 		Node->SetNumberField(TEXT("posX"), Expr->MaterialExpressionEditorX);
 		Node->SetNumberField(TEXT("posY"), Expr->MaterialExpressionEditorY);
 
-		// Scalar / vector constants — capture literal
+		// Scalar / vector constants - capture literal
 		if (UMaterialExpressionConstant* C = Cast<UMaterialExpressionConstant>(Expr))
 		{
 			Node->SetNumberField(TEXT("value"), C->R);
@@ -398,7 +310,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::ExportMaterialGraph(const TSharedPtr<F
 
 TSharedPtr<FJsonValue> FMaterialHandlers::ImportMaterialGraph(const TSharedPtr<FJsonObject>& Params)
 {
-	// Delegates to BuildMaterialGraph — same JSON spec format.
+	// Delegates to BuildMaterialGraph - same JSON spec format.
 	return BuildMaterialGraph(Params);
 }
 

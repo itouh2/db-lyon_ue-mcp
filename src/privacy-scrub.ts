@@ -21,7 +21,7 @@ import * as os from "node:os";
  *
  * Project/username matches use `\b` word boundaries (case-insensitive) so
  * "david" inside paths or sentences matches but "davidson" does not. Class,
- * component, and actor names are NOT redacted — the user can use the
+ * component, and actor names are NOT redacted - the user can use the
  * "Revise first" path on the approval prompt to request specific further
  * redactions.
  */
@@ -35,6 +35,19 @@ export interface PrivacyScrubContext {
   username?: string;
   /** OS home directory. Defaults to os.homedir(); tests pass an explicit value. */
   homeDir?: string;
+  /**
+   * Roots of the OTHER editors this server drives (#817, plan item 6.4).
+   *
+   * A feedback body is assembled from the submitting session, so in the normal
+   * case none of these appear in it. They are scrubbed anyway because the body
+   * is posted to a public tracker and the cost of being wrong is another
+   * project's absolute path leaving the machine. Redacted to the same tokens
+   * as the submitting project, so a reader cannot tell how many editors the
+   * server drives either.
+   */
+  otherProjectRoots?: string[];
+  /** Names of the other editors this server drives. Same reasoning as above. */
+  otherProjectNames?: string[];
 }
 
 export interface PrivacyScrubResult {
@@ -101,8 +114,16 @@ export function privacyScrub(
   const user = ctx.username ?? os.userInfo().username;
 
   replacePath(ctx.projectRoot, "REDACTED_PROJECT_ROOT", "project-root-path");
+  // Longest first among the other roots too, so a nested project root is not
+  // fragmented by its parent's replacement.
+  for (const root of [...(ctx.otherProjectRoots ?? [])].sort((a, b) => b.length - a.length)) {
+    replacePath(root, "REDACTED_PROJECT_ROOT", "other-project-root-path");
+  }
   replacePath(home,            "REDACTED_HOME",         "home-path");
   replaceWord(ctx.projectName, "REDACTED_PROJECT", "project-name");
+  for (const name of ctx.otherProjectNames ?? []) {
+    replaceWord(name, "REDACTED_PROJECT", "other-project-name");
+  }
   replaceWord(user,            "REDACTED_USER",    "username");
 
   return { text, hits };

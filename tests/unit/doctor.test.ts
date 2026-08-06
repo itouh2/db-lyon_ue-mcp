@@ -114,6 +114,31 @@ describe("parseServerInvocation", () => {
   it("returns null for a non-ue-mcp process", () => {
     expect(parseServerInvocation("node /some/other/server.js project")).toBeNull();
   });
+
+  // #817: a server can be launched with more than one project.
+  it("returns every project positional, quoted or bare", () => {
+    const cmd = 'node C:/x/ue-mcp/dist/index.js "C:/proj/Alpha/Alpha.uproject" C:/proj/Beta/Beta.uproject';
+    const r = parseServerInvocation(cmd);
+    expect(r?.projects).toEqual([
+      "C:/proj/Alpha/Alpha.uproject",
+      "C:/proj/Beta/Beta.uproject",
+    ]);
+    // The single-project field still reads as the first, unchanged.
+    expect(r?.project).toBe("C:/proj/Alpha/Alpha.uproject");
+  });
+
+  it("keeps flags out of the project list", () => {
+    const r = parseServerInvocation("node /x/ue-mcp/dist/index.js /proj/Alpha --verbose /proj/Beta");
+    expect(r?.projects).toEqual(["/proj/Alpha", "/proj/Beta"]);
+  });
+
+  // These three subcommands were absent from NON_SERVER_ARGS, so each parsed
+  // as a running server whose project was the subcommand's own name.
+  it("rejects the context, login and logout subcommands", () => {
+    expect(parseServerInvocation("node /x/ue-mcp/dist/index.js context lean")).toBeNull();
+    expect(parseServerInvocation("node /x/ue-mcp/dist/index.js login")).toBeNull();
+    expect(parseServerInvocation("node /x/ue-mcp/dist/index.js logout")).toBeNull();
+  });
 });
 
 describe("formatDoctor verdict", () => {
@@ -142,6 +167,20 @@ describe("formatDoctor verdict", () => {
     })));
     expect(out).not.toContain("Everything aligned");
     expect(out).toContain("pid 9");
+  });
+
+  it("does not call a prerelease install stale for being ahead of the stable line", () => {
+    // registryLatest is the `latest` dist-tag, which is the stable line. A
+    // tester on a prerelease is ahead of it, not behind it, and must not be
+    // told to update onto an older release.
+    const out = stripAnsi(formatDoctor(baseReport({
+      selfVersion: "1.1.0-beta.2",
+      npmGlobal: { version: "1.1.0-beta.2", dir: "/g/ue-mcp" },
+      effectiveNpx: "1.1.0-beta.2",
+      runningServers: [{ pid: 1, version: "1.1.0-beta.2", script: "x", project: "C:/proj/Vale", servesTarget: true }],
+    })));
+    expect(out).toContain("Everything aligned");
+    expect(out).not.toContain("behind latest");
   });
 
   it("does not let a server for another project produce a false aligned", () => {

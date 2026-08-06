@@ -2,15 +2,177 @@ import { z } from "zod";
 import { categoryTool, bp, type ToolDef } from "../types.js";
 import { Vec3, Rotator } from "../schemas.js";
 import { SESSION_ID } from "../locking.js";
+import { McpError, ErrorCode } from "../errors.js";
+import type { EditorSession } from "../session.js";
+import type { ToolContext } from "../types.js";
+
+/**
+ * Who a lock belongs to: the addressed editor, or this process when there is
+ * no session behind the call (#817).
+ *
+ * The lock registry lives in the bridge, which is per editor, so the owner has
+ * to match whatever `withAssetLocks` used on the dispatch path or an explicit
+ * asset(unlock) would not match the lock asset(lock) took. Both read this.
+ */
+function lockOwner(ctx: ToolContext, params: Record<string, unknown>): string {
+  const explicit = params.sessionId;
+  if (typeof explicit === "string" && explicit.trim() !== "") return explicit;
+  return ctx.session?.lockOwnerId ?? SESSION_ID;
+}
+
+/**
+ * `asset(migrate)`, with a second editor as the destination (#817, plan 6.5).
+ *
+ * Migration is the one action with two editors in it: the call runs in the
+ * editor holding the source assets and its output lands in another project
+ * entirely. Naming that project as a path worked, but left two things to the
+ * caller that the server already knows: which directory it is, and the fact
+ * that the destination editor will not see the new packages until its asset
+ * registry is rescanned. A destination editor answers both.
+ *
+ * The migrate call itself is unchanged and still goes to the source editor's
+ * bridge; `toEditor` never reaches it.
+ */
+async function migrateAssets(
+  ctx: ToolContext,
+  p: Record<string, unknown>,
+): Promise<unknown> {
+  const requested = typeof p.toEditor === "string" ? p.toEditor.trim() : "";
+  const explicitDir = typeof p.destinationContentDir === "string" ? p.destinationContentDir.trim() : "";
+
+  let destination: EditorSession | undefined;
+  let destinationContentDir = explicitDir;
+
+  if (requested) {
+    if (explicitDir) {
+      throw new McpError(
+        ErrorCode.INVALID_PARAMS,
+        "Pass 'toEditor' or 'destinationContentDir', not both: they name the same thing and " +
+          "there is no safe answer when they disagree.",
+      );
+    }
+    if (!ctx.sessions) {
+      throw new McpError(
+        ErrorCode.INVALID_PARAMS,
+        "'toEditor' addresses another editor this server drives, and there is no session registry here. " +
+          "Pass 'destinationContentDir' with the target project's Content folder instead.",
+      );
+    }
+    destination = ctx.sessions.resolve(requested);
+    if (ctx.session && destination === ctx.session) {
+      throw new McpError(
+        ErrorCode.INVALID_PARAMS,
+        `'${destination.name}' is the editor this call runs in, so there is nothing to migrate between. ` +
+          "Address the source editor with 'editor' and the destination with 'toEditor'.",
+      );
+    }
+    const dir = destination.project.contentDir;
+    if (!dir) {
+      throw new McpError(
+        ErrorCode.INVALID_PARAMS,
+        `Editor '${destination.name}' has no project bound, so it has no Content directory to migrate into.`,
+      );
+    }
+    destinationContentDir = dir;
+  }
+
+  const result = (await ctx.bridge.call("migrate", {
+    assetPaths: p.assetPaths,
+    assetPath: p.assetPath,
+    destinationContentDir,
+    includeDependencies: p.includeDependencies,
+    onConflict: p.onConflict,
+    allowDirty: p.allowDirty,
+    dryRun: p.dryRun,
+  })) as Record<string, unknown>;
+
+  if (!destination) return result;
+
+  const out: Record<string, unknown> = {
+    ...(result && typeof result === "object" ? result : { result }),
+    destination: {
+      editor: destination.name,
+      project: destination.project.projectPath,
+      contentDir: destinationContentDir,
+    },
+  };
+  out.rescan = p.dryRun === true
+    ? { attempted: false, reason: "dryRun copied nothing, so there is nothing to rescan." }
+    : await rescanDestination(destination, contentPathsOf(p));
+  return out;
+}
+
+/** The content directories a migrate landed in, derived from what it was asked to move. */
+function contentPathsOf(p: Record<string, unknown>): string[] {
+  const raw = [
+    ...(Array.isArray(p.assetPaths) ? p.assetPaths : []),
+    ...(typeof p.assetPath === "string" ? [p.assetPath] : []),
+  ].filter((v): v is string => typeof v === "string" && v.startsWith("/"));
+
+  const dirs = new Set<string>();
+  for (const assetPath of raw) {
+    const withoutObject = assetPath.split(".")[0];
+    const slash = withoutObject.lastIndexOf("/");
+    dirs.add(slash > 0 ? withoutObject.slice(0, slash) : withoutObject);
+  }
+  // Nothing recognisable to narrow by: rescan the whole game root rather than
+  // leave the destination editor blind to what just landed in it.
+  if (dirs.size === 0) return ["/Game"];
+  return [...dirs].slice(0, 32);
+}
+
+/**
+ * Make the migrated packages visible in the destination editor.
+ *
+ * Unreal does not notice files that appeared under Content while it was
+ * running, so without this the assets are on disk and absent from every
+ * registry query until someone restarts or rescans by hand. `diagnose_registry`
+ * with `reconcile` is a forced synchronous scan of one path, which is exactly
+ * the operation needed and already exists on the bridge.
+ *
+ * Best-effort by design: the migration itself has already succeeded, so a
+ * destination editor that is closed or on an older plugin is reported, not
+ * turned into a failure of a copy that worked.
+ */
+async function rescanDestination(
+  destination: EditorSession,
+  contentPaths: string[],
+): Promise<Record<string, unknown>> {
+  if (!destination.bridge.isConnected) {
+    return {
+      attempted: false,
+      reason:
+        `Editor '${destination.name}' is not connected, so its asset registry could not be rescanned. ` +
+        "The files are on disk; that editor will see them when it next starts.",
+    };
+  }
+  const scanned: string[] = [];
+  const failed: Array<{ path: string; error: string }> = [];
+  for (const contentPath of contentPaths) {
+    try {
+      await destination.guarded.call("diagnose_registry", {
+        path: contentPath,
+        recursive: true,
+        reconcile: true,
+      });
+      scanned.push(contentPath);
+    } catch (e) {
+      failed.push({ path: contentPath, error: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  return failed.length === 0
+    ? { attempted: true, editor: destination.name, scanned }
+    : { attempted: true, editor: destination.name, scanned, failed };
+}
 
 export const assetTool: ToolDef = categoryTool(
   "asset",
   "Asset management: list, search, read, CRUD, import meshes/textures, datatables, stringtables.",
   {
     list: bp(
-      "List assets via the AssetRegistry (sees /Game and every mounted plugin root). Params: directory? (default /Game), classFilter?, recursive? (default true), maxResults? (default 2000)",
+      "List assets via the AssetRegistry (sees /Game and every mounted plugin root). Paginated: returns totalMatched, offset, hasMore and nextOffset so a large folder can be walked deterministically instead of dropping the bridge on one oversized response (#790). Params: directory? (default /Game), classFilter?, recursive? (default true), maxResults? (default 500, max 5000), offset? (default 0)",
       "list_assets",
-      (p) => ({ directory: p.directory, classFilter: p.classFilter ?? p.typeFilter, recursive: p.recursive, maxResults: p.maxResults }),
+      (p) => ({ directory: p.directory, classFilter: p.classFilter ?? p.typeFilter, recursive: p.recursive, maxResults: p.maxResults, offset: p.offset }),
     ),
     search: {
       description: "Search by name/class/path. Params: query, directory?, maxResults?, searchAll?",
@@ -40,7 +202,7 @@ export const assetTool: ToolDef = categoryTool(
       },
     },
     read:           bp("Read asset via reflection. Params: assetPath", "read_asset", (p) => ({ path: p.assetPath })),
-    read_properties: bp("Read asset properties with values. Blueprint paths resolve to the generated-class CDO (#568). propertyName accepts dotted/indexed paths into nested structs, array elements, and instanced subobjects (e.g. `Config.Traits[1].Params.Field`); landing on an array of subobjects also lists each element's index+class (#527). Params: assetPath, propertyName?, includeValues?, valueFormat?", "read_asset_properties"),
+    read_properties: bp("Read asset properties with values. Blueprint paths resolve to the generated-class CDO (#568). propertyName accepts dotted/indexed paths into nested structs, array elements, and instanced subobjects (e.g. `Config.Traits[1].Params.Field`); landing on an array of subobjects also lists each element's index+class (#527). expandDepth inlines the properties of subobjects OWNED by this asset, so a data asset's nested payload comes back in ONE call instead of a reference you have to chase (#755); references to OTHER assets are marked expandable rather than followed, unless expandExternal=true. Capped by maxExpandedObjects with expansionTruncated reported. Params: assetPath, propertyName?, includeValues?, valueFormat?, expandDepth? (0-5, default 0), expandExternal?, maxExpandedObjects? (default 64)", "read_asset_properties", (p) => ({ assetPath: p.assetPath, propertyName: p.propertyName, includeValues: p.includeValues, valueFormat: p.valueFormat, expandDepth: p.expandDepth, expandExternal: p.expandExternal, maxExpandedObjects: p.maxExpandedObjects })),
     list_properties: bp("List reflected properties on any asset. Params: assetPath, includeValues?, valueFormat? ('text'|'json')", "read_asset_properties", (p) => ({ assetPath: p.assetPath ?? p.path, includeValues: p.includeValues, valueFormat: p.valueFormat })),
     get_properties: bp("Read property values on any asset. propertyName accepts dotted/indexed paths into nested structs, array elements, and instanced subobjects. valueFormat='json' returns structured values. Params: assetPath, propertyName?, includeValues?, valueFormat?", "read_asset_properties", (p) => ({ assetPath: p.assetPath ?? p.path, propertyName: p.propertyName, includeValues: p.includeValues ?? true, valueFormat: p.valueFormat })),
     duplicate:      bp("Duplicate asset. Params: sourcePath, destinationPath", "duplicate_asset"),
@@ -49,11 +211,13 @@ export const assetTool: ToolDef = categoryTool(
     move:           bp("Move asset. Params: sourcePath, destinationPath", "move_asset"),
     delete:         bp("Delete asset. On failure returns reason (open_in_editor / has_referencers / in_memory_referenced / package_read_only / package_dirty / unknown) plus referencers, inMemoryReferencers, packageReadOnly, packageDirty diagnostics (#601). Pass force=true to auto-close any open asset editors before deleting (#278). Params: assetPath, force?", "delete_asset"),
     delete_batch:   bp("Batch-delete assets. Per-path status (deleted/absent/failed) plus reason+referencers on failed entries (#278). Params: assetPaths[], force?", "delete_asset_batch"),
-    create_data_asset: bp("Create UDataAsset instance of custom class. Params: name, className (/Script/Module.ClassName or loaded name), packagePath?, properties? (key/value map)", "create_data_asset"),
-    create_asset_by_class: bp("Create an asset of ANY concrete UObject class (not just UDataAsset) - physical-material subclasses, curves, settings objects. Params: name, className (/Script/Module.ClassName or loaded name), packagePath?, properties? (key/value map), onConflict? (skip|replace|rename). Actors/components and specialized assets (Blueprint/Material) have dedicated actions (#726)", "create_asset_by_class", (p) => ({ name: p.name, className: p.className, packagePath: p.packagePath, properties: p.properties, onConflict: p.onConflict })),
-    save:           bp("Save asset(s). Params: assetPath?", "save_asset"),
-    save_all_dirty: bp("Flush every dirty package to disk in one call. End-of-workflow shortcut after bulk import/edit. Params: saveMapPackages? (default true), saveContentPackages? (default true). Returns savedAll boolean (#429)", "save_all_dirty", (p) => ({ saveMapPackages: p.saveMapPackages, saveContentPackages: p.saveContentPackages })),
+    create_data_asset: bp("Create UDataAsset instance of custom class. className accepts the C++ spelling with or without the A/U/F/E prefix (UMyConfig and MyConfig both resolve), a /Script/Module.ClassName path, or a loaded class name; a failed lookup lists the spellings tried and the closest matches (#823). Params: name, className, packagePath?, properties? (key/value map)", "create_data_asset"),
+    create_asset_by_class: bp("Create an asset of ANY concrete UObject class (not just UDataAsset) - physical-material subclasses, curves, settings objects. className accepts the C++ spelling with or without the A/U/F/E prefix, a /Script/Module.ClassName path, or a loaded class name (#823). Params: name, className, packagePath?, properties? (key/value map), onConflict? (skip|replace|rename). Actors/components and specialized assets (Blueprint/Material) have dedicated actions (#726)", "create_asset_by_class", (p) => ({ name: p.name, className: p.className, packagePath: p.packagePath, properties: p.properties, onConflict: p.onConflict })),
+    bulk_upsert_data_assets: bp("Create or update up to 500 UDataAsset instances in ONE call. Every descriptor is first applied to a transient copy, so a bad class, property path, or value rejects the whole batch before a package is touched; nothing is half-written by a typo. Per-item status is created | updated | unchanged | skipped | failed (dryRun reports wouldCreate | wouldUpdate | wouldRemainUnchanged | wouldSkip), each with its own error when it failed. Replaying the same request returns unchanged, and only changed packages are saved. Emits a rollback descriptor that restores prior values and deletes what it created. Params: items[]: [{name, packagePath, className, properties?}], onConflict? (update (default) | skip | error), dryRun? (default false), save? (default true)", "bulk_upsert_data_assets", (p) => ({ items: p.items, onConflict: p.onConflict, dryRun: p.dryRun, save: p.save })),
+    save:           bp("Save one asset, or every dirty asset under /Game when assetPath is omitted. force=true saves regardless of the dirty flag - several edits (OFPA level actors, some subsystem property writes) never mark their package dirty, so a dirty-only save skipped them and still reported success. Returns the package name plus on-disk file path, size and mtime so the write can be verified rather than trusted (#768). Params: assetPath?, force?", "save_asset", (p) => ({ assetPath: p.assetPath ?? p.path, force: p.force })),
+    save_all_dirty: bp("Flush every dirty package to disk in one call. Reports the packages it attempted, which ones reached disk (with file path, size and mtime) and which are still dirty afterwards, because a bare savedAll boolean has come back true while packages were never written (#768). Params: saveMapPackages? (default true), saveContentPackages? (default true)", "save_all_dirty", (p) => ({ saveMapPackages: p.saveMapPackages, saveContentPackages: p.saveContentPackages })),
     set_mesh_material:    bp("Assign material to static mesh slot. Params: assetPath, materialPath, slotIndex?", "set_mesh_material"),
+    set_mesh_materials_batch: bp("Assign materials across many meshes and slots in one call, so an N mesh x M slot kit costs one round trip instead of N*M. StaticMesh and SkeletalMesh both work. Address a slot by slotName (survives a reimport reordering slot indices) or by slotIndex (default 0); passing both is rejected when they disagree. Every submitted assignment returns its own index/ok/status/error, status being ok|updated|unchanged|invalid|protected|duplicate|not_found|slot_not_found|failed|skipped. Default is all-or-nothing: any preflight rejection aborts before a mesh is touched. Pass continueOnError to apply the assignments that did pass and keep the rejects reported alongside them. Each mesh is written and saved once no matter how many of its slots the batch names, and the rollback payload restores only the writes that landed. Params: assignments ([{assetPath, materialPath, slotName? | slotIndex?}], max 500), save? (default true), dryRun? (default false), continueOnError? (default false) (#822)", "set_mesh_materials_batch", (p) => ({ assignments: p.assignments, save: p.save, dryRun: p.dryRun, continueOnError: p.continueOnError })),
     recenter_pivot:       { description: "Move static mesh pivot to geometry center. Params: assetPath OR assetPaths", bridge: "recenter_pivot", mapParams: (p) => {
       const paths = p.assetPaths as string[] | undefined;
       if (paths && paths.length > 0) return { assetPaths: paths };
@@ -63,6 +227,7 @@ export const assetTool: ToolDef = categoryTool(
     import_skeletal_mesh: bp("Import skeletal mesh from FBX. importUniformScale=100 fixes metre-authored FBX (Blender FBX_SCALE_ALL) that lands 100x too small on a cm skeleton (#687). Returns post-import readback: boxExtent, morphTargets[], numLODs, skeleton (#678). Params: filePath, name?, packagePath?, skeletonPath?, importMaterials?, importTextures?, importUniformScale? (default 1.0), importMorphTargets? (default true), createPhysicsAsset? (default false), replaceExisting? (default true)", "import_skeletal_mesh", (p) => ({ filename: p.filePath, destinationPath: p.packagePath, assetName: p.name, skeletonPath: p.skeletonPath, importMaterials: p.importMaterials, importTextures: p.importTextures, importUniformScale: p.importUniformScale, importMorphTargets: p.importMorphTargets, createPhysicsAsset: p.createPhysicsAsset, replaceExisting: p.replaceExisting })),
     import_animation:     bp("Import anim from FBX. Params: filePath, name?, packagePath?, skeletonPath", "import_animation", (p) => ({ filename: p.filePath, destinationPath: p.packagePath, assetName: p.name, skeletonPath: p.skeletonPath })),
     import_texture:       bp("Import image. sRGB/compressionSettings/lodGroup/neverStream are applied at import time (folded in, no second call needed) (#661). Params: filePath, name?, packagePath?, sRGB?, compressionSettings? (Default|Normalmap|Grayscale|HDR|BC7|...), lodGroup?, neverStream?", "import_texture", (p) => ({ filename: p.filePath, destinationPath: p.packagePath, assetName: p.name, sRGB: p.sRGB, compressionSettings: p.compressionSettings, lodGroup: p.lodGroup, neverStream: p.neverStream })),
+    create_render_target_2d: bp("Create and persist a TextureRenderTarget2D asset. Render format is applied before resource initialization. Params: name, packagePath? (default /Game), width? (1-8192, default 512), height? (1-8192, default 512), format? (R8|RG8|RGBA8|RGBA8_SRGB|R16F|RG16F|RGBA16F|R32F|RG32F|RGBA32F|RGB10A2, default RGBA8_SRGB), clearColor? ({r,g,b,a}, default transparent), generateMips? (default false), targetGamma? (default 0), onConflict? (skip|error)", "create_render_target_2d", (p) => ({ name: p.name, packagePath: p.packagePath, width: p.width, height: p.height, format: p.format, clearColor: p.clearColor, generateMips: p.generateMips, targetGamma: p.targetGamma, onConflict: p.onConflict })),
     read_cloth_data:      bp("Read Chaos cloth data on a skeletal mesh: per clothing asset, its configs (reflected properties), LOD count, and per-LOD point-weight-map summary (name, target, vertex count, min/max - including the MaxDistances mask). Params: skeletalMeshPath (#595)", "read_cloth_data", (p) => ({ skeletalMeshPath: p.skeletalMeshPath })),
     set_cloth_config:     bp("Set properties on a clothing asset's Chaos cloth config via reflection. Params: skeletalMeshPath, properties (object), clothingAsset? (name filter), configType? (config class/key filter) (#595)", "set_cloth_config", (p) => ({ skeletalMeshPath: p.skeletalMeshPath, properties: p.properties, clothingAsset: p.clothingAsset, configType: p.configType })),
     export_texture:       bp("Export a Texture2D to a PNG on disk (for inspection or external diffing). Params: assetPath, outputPath (.png) (#697)", "export_texture", (p) => ({ assetPath: p.assetPath, outputPath: p.outputPath })),
@@ -114,12 +279,14 @@ export const assetTool: ToolDef = categoryTool(
     remove_socket:        bp("Remove socket by name. Params: assetPath, socketName", "remove_socket"),
     list_sockets:         bp("List sockets on a mesh (StaticMesh or SkeletalMesh). SkeletalMesh results include mesh-local sockets plus assigned Skeleton sockets, each with source='mesh' or source='skeleton'. Params: assetPath", "list_asset_sockets", (p) => ({ assetPath: p.assetPath })),
     set_socket_transform: bp("Update an existing socket's relative transform on StaticMesh or SkeletalMesh. Pass any subset of relativeLocation/relativeRotation/relativeScale; omitted fields stay at their current values. Errors if the socket does not exist (use add_socket to create). Common after FBX import when SOCKET_* empties land with scale=(100,100,100) (#412). Params: assetPath, socketName, relativeLocation?, relativeRotation?, relativeScale?", "set_socket_transform"),
-    set_property:         bp("Set a UPROPERTY on any loaded asset (Material, DataAsset, DataTable, SubsurfaceProfile, etc.) using a dotted path. Blueprint paths resolve to the generated-class CDO so you can author its defaults + Instanced sub-object arrays (#568). Walks nested structs, array elements by index, and instanced subobjects internally - no more read-modify-write copies (e.g. `settings.mean_free_path_distance` on a UMaterial, or `Config.Traits[1].Params.Field` on a config asset #527). Value goes through MCPJsonProperty::SetJsonOnProperty so JSON null clears object refs, structs accept {x,y,z}, arrays/maps round-trip. Params: assetPath, propertyName (dotted path), value (#420)", "set_asset_property", (p) => ({ assetPath: p.assetPath ?? p.path, propertyName: p.propertyName, value: p.value })),
+    set_property:         bp("Set a UPROPERTY on any loaded asset (Material, DataAsset, DataTable, SubsurfaceProfile, etc.) using a dotted path. Blueprint paths resolve to the generated-class CDO so you can author its defaults + Instanced sub-object arrays (#568). Walks nested structs, array elements by index, and instanced subobjects internally - no more read-modify-write copies (e.g. `settings.mean_free_path_distance` on a UMaterial, or `Config.Traits[1].Params.Field` on a config asset #527). Value goes through MCPJsonProperty::SetJsonOnProperty so JSON null clears object refs, structs accept {x,y,z}, arrays/maps round-trip. TMap values take { \"Key\": value } or, for struct keys, [{ key: {...}, value: ... }]; a write that cannot store every entry fails and leaves the old value untouched (#820). Params: assetPath, propertyName (dotted path), value (#420)", "set_asset_property", (p) => ({ assetPath: p.assetPath ?? p.path, propertyName: p.propertyName, value: p.value })),
+    append_array_elements: bp("Append one or more JSON values to a reflected TArray without replacing existing entries. Supports dotted property paths plus native and user-defined USTRUCT elements. All elements are validated before mutation; returns appended indices and rollback data, and leaves the package dirty without saving. Params: assetPath, propertyName, elements", "append_asset_array_elements", (p) => ({ assetPath: p.assetPath ?? p.path, propertyName: p.propertyName, elements: p.elements })),
+    bulk_set_properties:  bp("Set dotted UPROPERTY paths on as many as 500 assets in one preflighted batch. Every asset, path, and value is validated before anything is mutated, and every submitted item comes back with its own ok/status/error, so a bad path in item 300 never hides the other 499 verdicts. Default is all-or-nothing: any preflight rejection aborts before a single UObject is touched. Pass continueOnError to apply the items that did pass and keep the rejects reported alongside them. Returns per-property readback, aggregate counts, targeted save results, and a replayable rollback payload covering only the writes that landed. Params: items ([{assetPath, properties}]), save? (default true), dryRun? (default false), continueOnError? (default false)", "bulk_set_asset_properties", (p) => ({ items: p.items, save: p.save, dryRun: p.dryRun, continueOnError: p.continueOnError })),
     set_texture_settings_by_type: bp("Apply the canonical (compressionSettings, sRGB, LOD group) combo to every texture in each group: normal -> Normalmap, grayscale -> Grayscale, baseColor -> Default sRGB, hdr -> HDR. Params: groups (object: {normal?:[paths], grayscale?:[paths], baseColor?:[paths], hdr?:[paths]}) (#421)", "set_texture_settings_by_type", (p) => ({ groups: p.groups })),
     create_interchange_pipeline: bp("One-call factory for a UInterchangeGenericAssetsPipeline asset with the 15-property mesh-import boilerplate already applied (RecomputeNormals=false, MikkTSpace=true, HighPrecisionTangents=true, BuildNanite=false, CreatePhysicsAsset=false, etc.). Params: assetPath OR (name + packagePath?), meshType? (skeletal default | static), options? (dotted-path overrides on the resulting pipeline e.g. {'MeshPipeline.bBuildNanite': true}), onConflict? (#421)", "create_interchange_pipeline", (p) => ({ assetPath: p.assetPath, name: p.name, packagePath: p.packagePath, meshType: p.meshType, options: p.options, onConflict: p.onConflict })),
     reload_package:       bp("Force reload an asset package from disk. Params: assetPath", "reload_package"),
     health_check:         bp("Diagnose stuck-unloadable asset. Returns onDisk/inRegistry/isLoaded/canLoad/isStuck flags so an agent can detect the half-shutdown state where load returns null but the file exists (#279). Params: assetPath", "asset_health_check"),
-    force_reload:         bp("Aggressive reload that resets package loaders + GCs + LoadObject. Recovers from the half-shutdown state without an editor restart (#279). Closes any open editors first. Params: assetPath", "force_reload_asset"),
+    force_reload:         bp("Aggressive reload from disk: closes open editors, reloads the package (rebuilding a Blueprint's class and CDO so container properties come back fresh, not just scalars), and reports objectReplaced. Refuses a dirty package unless discardUnsaved=true, and fails loudly when the editor would not release the old object rather than serving stale values (#279/#820). Params: assetPath, discardUnsaved? (default false)", "force_reload_asset", (p) => ({ assetPath: p.assetPath ?? p.path, discardUnsaved: p.discardUnsaved })),
     export:               bp("Export asset to disk file (Texture2D → PNG, StaticMesh → FBX, etc.). Params: assetPath, outputPath", "export_asset"),
     search_fts:           bp("Ranked asset search (token-scored over name/class/path). Params: query, maxResults?, classFilter?", "search_assets_fts", (p) => ({ query: p.query, maxResults: p.maxResults, classFilter: p.classFilter })),
     reindex_fts:          bp("Rebuild the SQLite FTS5 asset index. Params: directory?", "reindex_assets_fts", (p) => ({ directory: p.directory })),
@@ -127,13 +294,25 @@ export const assetTool: ToolDef = categoryTool(
     get_dependencies:     bp("Forward dependency lookup (what packages this asset references). Params: packages[] OR packagePath, hard? (default true), soft? (default true) (#588). Returns {dependenciesByPackage, totalDependencies}.", "get_asset_dependencies", (p) => ({ packages: p.packages, packagePath: p.packagePath, hard: p.hard, soft: p.soft })),
     list_skeleton_bones:  bp("List bones (names + rest-pose local and component-space transforms) from a SkeletalMesh or Skeleton asset, no live actor needed. Params: assetPath, includeTransforms? (default true) (#593). Returns {bones, boneCount, sourceKind}.", "list_skeleton_bones", (p) => ({ assetPath: p.assetPath, includeTransforms: p.includeTransforms })),
     get_primary_asset_ids: bp("Enumerate AssetManager-registered FPrimaryAssetIds (verify a primary-asset registration). Params: type? (FPrimaryAssetType; omit for all types), maxResults? (default 1000) (#579). Returns {primaryAssetIds:[{primaryAssetId, type, name, assetPath}], count, total}.", "get_primary_asset_ids", (p) => ({ type: p.type, maxResults: p.maxResults })),
-    // v1.0.0-rc.2 — #155 (asset gaps)
+    // v1.0.0-rc.2 - #155 (asset gaps)
     set_sk_material_slots: bp("Set materials on a USkeletalMesh by slot name or slotIndex (bypasses the blueprint override-materials path that UE's ICH silently reverts). Params: assetPath, slots[{slotName?|slotIndex?, materialPath}]", "set_sk_material_slots"),
     diagnose_registry:    bp("Scan a content path and compare disk vs AssetRegistry (including in-memory pending-kill entries). Returns onDiskCount, inMemoryIncludedCount, ghostCount and paths. Params: path, recursive? (default true), reconcile? (forceRescan=true)", "diagnose_registry"),
     get_mesh_bounds:      bp("Get StaticMesh OR SkeletalMesh bounding box. Params: assetPath. Returns min, max, boxExtent, boxCenter, meshKind (#193/#351)", "get_mesh_bounds"),
     get_mesh_info:        bp("One-call mesh QA: bounds + material slots + skeleton + LOD/vertex counts. Works for both UStaticMesh and USkeletalMesh. Params: assetPath. Returns meshKind, boundsOrigin, boundsExtent, heightM, lodCount, vertexCount, skeletonPath (skeletal only), materialSlots:[{index, slotName, materialPath, isDefaultFallback}], materialCount (#431)", "get_mesh_info"),
     read_import_sources:  bp("Read AssetImportData source filenames on an imported asset (StaticMesh, SkeletalMesh, Texture, Animation, etc.). Returns sources[] of {relativeFilename, absolutePath, timestamp, fileHash, displayLabelName}. Params: assetPath (#270)", "read_import_sources", (p) => ({ assetPath: p.assetPath ?? p.path })),
     get_mesh_collision:   bp("Inspect StaticMesh collision setup. Params: assetPath. Returns collisionTraceFlag, hasSimple/ComplexCollision, element counts (#177)", "get_mesh_collision"),
+    migrate: {
+      description:
+        "Copy assets and their dependencies into ANOTHER project's Content directory - the scripted form of the content browser's Migrate (#760). " +
+        "destinationContentDir is the TARGET project's Content folder. " +
+        "While this server drives more than one editor, a 'toEditor' parameter is offered as well: name the destination editor and its Content folder is resolved for you and its asset registry rescanned afterwards, so the assets are visible there without a manual rescan (#817). " +
+        "The call runs in the editor holding the SOURCE assets, so it pushes assets out of the project it is attached to. " +
+        "Unsaved or never-saved assets are refused, because migrate copies files and would otherwise silently omit your edits. " +
+        "Every asset is resolved before anything is copied, and the destination is checked for the packages afterwards rather than reporting success on the call returning. " +
+        "Params: assetPaths (string[]) or assetPath, toEditor OR destinationContentDir, includeDependencies? (default true), onConflict? (skip|overwrite, default skip), allowDirty?, dryRun?",
+      destinationEditor: true,
+      handler: async (ctx, p) => migrateAssets(ctx, p),
+    },
     move_folder:          bp("Move/rename entire content folder with redirector fixup in one transaction. Params: sourcePath, destinationPath (#192)", "move_folder"),
     create_folder:        bp("Create empty content browser folder(s). Params: path OR paths[] (e.g. /Game/Foo, /Game/Bar/Baz). Returns per-path created/existed/failed (#212)", "create_folder", (p) => ({ path: p.path, paths: p.paths })),
     delete_folder:        bp("Delete content browser folder(s) - counterpart to delete_asset, which leaves the parent directory entry behind as an orphan. Empty folders only by default; pass force=true to also delete any assets still inside (Content Browser 'Delete folder' equivalent). Per-path status (deleted/absent/failed) with reason (invalid_path/protected_path/not_empty/delete_failed) and a sample of contained assets on not_empty entries. Params: path OR paths[], force?", "delete_folder", (p) => ({ path: p.path, paths: p.paths, force: p.force })),
@@ -149,21 +328,53 @@ export const assetTool: ToolDef = categoryTool(
     // lives in the bridge (the shared editor), keyed by asset path with a TTL
     // so a crashed session never wedges an asset. sessionId defaults to this
     // server process; pass it explicitly to coordinate across processes.
-    lock:                 bp("Acquire an exclusive lock on an asset for this session. Returns acquired=true, or acquired=false with holder{sessionId,ttlSecondsRemaining} when another session holds it. Params: assetPath, ttlSeconds? (default 300), sessionId?", "acquire_lock", (p) => ({ path: p.assetPath ?? p.path, sessionId: p.sessionId ?? SESSION_ID, ttlSeconds: p.ttlSeconds })),
-    unlock:               bp("Release an asset lock held by this session (or force=true to break any holder's lock). Params: assetPath, force?, sessionId?", "release_lock", (p) => ({ path: p.assetPath ?? p.path, sessionId: p.sessionId ?? SESSION_ID, force: p.force })),
+    lock: {
+      description: "Acquire an exclusive lock on an asset for this editor. Returns acquired=true, or acquired=false with holder{sessionId,ttlSecondsRemaining} when another session holds it. Params: assetPath, ttlSeconds? (default 300), sessionId?",
+      handler: async (ctx, p) => ctx.bridge.call("acquire_lock", {
+        path: p.assetPath ?? p.path,
+        sessionId: lockOwner(ctx, p),
+        ttlSeconds: p.ttlSeconds,
+      }),
+    },
+    unlock: {
+      description: "Release an asset lock held by this editor (or force=true to break any holder's lock). Params: assetPath, force?, sessionId?",
+      handler: async (ctx, p) => ctx.bridge.call("release_lock", {
+        path: p.assetPath ?? p.path,
+        sessionId: lockOwner(ctx, p),
+        force: p.force,
+      }),
+    },
     list_locks:           bp("List all currently-held asset locks with holder session id, acquiredAt, and ttlSecondsRemaining.", "list_locks"),
+    unlock_all: {
+      description: "Release every lock held by one session in a single call, returning the number released. Defaults to the addressed editor's own session; pass sessionId to clear a different one (for example after a crashed session left assets wedged). Params: sessionId?",
+      handler: async (ctx, p) => ctx.bridge.call("release_session_locks", {
+        sessionId: lockOwner(ctx, p),
+      }),
+    },
+    diff:                 bp("Semantic structural diff between two assets of any type, dispatching on the asset's class. Blueprints are diffed structurally (parent class, variables, functions, components, per-graph node and connection deltas); other asset types report that diffing is not supported yet rather than failing opaquely. Params: assetPath, otherPath", "diff_asset", (p) => ({ assetPath: p.assetPath ?? p.path, otherPath: p.otherPath })),
   },
   undefined,
   {
     saveMapPackages: z.boolean().optional().describe("save_all_dirty: include map packages (default true)"),
     saveContentPackages: z.boolean().optional().describe("save_all_dirty: include content packages (default true)"),
-    items: z.array(z.object({
-      filePath: z.string(),
-      packagePath: z.string().optional(),
-      name: z.string().optional(),
-      replaceExisting: z.boolean().optional(),
-    })).optional().describe("import_texture_batch entries"),
-    save: z.boolean().optional().describe("import_texture_batch: save imported packages immediately (default true)"),
+    items: z.array(z.union([
+      z.object({
+        filePath: z.string(),
+        packagePath: z.string().optional(),
+        name: z.string().optional(),
+        replaceExisting: z.boolean().optional(),
+      }),
+      z.object({
+        assetPath: z.string().min(1),
+        properties: z.record(z.unknown()).refine((value) => Object.keys(value).length > 0, "properties must not be empty"),
+      }),
+      z.object({
+        name: z.string(),
+        packagePath: z.string(),
+        className: z.string(),
+        properties: z.record(z.unknown()).optional(),
+      }),
+    ])).min(1).max(500).optional().describe("Batch entries: import_texture_batch takes {filePath, packagePath?, name?, replaceExisting?}; bulk_set_properties takes {assetPath, properties}; bulk_upsert_data_assets takes {name, packagePath, className, properties?} (max 500)"),
     automated: z.boolean().optional().describe("import_texture_batch: bypass interactive dialogs (default true)"),
     assetPath: z.string().optional().describe("Asset path"),
     directory: z.string().optional(), query: z.string().optional(),
@@ -177,12 +388,22 @@ export const assetTool: ToolDef = categoryTool(
     filePath: z.string().optional().describe("Absolute file path for imports"),
     name: z.string().optional().describe("Asset name (defaults to filename)"),
     packagePath: z.string().optional().describe("Destination package path (e.g. /Game/Meshes)"),
-    onConflict: z.string().optional().describe("Asset-creation conflict policy: skip (default) | error | overwrite"),
+    width: z.number().int().min(1).max(8192).optional().describe("create_render_target_2d: pixel width, 1-8192 (default 512)"),
+    height: z.number().int().min(1).max(8192).optional().describe("create_render_target_2d: pixel height, 1-8192 (default 512)"),
+    clearColor: z.object({
+      r: z.number().optional(),
+      g: z.number().optional(),
+      b: z.number().optional(),
+      a: z.number().optional(),
+    }).optional().describe("create_render_target_2d: linear clear color (default transparent)"),
+    generateMips: z.boolean().optional().describe("create_render_target_2d: automatically generate mipmaps (default false)"),
+    targetGamma: z.number().min(0).optional().describe("create_render_target_2d: target gamma (default 0 uses engine behavior)"),
+    onConflict: z.string().optional().describe("Asset-creation conflict policy: skip (default) | error | overwrite. bulk_upsert_data_assets uses update (default) | skip | error"),
     groups: z.record(z.array(z.string())).optional().describe("set_texture_settings_by_type: { normal?: [...], grayscale?: [...], baseColor?: [...], hdr?: [...] }"),
     meshType: z.string().optional().describe("create_interchange_pipeline: 'skeletal' (default) or 'static'"),
     options: z.record(z.unknown()).optional().describe("create_interchange_pipeline: dotted-path overrides"),
     skeletonPath: z.string().optional(),
-    combineMeshes: z.boolean().optional().describe("Combine all meshes in FBX into one (default false — imports as separate assets)"),
+    combineMeshes: z.boolean().optional().describe("Combine all meshes in FBX into one (default false - imports as separate assets)"),
     importMaterials: z.boolean().optional(), importTextures: z.boolean().optional(),
     generateLightmapUVs: z.boolean().optional(),
     rowFilter: z.string().optional(), rowStruct: z.string().optional(),
@@ -205,7 +426,11 @@ export const assetTool: ToolDef = categoryTool(
     rows: z.record(z.unknown()).optional().describe("DataTable bulk rows { rowName: {field: value} } for fill_datatable_from_json (#535)"),
     jsonPath: z.string().optional(), jsonString: z.string().optional(),
     csvString: z.string().optional().describe("CurveTable CSV payload for import_curvetable"),
-    format: z.enum(["json", "csv"]).optional().describe("CurveTable import format"),
+    format: z.enum([
+      "json", "csv",
+      "R8", "RG8", "RGBA8", "RGBA8_SRGB",
+      "R16F", "RG16F", "RGBA16F", "R32F", "RG32F", "RGBA32F", "RGB10A2",
+    ]).optional().describe("CurveTable import format or create_render_target_2d pixel format"),
     interpMode: z.enum(["linear", "constant", "cubic", "none"]).optional().describe("CurveTable interpolation mode"),
     curveType: z.enum(["simple", "rich"]).optional().describe("CurveTable row type"),
     mode: z.enum(["simple", "rich"]).optional().describe("Alias for curveType"),
@@ -219,8 +444,18 @@ export const assetTool: ToolDef = categoryTool(
     time: z.number().optional().describe("CurveTable key time"),
     keyTimeTolerance: z.number().optional().describe("CurveTable key update tolerance"),
     exportName: z.string().optional(), propertyName: z.string().optional(),
-    value: z.unknown().optional().describe("Property value for set_property — scalar, object/array, or asset-path string. Goes through MCPJsonProperty (#420/#531)"),
+    value: z.unknown().optional().describe("Property value for set_property - scalar, object/array, or asset-path string. Goes through MCPJsonProperty (#420/#531)"),
+    elements: z.array(z.unknown()).min(1).optional().describe("append_array_elements: one or more values to append after full prevalidation"),
     includeValues: z.boolean().optional().describe("Include property values in read_properties/list_properties/get_properties"),
+    continueOnError: z.boolean().optional().describe("bulk_set_properties / set_mesh_materials_batch: apply the items that passed preflight instead of aborting the whole batch (default false). Rejected items are still reported in items[]"),
+    dryRun: z.boolean().optional().describe("migrate: resolve and report without copying (#760). bulk_upsert_data_assets: run the full preflight and report planned statuses without writing"),
+    discardUnsaved: z.boolean().optional().describe("force_reload: reload even though the package has unsaved changes, discarding them (default false) (#820)"),
+    allowDirty: z.boolean().optional().describe("migrate: migrate the on-disk version of an asset with unsaved edits (#760)"),
+    destinationContentDir: z.string().optional().describe("migrate: the TARGET project's Content folder (#760)"),
+    includeDependencies: z.boolean().optional().describe("migrate: also copy referenced assets (default true) (#760)"),
+    expandDepth: z.number().int().min(0).max(5).optional().describe("read_properties: inline owned subobjects to this depth (default 0) (#755)"),
+    expandExternal: z.boolean().optional().describe("read_properties: also follow references to other assets (default false) (#755)"),
+    maxExpandedObjects: z.number().int().positive().optional().describe("read_properties: cap on expanded objects (default 64) (#755)"),
     valueFormat: z.enum(["text", "json"]).optional().describe("Property value format for read_properties/list_properties/get_properties. Default text preserves the existing Unreal ExportText output; json returns structured JSON where supported."),
     settings: z.record(z.unknown()).optional(),
     compressionSettings: z.string().optional().describe("Texture compression: Default, Normalmap, Grayscale, Displacementmap, VectorDisplacementmap, HDR, EditorIcon, Alpha, DistanceFieldFont, HDR_Compressed, BC7"),
@@ -236,8 +471,8 @@ export const assetTool: ToolDef = categoryTool(
     importMorphTargets: z.boolean().optional().describe("import_skeletal_mesh: import morph targets (default true) (#678)"),
     createPhysicsAsset: z.boolean().optional().describe("import_skeletal_mesh: auto-create a PhysicsAsset (default false) (#678)"),
     replaceExisting: z.boolean().optional().describe("import_skeletal_mesh: replace an existing asset at the destination (default true) (#678)"),
-    assetPaths: z.array(z.string()).optional().describe("Array of asset paths (for recenter_pivot batch — first mesh sets reference pivot)"),
-    renames: z.array(z.record(z.unknown())).optional().describe("Array of rename descriptors for bulk_rename — each {sourcePath, destinationPath} or {assetPath, newName}"),
+    assetPaths: z.array(z.string()).optional().describe("Array of asset paths (recenter_pivot batch - first mesh sets reference pivot; also migrate)"),
+    renames: z.array(z.record(z.unknown())).optional().describe("Array of rename descriptors for bulk_rename - each {sourcePath, destinationPath} or {assetPath, newName}"),
     socketName: z.string().optional().describe("Socket name"),
     boneName: z.string().optional().describe("Bone name (for skeletal mesh sockets)"),
     relativeLocation: Vec3.optional().describe("Socket relative location"),
@@ -245,7 +480,7 @@ export const assetTool: ToolDef = categoryTool(
     relativeScale: Vec3.optional().describe("Socket relative scale"),
     outputPath: z.string().optional().describe("Absolute file path for export (e.g. C:/output/texture.png)"),
     classFilter: z.string().optional().describe("Restrict search_fts to assets whose class name contains this substring"),
-    className: z.string().optional().describe("UClass path (/Script/Module.ClassName) or loaded class name for create_data_asset"),
+    className: z.string().optional().describe("Class for create_data_asset/create_asset_by_class: loaded class name with or without the C++ A/U/F/E prefix, or a /Script/Module.ClassName path"),
     properties: z.record(z.unknown()).optional().describe("Key/value property overrides for create_data_asset"),
     packages: z.array(z.string()).optional().describe("Package paths for get_referencers / get_dependencies"),
     hard: z.boolean().optional().describe("get_dependencies: include hard dependencies (default true)"),
@@ -258,6 +493,13 @@ export const assetTool: ToolDef = categoryTool(
       slotIndex: z.number().optional(),
       materialPath: z.string(),
     })).optional().describe("Per-slot material assignments for set_sk_material_slots"),
+    // #822
+    assignments: z.array(z.object({
+      assetPath: z.string().min(1),
+      materialPath: z.string().min(1),
+      slotName: z.string().optional(),
+      slotIndex: z.number().int().optional(),
+    })).min(1).max(500).optional().describe("set_mesh_materials_batch entries: [{assetPath, materialPath, slotName? | slotIndex?}] (max 500). slotName is preferred for imported kits because slot indices are not stable across reimports"),
     path: z.string().optional().describe("Content path (e.g. /Game/Foo) - used by diagnose_registry, create_folder"),
     op: z.string().optional().describe("edit_user_defined_enum op: add_value | rename_value | remove_value. edit_user_defined_struct op: add_field | rename_field | set_field_type | remove_field"),
     values: z.array(z.string()).optional().describe("create_user_defined_enum: initial value display names"),
@@ -273,6 +515,12 @@ export const assetTool: ToolDef = categoryTool(
     reconcile: z.boolean().optional().describe("diagnose_registry: force synchronous rescan (evicts pending-kill ghosts)"),
     bHasNavigationData: z.boolean().optional().describe("Toggle nav data generation for set_mesh_nav"),
     clearNavCollision: z.boolean().optional().describe("Remove NavCollision from mesh for set_mesh_nav"),
-    force: z.boolean().optional().describe("delete / delete_batch: auto-close any open asset editors before deleting (#278). delete_folder: also delete assets contained in the folder."),
+    offset: z.number().optional().describe("list: index of the first match to return, for paging large folders (#790)"),
+    force: z.boolean().optional().describe("delete / delete_batch: auto-close any open asset editors before deleting (#278). delete_folder: also delete assets contained in the folder. save: write even if the package is not marked dirty (#768)."),
+    otherPath: z.string().optional().describe("diff: the asset to compare assetPath against"),
+    // lock / unlock / unlock_all all default this to the server process's own
+    // session id; it is only passed explicitly to coordinate across processes.
+    sessionId: z.string().optional().describe("lock / unlock / unlock_all: owning session id (defaults to this server process)"),
+    ttlSeconds: z.number().optional().describe("lock: seconds before the lock auto-expires (default 300)"),
   },
 );

@@ -16,7 +16,7 @@
  * rewriting only the `plugins:` block via a string-level surgery when
  * possible, and falling back to a full dump when the existing file lacks the
  * block entirely. The user is told both before and after about the restart
- * requirement — injected MCP actions only appear on next server start.
+ * requirement - injected MCP actions only appear on next server start.
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -42,8 +42,13 @@ import {
 } from "./plugin/native-deploy.js";
 import { ALL_TOOLS } from "./tools.js";
 import { resolvePublishToken } from "./registry-auth.js";
+import { parseEditorFlag, resolveEditorFlag, EditorFlagError } from "./editor-flag.js";
 
-const args = process.argv.slice(2);
+// --editor names one of the editors this server drives; every project lookup
+// below starts from it instead of cwd. Taken before the subcommand is shifted
+// off so it can appear anywhere on the line.
+const parsedEditor = parseEditorFlag(process.argv.slice(2));
+const args = parsedEditor.rest;
 const sub = args.shift();
 
 const RESTART_NOTE =
@@ -61,6 +66,21 @@ function note(msg: string): void {
 interface ProjectInfo {
   projectDir: string;
   configPath: string;
+}
+
+/**
+ * Where project resolution starts: the editor named by --editor when there is
+ * one, cwd otherwise. Resolved lazily so a subcommand that never touches a
+ * project (login, publish) does not fail on an unresolvable name.
+ */
+function projectStartDir(): string {
+  if (parsedEditor.editor === undefined) return process.cwd();
+  try {
+    const projectPath = resolveEditorFlag(parsedEditor.editor);
+    return projectPath.toLowerCase().endsWith(".uproject") ? path.dirname(projectPath) : projectPath;
+  } catch (e) {
+    fail(e instanceof EditorFlagError ? e.message : String(e));
+  }
 }
 
 function findProjectDir(startDir: string): ProjectInfo {
@@ -203,7 +223,7 @@ function cmdInstall(): void {
     note(`resolved '${requested}' -> '${name}' via the registry`);
   }
 
-  const proj = findProjectDir(process.cwd());
+  const proj = findProjectDir(projectStartDir());
 
   // Ensure a package.json exists. npm install will refuse without one.
   if (!fs.existsSync(path.join(proj.projectDir, "package.json"))) {
@@ -267,7 +287,7 @@ function cmdInstall(): void {
 
   // Native module gate: refuse to install when the deployed bridge can't
   // support the required ABI. Without a deployed bridge we let the install
-  // proceed and warn — `ue-mcp init` later deploys a current bridge.
+  // proceed and warn - `ue-mcp init` later deploys a current bridge.
   if (manifest.nativeModule) {
     const bridgeApi = readDeployedBridgeApiVersion(proj.projectDir);
     if (bridgeApi !== null && manifest.nativeModule.minBridgeApi > bridgeApi) {
@@ -287,7 +307,7 @@ function cmdInstall(): void {
     if (present === false) {
       note(`WARNING: ${name} requires UE plugin '${manifest.uePluginDependency}', not enabled in the .uproject. Enable it in the editor before using ${name} actions.`);
     } else if (present === undefined) {
-      note(`could not determine whether UE plugin '${manifest.uePluginDependency}' is enabled — check the .uproject manually.`);
+      note(`could not determine whether UE plugin '${manifest.uePluginDependency}' is enabled - check the .uproject manually.`);
     }
   }
 
@@ -343,7 +363,7 @@ function cmdInstall(): void {
 function cmdUninstall(): void {
   const name = args.shift();
   if (!name) fail("usage: ue-mcp plugin uninstall <name>");
-  const proj = findProjectDir(process.cwd());
+  const proj = findProjectDir(projectStartDir());
 
   // Remove any deployed native module BEFORE npm uninstall so we can still
   // read the manifest (for diagnostics) and so the state file stays
@@ -367,7 +387,7 @@ function cmdUninstall(): void {
 }
 
 function cmdList(): void {
-  const proj = findProjectDir(process.cwd());
+  const proj = findProjectDir(projectStartDir());
   const list = readPluginsList(proj.configPath);
   if (list.length === 0) {
     note(`no plugins declared in ${proj.configPath}`);
@@ -376,7 +396,7 @@ function cmdList(): void {
   for (const entry of list) {
     const pkgDir = findInstalledPackage(entry.name, proj.projectDir);
     if (!pkgDir) {
-      console.log(`  ${entry.name}${entry.version ? `@${entry.version}` : ""} — MISSING (not in node_modules)`);
+      console.log(`  ${entry.name}${entry.version ? `@${entry.version}` : ""} - MISSING (not in node_modules)`);
       continue;
     }
     const pj = JSON.parse(fs.readFileSync(path.join(pkgDir, "package.json"), "utf-8")) as { version?: string };
@@ -391,15 +411,15 @@ function cmdList(): void {
     console.log(
       `  ${entry.name}@${pj.version ?? "?"}` +
       (entry.version ? ` (pinned ${entry.version})` : "") +
-      ` — ${status}` +
-      (categories.length ? ` — injects: ${categories.join(", ")}` : ""),
+      ` - ${status}` +
+      (categories.length ? ` - injects: ${categories.join(", ")}` : ""),
     );
   }
 }
 
 function cmdUpdate(): void {
   const name = args.shift();
-  const proj = findProjectDir(process.cwd());
+  const proj = findProjectDir(projectStartDir());
   if (name) {
     runNpm(["update", name], proj.projectDir);
   } else {
@@ -1190,7 +1210,7 @@ async function cmdConfig(): Promise<void> {
     else if (a === "--global") target = "global";
   }
 
-  const proj = findProjectDir(process.cwd());
+  const proj = findProjectDir(projectStartDir());
   const resolved = resolveInstalledPlugin(proj, nameArg);
   const manifest = loadManifest(resolved.pkgDir).manifest;
   const groups = deriveGroups(manifest.flows);

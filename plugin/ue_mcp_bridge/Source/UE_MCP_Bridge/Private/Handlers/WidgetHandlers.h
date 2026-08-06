@@ -13,6 +13,10 @@ private:
 	static TSharedPtr<FJsonValue> ListWidgetBlueprints(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateWidgetBlueprint(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadWidgetTree(const TSharedPtr<FJsonObject>& Params);
+	// Extract an authored designer subtree into a new or empty WidgetBlueprint.
+	// The implementation uses UMG's clipboard serializer so editable widget
+	// properties, hierarchy, and internal panel slot data stay intact.
+	static TSharedPtr<FJsonValue> ExtractWidgetSubtree(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateEditorUtilityWidget(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateEditorUtilityBlueprint(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetWidgetProperties(const TSharedPtr<FJsonObject>& Params);
@@ -41,12 +45,24 @@ private:
 	// Runtime (PIE) widget inspection (#160)
 	static TSharedPtr<FJsonValue> ListRuntimeWidgets(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> GetRuntimeWidget(const TSharedPtr<FJsonObject>& Params);
+	// Read selected reflected properties from every matching live widget instance.
+	// Unlike GetRuntimeWidget, this never silently selects the first class match.
+	static TSharedPtr<FJsonValue> InspectRuntimeInstances(const TSharedPtr<FJsonObject>& Params);
 	// #161: Runtime delegate inspection
 	static TSharedPtr<FJsonValue> GetRuntimeDelegates(const TSharedPtr<FJsonObject>& Params);
 	// #602: instantiate a WidgetBlueprint into the live PIE viewport.
 	static TSharedPtr<FJsonValue> AddWidgetToViewport(const TSharedPtr<FJsonObject>& Params);
 	// #559: fire a UFUNCTION / button click on a live PIE UUserWidget.
 	static TSharedPtr<FJsonValue> InvokeRuntimeWidgetFunction(const TSharedPtr<FJsonObject>& Params);
+	// #812: drive an interactive child of a live PIE widget (button, checkbox,
+	// slider, spin box, text entry, combo box) and broadcast the delegate the
+	// real interaction fires. Returns an error value on failure, otherwise an
+	// unset pointer with the interaction record written into OutInfo.
+	// Implemented in WidgetHandlers_Interaction.cpp.
+	static TSharedPtr<FJsonValue> SimulateRuntimeChildInteraction(
+		class UWidget* Target,
+		const TSharedPtr<FJsonObject>& Params,
+		const TSharedPtr<FJsonObject>& OutInfo);
 
 	// Helper: recursively search for a widget by name in the tree
 	static class UWidget* FindWidgetByNameRecursive(class UWidget* Root, const FString& WidgetName);

@@ -1,6 +1,8 @@
 import type { TaskResult, TaskConstructor } from "@db-lyon/flowkit";
 import { UeMcpTask } from "../task.js";
+import { stripEditorTarget } from "../types.js";
 import type { FlowContext } from "./context.js";
+import { liftRollback } from "./rollback.js";
 
 /**
  * Create a TaskConstructor for a bridge-delegation action.
@@ -15,16 +17,30 @@ export function bridgeTaskClass(
   class FactoryBridgeTask extends UeMcpTask {
     get taskName() { return name; }
     async execute(): Promise<TaskResult> {
-      const params = mapParams
-        ? mapParams(this.options as Record<string, unknown>)
-        : this.options as Record<string, unknown>;
-      const data = await this.bridge.call(method, params, timeoutMs);
-      return {
-        success: true,
-        data: typeof data === "object" && data !== null
-          ? (data as Record<string, unknown>)
-          : { result: data },
-      };
+      // `editor` addresses a session; it is never a bridge parameter. Strip it
+      // before the mapper too, since a mapper that forwards its input verbatim
+      // would carry it into the call.
+      const options = stripEditorTarget(this.options as Record<string, unknown>);
+      const params = mapParams ? mapParams(options) : options;
+      const raw = await this.bridge.call(method, params, timeoutMs);
+      if (typeof raw !== "object" || raw === null) {
+        return { success: true, data: { result: raw } };
+      }
+      // Handlers attach `rollback` to their response. This class never lifted
+      // it, so every rollback emitted by a registered action was silently
+      // dropped and rollback_on_failure had nothing to undo.
+      //
+      // The response is passed through INTACT, rollback descriptor included.
+      // Every MCP category-tool call routes through this class, not just
+      // flows, and data is serialized as the whole tool result - stripping the
+      // key here deleted the rollback descriptor from ~90 handlers' documented
+      // responses, and left bridge-backed actions inconsistent with
+      // handler-backed ones, which pass data through untouched.
+      const raw2 = raw as Record<string, unknown>;
+      const result: TaskResult = { success: true, data: raw2 };
+      const record = liftRollback(raw2.rollback);
+      if (record) result.rollback = record;
+      return result;
     }
   }
   Object.defineProperty(FactoryBridgeTask, "name", { value: `BridgeTask_${name}` });

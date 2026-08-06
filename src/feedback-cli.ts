@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * `npx ue-mcp feedback <list|show|approve|discard|review>` — review and act on
+ * `npx ue-mcp feedback <list|show|approve|discard|review>` - review and act on
  * submissions that ue-mcp deferred to disk while running in
  * `feedback.mode = "defer"`. Pairs with src/feedback-deferred.ts.
  *
@@ -10,14 +10,23 @@
  */
 
 import * as readline from "node:readline";
+import * as path from "node:path";
 import {
   deleteDeferred,
   getPendingDir,
-  listDeferred,
+  listDeferred as listAllDeferred,
   loadDeferred,
   type DeferredFeedback,
 } from "./feedback-deferred.js";
+import { takeEditorTarget, EditorFlagError } from "./editor-flag.js";
 import { submitFeedback } from "./github-app.js";
+import {
+  CORE_REPO,
+  newIssueUrl,
+  parseRepoSlug,
+  repoSlug,
+  type GitHubRepo,
+} from "./registry-catalog.js";
 import {
   getFeedbackMode,
   setFeedbackMode,
@@ -55,31 +64,48 @@ function printHelp(): void {
   console.log("");
 }
 
-function cmdMode(arg: string | undefined): void {
+/**
+ * Print or set the feedback approval mode.
+ *
+ * With `--editor` the preference is scoped to that project (#817), which is the
+ * per-session equivalent of UE_MCP_FEEDBACK_MODE: one editor can be a long
+ * unattended run while the user sits in front of another. Without it, the
+ * user-wide preference is read and written exactly as before.
+ */
+function cmdMode(arg: string | undefined, projectRoot: string | null, editorLabel: string | null): void {
+  const scope = editorLabel ? `editor '${editorLabel}'` : "per-user";
   if (arg === undefined) {
     const env = (process.env.UE_MCP_FEEDBACK_MODE ?? "").trim().toLowerCase();
+    const scoped = projectRoot ? getFeedbackMode(projectRoot) : undefined;
     const pref = getFeedbackMode();
     const effective: FeedbackMode =
       env === "interactive" || env === "auto-approve" || env === "defer"
         ? env
-        : pref ?? "interactive";
+        : scoped ?? pref ?? "interactive";
 
     console.log("");
     console.log(`  ${BOLD}effective:${RESET} ${effective}`);
+    if (projectRoot) {
+      console.log(`  ${DIM}${scope}: ${scoped ?? "(not set; falls back to the per-user preference)"}${RESET}`);
+    }
     console.log(`  ${DIM}preference (~/.ue-mcp/state.json): ${pref ?? "(not set; default interactive)"}${RESET}`);
     if (env === "interactive" || env === "auto-approve" || env === "defer") {
       console.log(`  ${DIM}UE_MCP_FEEDBACK_MODE env override: ${env}${RESET}`);
     }
     console.log("");
-    console.log(`  ${DIM}Set with: npx ue-mcp feedback mode <interactive|auto-approve|defer>${RESET}`);
+    console.log(`  ${DIM}Set with: npx ue-mcp feedback mode <interactive|auto-approve|defer> [--editor <name>]${RESET}`);
     console.log(`  ${DIM}Clear preference: npx ue-mcp feedback mode default${RESET}`);
     console.log("");
     return;
   }
 
   if (arg === "default" || arg === "clear" || arg === "unset") {
-    setFeedbackMode(undefined);
-    ok(`Cleared mode preference. Effective mode will default to "interactive" until set again or overridden by UE_MCP_FEEDBACK_MODE.`);
+    setFeedbackMode(undefined, projectRoot);
+    ok(
+      projectRoot
+        ? `Cleared the mode for ${scope}. It falls back to the per-user preference.`
+        : `Cleared mode preference. Effective mode will default to "interactive" until set again or overridden by UE_MCP_FEEDBACK_MODE.`,
+    );
     info(getUserStatePath());
     return;
   }
@@ -88,17 +114,60 @@ function cmdMode(arg: string | undefined): void {
     fail(`Unknown mode "${arg}". Allowed: interactive, auto-approve, defer, default.`);
     process.exit(1);
   }
-  setFeedbackMode(arg);
-  ok(`Feedback mode set to "${arg}" (per-user, stored in ~/.ue-mcp/state.json).`);
+  setFeedbackMode(arg, projectRoot);
+  ok(
+    projectRoot
+      ? `Feedback mode for ${scope} set to "${arg}" (per-user, stored in ~/.ue-mcp/state.json).`
+      : `Feedback mode set to "${arg}" (per-user, stored in ~/.ue-mcp/state.json).`,
+  );
   if (process.env.UE_MCP_FEEDBACK_MODE) {
     warn(`UE_MCP_FEEDBACK_MODE=${process.env.UE_MCP_FEEDBACK_MODE} is set in your env and will override this preference for processes started from that shell.`);
   }
 }
 
+/**
+ * `--editor <name-or-path>` scopes every listing to the entries that
+ * originated in that editor (#817). The deferred store is user-scoped, because
+ * feedback files against the ue-mcp tracker rather than the user's project, so
+ * the flag filters what is shown rather than pointing somewhere else.
+ */
+let editorFilter: string | null = null;
+
+function setEditorFilter(projectPath?: string): void {
+  if (!projectPath) {
+    editorFilter = null;
+    return;
+  }
+  editorFilter = projectPath.toLowerCase().endsWith(".uproject")
+    ? path.basename(projectPath, path.extname(projectPath))
+    : path.basename(projectPath.replace(/[\/]+$/, ""));
+}
+
+/** The project root a --editor value resolved to, for per-project preferences. */
+function projectRootOf(projectPath?: string): string | null {
+  if (!projectPath) return null;
+  return projectPath.toLowerCase().endsWith(".uproject")
+    ? path.dirname(path.resolve(projectPath))
+    : path.resolve(projectPath);
+}
+
+/** The deferred entries in scope: all of them, or one editor's. */
+function listDeferred(): DeferredFeedback[] {
+  const all = listAllDeferred();
+  if (!editorFilter) return all;
+  const needle = editorFilter.toLowerCase();
+  return all.filter((e) => (e.project ?? "").toLowerCase() === needle);
+}
+
 function cmdList(): void {
   const entries = listDeferred();
   if (entries.length === 0) {
-    info("No pending feedback submissions.");
+    const total = listAllDeferred().length;
+    if (editorFilter && total > 0) {
+      info(`No pending feedback submissions from '${editorFilter}'. ${total} pending from other editors.`);
+    } else {
+      info("No pending feedback submissions.");
+    }
     info(getPendingDir());
     return;
   }
@@ -110,13 +179,15 @@ function cmdList(): void {
     "project".length,
     ...entries.map((e) => (e.project ?? "(none)").length),
   );
+  const repoWidth = Math.max("tracker".length, ...entries.map((e) => repoSlug(entryRepo(e)).length));
   console.log(
-    `  ${DIM}${"id".padEnd(idWidth)}  ${"project".padEnd(projWidth)}  ${"author".padEnd(4)}  title${RESET}`,
+    `  ${DIM}${"id".padEnd(idWidth)}  ${"project".padEnd(projWidth)}  ${"tracker".padEnd(repoWidth)}  ${"author".padEnd(4)}  title${RESET}`,
   );
   for (const e of entries) {
     const projLabel = (e.project ?? "(none)").padEnd(projWidth);
+    const repoLabel = repoSlug(entryRepo(e)).padEnd(repoWidth);
     const titlePreview = e.title.length > 70 ? `${e.title.slice(0, 67)}...` : e.title;
-    console.log(`  ${e.id.padEnd(idWidth)}  ${projLabel}  ${e.author.padEnd(4)}  ${titlePreview}`);
+    console.log(`  ${e.id.padEnd(idWidth)}  ${projLabel}  ${repoLabel}  ${e.author.padEnd(4)}  ${titlePreview}`);
   }
   console.log("");
   console.log(`  ${DIM}Approve with: npx ue-mcp feedback approve <id>${RESET}`);
@@ -131,6 +202,8 @@ function renderEntry(entry: DeferredFeedback, header?: string): void {
   console.log(`  ${BOLD}created ${RESET}${entry.createdAt}`);
   console.log(`  ${BOLD}project ${RESET}${entry.project ?? "(none)"}`);
   console.log(`  ${BOLD}author  ${RESET}${entry.author}`);
+  console.log(`  ${BOLD}tracker ${RESET}${repoSlug(entryRepo(entry))}`);
+  if (entry.routing) console.log(`  ${BOLD}routing ${RESET}${DIM}${entry.routing}${RESET}`);
   console.log(`  ${BOLD}labels  ${RESET}${entry.labels.join(", ") || "(none)"}`);
   console.log(`  ${BOLD}title   ${RESET}${entry.title}`);
   console.log("");
@@ -151,15 +224,25 @@ function cmdShow(id: string): void {
 
 /** Outcome an interactive caller needs to distinguish from a bare success. */
 type ApproveOutcome =
-  | { kind: "posted"; number: number; url: string }
+  | { kind: "posted"; number: number; url: string; repo: string }
   | { kind: "auth_required"; verification_uri: string; user_code: string }
+  | { kind: "repo_unavailable"; repo: string; status: number; manualUrl: string }
+  | { kind: "bot_unavailable"; message: string; manualUrl: string }
   | { kind: "error"; message: string };
 
+/** Where a deferred entry goes. Entries written before routing existed carry
+ *  no repo and keep landing on the core tracker. */
+function entryRepo(entry: DeferredFeedback): GitHubRepo {
+  return parseRepoSlug(entry.repo) ?? CORE_REPO;
+}
+
 async function approveEntry(entry: DeferredFeedback): Promise<ApproveOutcome> {
+  const repo = entryRepo(entry);
   let result: Awaited<ReturnType<typeof submitFeedback>>;
   try {
     result = await submitFeedback(entry.title, entry.body, entry.labels, {
       useBot: entry.author === "bot",
+      repo,
     });
   } catch (e) {
     return { kind: "error", message: e instanceof Error ? e.message : String(e) };
@@ -167,8 +250,27 @@ async function approveEntry(entry: DeferredFeedback): Promise<ApproveOutcome> {
   if (result.kind === "auth_required") {
     return { kind: "auth_required", verification_uri: result.verification_uri, user_code: result.user_code };
   }
+  if (result.kind === "repo_unavailable") {
+    // Left on disk on purpose: the report is still valid, it just needs a
+    // different door. The prefilled URL is that door.
+    return {
+      kind: "repo_unavailable",
+      repo: result.repo,
+      status: result.status,
+      manualUrl: newIssueUrl(repo, entry.title, entry.body),
+    };
+  }
+  if (result.kind === "bot_unavailable") {
+    // Anonymous posting is off right now. Same treatment: the entry stays on
+    // disk and the user gets a door that always works.
+    return {
+      kind: "bot_unavailable",
+      message: result.message,
+      manualUrl: newIssueUrl(repo, entry.title, entry.body),
+    };
+  }
   deleteDeferred(entry.id);
-  return { kind: "posted", number: result.number, url: result.url };
+  return { kind: "posted", number: result.number, url: result.url, repo: result.repo };
 }
 
 async function cmdApprove(id: string): Promise<void> {
@@ -178,11 +280,24 @@ async function cmdApprove(id: string): Promise<void> {
     process.exit(1);
   }
   console.log("");
-  info(`Posting ${id} to GitHub as ${entry.author === "bot" ? "ue-mcp-feedback bot" : "your GitHub user"}...`);
+  info(`Posting ${id} to ${repoSlug(entryRepo(entry))} as ${entry.author === "bot" ? "ue-mcp-feedback bot" : "your GitHub user"}...`);
   const outcome = await approveEntry(entry);
   if (outcome.kind === "error") {
     fail(`GitHub POST failed: ${outcome.message}`);
     info(`Entry left on disk; retry with: npx ue-mcp feedback approve ${id}`);
+    process.exit(1);
+  }
+  if (outcome.kind === "repo_unavailable") {
+    warn(`${outcome.repo} would not accept the issue (HTTP ${outcome.status}).`);
+    console.log(`  ${BOLD}Open it manually:${RESET} ${CYAN}${outcome.manualUrl}${RESET}`);
+    info(`Entry left on disk. Discard with: npx ue-mcp feedback discard ${id}`);
+    process.exit(1);
+  }
+  if (outcome.kind === "bot_unavailable") {
+    warn(`Anonymous posting is unavailable: ${outcome.message}`);
+    console.log(`  ${BOLD}Open it manually:${RESET} ${CYAN}${outcome.manualUrl}${RESET}`);
+    info(`Or run \`npx ue-mcp auth\` and re-approve to post as your GitHub user.`);
+    info(`Entry left on disk. Discard with: npx ue-mcp feedback discard ${id}`);
     process.exit(1);
   }
   if (outcome.kind === "auth_required") {
@@ -193,7 +308,7 @@ async function cmdApprove(id: string): Promise<void> {
     info(`Or discard with: npx ue-mcp feedback discard ${id}`);
     process.exit(1);
   }
-  ok(`Posted as issue #${outcome.number} (${outcome.url})`);
+  ok(`Posted as ${outcome.repo}#${outcome.number} (${outcome.url})`);
   info(`Removed local entry ${id}.`);
   console.log("");
 }
@@ -256,11 +371,25 @@ async function cmdReview(): Promise<void> {
         continue;
       }
 
-      info(`Posting ${entry.id} to GitHub as ${entry.author === "bot" ? "ue-mcp-feedback bot" : "your GitHub user"}...`);
+      info(`Posting ${entry.id} to ${repoSlug(entryRepo(entry))} as ${entry.author === "bot" ? "ue-mcp-feedback bot" : "your GitHub user"}...`);
       const outcome = await approveEntry(entry);
       if (outcome.kind === "posted") {
-        ok(`Posted as issue #${outcome.number} (${outcome.url})`);
+        ok(`Posted as ${outcome.repo}#${outcome.number} (${outcome.url})`);
         approved++;
+        continue;
+      }
+      if (outcome.kind === "repo_unavailable") {
+        warn(`${outcome.repo} would not accept the issue (HTTP ${outcome.status}).`);
+        console.log(`  ${BOLD}Open it manually:${RESET} ${CYAN}${outcome.manualUrl}${RESET}`);
+        info(`Entry left on disk; continuing with the rest of the queue.`);
+        skipped++;
+        continue;
+      }
+      if (outcome.kind === "bot_unavailable") {
+        warn(`Anonymous posting is unavailable: ${outcome.message}`);
+        console.log(`  ${BOLD}Open it manually:${RESET} ${CYAN}${outcome.manualUrl}${RESET}`);
+        info(`Entry left on disk; continuing with the rest of the queue.`);
+        skipped++;
         continue;
       }
       if (outcome.kind === "auth_required") {
@@ -308,12 +437,24 @@ function cmdDiscard(id: string): void {
 }
 
 async function main(): Promise<void> {
-  const sub = process.argv[2];
-  const id = process.argv[3];
+  // --editor scopes the deferred store to entries that originated in one of
+  // this server's editors. The store itself is user-scoped (feedback files
+  // against the ue-mcp tracker, not the project), so the flag is a filter
+  // rather than a different location.
+  let target: { projectPath?: string; rest: string[] };
+  try {
+    target = takeEditorTarget(process.argv.slice(2));
+  } catch (e) {
+    fail(e instanceof EditorFlagError ? e.message : String(e));
+    process.exit(1);
+  }
+  setEditorFilter(target.projectPath);
+  const sub = target.rest[0];
+  const id = target.rest[1];
 
   switch (sub) {
     case "mode":
-      cmdMode(id);
+      cmdMode(id, projectRootOf(target.projectPath), editorFilter);
       return;
     case "list":
       cmdList();

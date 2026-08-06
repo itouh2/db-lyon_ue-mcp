@@ -20,16 +20,41 @@ import {
   type Snapshot,
 } from "./git-snapshot.js";
 import {
+
   emitFlowEvent,
   nextRunId,
   trimStepResult,
   trimError,
 } from "./events.js";
 
+/**
+ * Name a failed rollback by the bridge method it tried to call. Every record
+ * routes through the generic "ue-mcp.bridge" task now, so taskName alone
+ * renders three different failed inverses as three identical lines.
+ */
+function rollbackLabel(e: { taskName: string; payload?: Record<string, unknown> }): string {
+  const method = e.payload?.method;
+  return typeof method === "string" && method.length > 0 ? method : e.taskName;
+}
+
+/**
+ * The task registry and flow config a call resolves to.
+ *
+ * Both are per editor (#817): the registry is built from that project's tool
+ * graph, and the config is that project's ue-mcp.yml. Passing plain values
+ * still works and means "the same one for every call", which is what a
+ * single-editor server and the script runner want.
+ */
+export type FlowRegistrySource = TaskRegistry | ((ctx: ToolContext) => TaskRegistry);
+export type FlowConfigSource = (() => FlowConfig) | ((ctx: ToolContext) => FlowConfig);
+
 export function createFlowTool(
-  registry: TaskRegistry,
-  reloadConfig: () => FlowConfig,
+  registrySource: FlowRegistrySource,
+  reloadConfig: FlowConfigSource,
 ): ToolDef {
+  const registryFor = (ctx: ToolContext): TaskRegistry =>
+    typeof registrySource === "function" ? registrySource(ctx) : registrySource;
+  const configFor = (ctx: ToolContext): FlowConfig => reloadConfig(ctx);
   return {
     name: "flow",
     description:
@@ -58,15 +83,15 @@ export function createFlowTool(
       rollback_on_failure: z.boolean().optional().describe("Invoke inverse tasks in reverse order on failure"),
     },
     actions: {
-      run: { handler: async (ctx, params) => runFlow(registry, reloadConfig(), ctx, params) },
-      plan: { handler: async (ctx, params) => planFlow(registry, reloadConfig(), ctx, params) },
-      list: { handler: async () => listFlows(reloadConfig()) },
+      run: { handler: async (ctx, params) => runFlow(registryFor(ctx), configFor(ctx), ctx, params) },
+      plan: { handler: async (ctx, params) => planFlow(registryFor(ctx), configFor(ctx), ctx, params) },
+      list: { handler: async (ctx) => listFlows(configFor(ctx)) },
     },
     handler: async (ctx, params) => {
       const action = params.action as string;
-      if (action === "list") return listFlows(reloadConfig());
-      if (action === "plan") return planFlow(registry, reloadConfig(), ctx, params);
-      if (action === "run") return runFlow(registry, reloadConfig(), ctx, params);
+      if (action === "list") return listFlows(configFor(ctx));
+      if (action === "plan") return planFlow(registryFor(ctx), configFor(ctx), ctx, params);
+      if (action === "run") return runFlow(registryFor(ctx), configFor(ctx), ctx, params);
       throw new Error(`Unknown flow action: ${action}`);
     },
   };
@@ -126,10 +151,12 @@ function makeRunner(
   runId: string,
   flowName: string,
 ): FlowRunner {
-  const flowCtx: FlowContext = {
-    bridge: ctx.bridge,
-    project: ctx.project,
-  };
+  // The whole context, not two fields of it. Rebuilding it field-by-field
+  // dropped `elicit`, `getFlows`, `getPlugins` and now the editor session, so
+  // a step inside a flow saw a different server than the same action called
+  // directly - and, with more than one editor, could not tell which one it
+  // was running in.
+  const flowCtx: FlowContext = { ...ctx };
 
   // Opt-in git snapshot: capture Content/ + Config/ on start; reset on failure.
   // Handler-level rollbacks cover in-memory state (selection, PIE, unsaved
@@ -254,7 +281,7 @@ function formatFlowResult(result: FlowRunResult): Record<string, unknown> {
     const stepIcon = s.skipped ? "○" : s.result?.success ? "✓" : "✗";
     const status = s.skipped ? "skipped" : s.result?.success ? formatDuration(s.duration) : "FAILED";
     const attempts = s.attempts && s.attempts > 1 ? ` [${s.attempts} attempts]` : "";
-    lines.push(`  ${stepIcon} ${s.stepNumber}. ${s.name} (${s.type}) — ${status}${attempts}`);
+    lines.push(`  ${stepIcon} ${s.stepNumber}. ${s.name} (${s.type}) - ${status}${attempts}`);
 
     if (s.result?.error) {
       lines.push(`      ${s.result.error.message}`);
@@ -280,10 +307,10 @@ function formatFlowResult(result: FlowRunResult): Record<string, unknown> {
     lines.push("");
     lines.push(
       `  Rollback: ${result.rollback.succeeded}/${result.rollback.attempted} inverses succeeded` +
-        (result.rollback.errors.length ? ` — ${result.rollback.errors.length} failed` : ""),
+        (result.rollback.errors.length ? ` - ${result.rollback.errors.length} failed` : ""),
     );
     for (const e of result.rollback.errors) {
-      lines.push(`      ✗ ${e.taskName}: ${e.error.message}`);
+      lines.push(`      ✗ ${rollbackLabel(e)}: ${e.error.message}`);
     }
   }
 
@@ -301,7 +328,7 @@ function formatFlowResult(result: FlowRunResult): Record<string, unknown> {
     lines.push("");
     lines.push(`  Hook errors (${result.hookErrors.length}):`);
     for (const h of result.hookErrors) {
-      lines.push(`      ✗ ${h.phase}:${h.name} — ${h.error.message}`);
+      lines.push(`      ✗ ${h.phase}:${h.name} - ${h.error.message}`);
     }
   }
 
@@ -311,6 +338,25 @@ function formatFlowResult(result: FlowRunResult): Record<string, unknown> {
     duration: result.duration,
     stepCount: result.steps.length,
     failedStep: result.steps.find((s) => s.result?.success === false)?.name,
+    // What each step answered. The per-step events carry no data by design
+    // (an SSE subscriber does not want a shell log or an asset listing pushed
+    // at it), which left the run response as the only place the data could
+    // arrive, and it was dropping it too: a flow that read anything returned a
+    // summary line and nothing else, so the same action was strictly less
+    // useful inside a flow than called directly.
+    steps: result.steps.map((s) => ({
+      stepNumber: s.stepNumber,
+      name: s.name,
+      type: s.type,
+      skipped: s.skipped,
+      success: s.result?.success ?? false,
+      duration: s.duration,
+      attempts: s.attempts,
+      error: s.result?.error
+        ? { message: s.result.error.message, name: s.result.error.name }
+        : undefined,
+      data: s.result?.data,
+    })),
     rollback: result.rollback,
     hookErrors: result.hookErrors,
   };

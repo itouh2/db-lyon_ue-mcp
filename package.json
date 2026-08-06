@@ -1,7 +1,7 @@
 {
   "name": "ue-mcp",
-  "version": "1.1.33",
-  "description": "Unreal Engine MCP server - 24 tools, 736+ actions for AI-driven editor control",
+  "version": "1.2.0",
+  "description": "Unreal Engine MCP server - 24 tools, 783+ actions for AI-driven editor control",
   "type": "module",
   "main": "dist/index.js",
   "exports": {
@@ -42,7 +42,7 @@
     "type": "git",
     "url": "https://github.com/db-lyon/ue-mcp.git"
   },
-  "homepage": "https://db-lyon.github.io/ue-mcp/",
+  "homepage": "https://ue-mcp.com/docs/",
   "engines": {
     "node": ">=18"
   },
@@ -54,9 +54,14 @@
     "dev": "tsx src/index.ts",
     "test": "vitest run",
     "test:unit": "vitest run tests/unit",
+    "test:multi-editor": "vitest run tests/multi-editor",
+    "test:live": "node scripts/live-tier.mjs",
+    "golden:record": "node scripts/record-golden.mjs",
+    "release:notes": "node scripts/compose-release-notes.mjs",
     "audit:docs": "node scripts/audit-docs.mjs && node scripts/audit-params.mjs",
     "audit:handlers": "node scripts/audit-handlers.mjs",
-    "audit": "npm run audit:docs && npm run audit:handlers",
+    "audit:em-dash": "node scripts/check-em-dashes.mjs",
+    "audit": "npm run audit:docs && npm run audit:handlers && npm run audit:em-dash",
     "test:watch": "vitest",
     "test:level": "vitest run tests/smoke/level.test.ts",
     "test:asset": "vitest run tests/smoke/asset.test.ts",

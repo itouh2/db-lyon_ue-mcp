@@ -1,13 +1,18 @@
+import { checkPluginFreshness } from "../plugin-freshness.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
 import { categoryTool, bp, type ToolDef } from "../types.js";
-import { deploy, deploySummary, findEngineInstall } from "../deployer.js";
+import { deploy, deploySummary, attach, attachSummary, findEngineInstall } from "../deployer.js";
+import { startEditor, isBridgeReachable } from "../editor-control.js";
 import { resolveConfigPath, findIniFiles, parseIni, buildTagTree } from "../config-parser.js";
 import { parseHeader, collectFiles, findSourceRoots, resolveModuleDir } from "../cpp-parser.js";
 import { readDeployedBridgeApiVersion } from "../plugin/bridge-api.js";
+import { CLIENT_PROTOCOL_VERSION, describeProtocolMismatch } from "../bridge.js";
 import { searchTools, type ToolSearchHit } from "../tool-search.js";
 import { getWorkarounds } from "../workaround-tracker.js";
+import { readLogState, readEngineSnapshot } from "../engine-observer.js";
+import { switchProject, isTargetDiverged } from "../project-switch.js";
 
 /**
  * Resolve a module name to its Source/<Module> directory, searching the project
@@ -53,34 +58,253 @@ export const projectTool: ToolDef = categoryTool(
   "Project status and editor connection: get_status (is the editor connected?), set_project (switch/redirect the bridge to another .uproject), get_info. Also config INI files, module load state, and C++ source inspection. Call project(get_status) first in any session.",
   {
     get_status: {
-      description: "Check server mode and editor connection",
+      description: "Check server mode and editor connection. Also reports pluginBuildStale when the compiled bridge is older than its source, which is the real cause of 'Unknown method' on handlers that do exist (#785)",
       handler: async (ctx) => {
         const flows = ctx.getFlows?.() ?? [];
         const bridgeApiVersion = ctx.project.projectDir
           ? readDeployedBridgeApiVersion(ctx.project.projectDir)
           : null;
+        // #785: surface staleness on the first call agents make, so an
+        // "Unknown method" later is read as a stale build rather than a
+        // missing feature.
+        const freshness = checkPluginFreshness(ctx.project.projectPath ?? null);
+
+        // "disconnected" on its own has never been actionable: it is the same
+        // word for "no editor", "editor still loading shaders", and "editor
+        // blocked on a dialog nobody can see". The engine's own log and the
+        // plugin's status snapshot are plain file reads, so read them whenever
+        // there is no live bridge to ask. The full probe (process table,
+        // native dialog windows) costs seconds and lives in
+        // editor(get_engine_state).
+        const offlineEngine = ctx.bridge.isConnected ? null : (() => {
+          const logState = readLogState(ctx.project.projectPath ?? null);
+          const snapshot = readEngineSnapshot(ctx.project.projectPath ?? null);
+          if (!logState.logPath && !snapshot) return null;
+          return {
+            phase: snapshot?.phase ?? logState.phase,
+            blocked: logState.blocking || Boolean(snapshot?.modal),
+            modal: snapshot?.modal ?? undefined,
+            slowTask: snapshot?.slowTask ?? undefined,
+            gameThreadStalledSeconds: snapshot?.gameThreadStalledSeconds ?? undefined,
+            // False during startup: there is no engine loop to stall yet, so
+            // the stall figure above is deliberately absent rather than zero.
+            gameThreadTicking: snapshot?.gameThreadTicking,
+            modulesLoaded: snapshot?.modulesLoaded,
+            snapshotAgeSeconds: snapshot?.ageSeconds,
+            secondsSinceLogWrite: logState.secondsSinceWrite ?? undefined,
+            lastLogLine: logState.lastLine ?? undefined,
+            recentErrors: logState.errors.length > 0 ? logState.errors : undefined,
+            hint: "editor(action='get_engine_state') runs the full out-of-process probe (process table, native dialogs).",
+          };
+        })();
+
+        // Which editor this connection belongs to (#818). "connected" on its
+        // own never said whose editor answered, so a bridge left on another
+        // project read as a healthy session.
+        const target = ctx.bridge.getTarget();
+
         return {
+          engine: offlineEngine ?? undefined,
+          pluginBuildStale: freshness.checked ? freshness.stale : undefined,
+          pluginBuildWarning: freshness.stale ? freshness.message : undefined,
           mode: ctx.bridge.isConnected ? "live" : "disconnected",
           editorConnected: ctx.bridge.isConnected,
+          editorTarget: {
+            projectPath: target.projectPath,
+            port: target.port,
+            portSource: target.portSource,
+          },
+          // Bridge calls and path resolution would be hitting different
+          // projects. Unreachable through set_project, reported so it can
+          // never be silent again.
+          editorTargetMismatch: isTargetDiverged(ctx.project, target) || undefined,
           project: ctx.project.isLoaded ? { name: ctx.project.projectName, path: ctx.project.projectPath, contentDir: ctx.project.contentDir, engineAssociation: ctx.project.engineAssociation, config: Object.keys(ctx.project.config).length > 0 ? ctx.project.config : undefined } : null,
           // Bridge ABI version of the deployed plugin in this project.
           // Plugins declaring nativeModule.minBridgeApi compare against
           // this number; older bridges refuse newer plugins.
+          //
+          // Read from the header on disk, which describes the source, not the
+          // loaded binary. bridgeProtocol below comes from the running plugin
+          // itself and is the one to trust when the two disagree.
           bridgeApiVersion: bridgeApiVersion ?? undefined,
+          // #821: what the connected plugin said it was, and whether that
+          // matches the client. A mismatch here is the reason behind an
+          // "Unknown method" on an action the schema advertises.
+          bridgeProtocol: ctx.bridge.capabilities
+            ? {
+                plugin: ctx.bridge.capabilities.protocolVersion,
+                client: CLIENT_PROTOCOL_VERSION,
+                builtAt: ctx.bridge.capabilities.builtAt,
+                actionCount: ctx.bridge.capabilities.actionCount,
+                mismatch: describeProtocolMismatch(ctx.bridge.capabilities) ?? undefined,
+              }
+            : undefined,
           // Pre-built sequences for this project. If the user's request
           // matches a flow's name/description, prefer flow(action="run")
           // over composing the sequence by hand. See SERVER_INSTRUCTIONS.
           flows: flows.length > 0 ? flows : undefined,
+          // #817: only beyond one editor, so a single-editor status response
+          // is exactly what it has always been.
+          editors: ctx.sessions && ctx.sessions.size > 1
+            ? ctx.sessions.list().map((s) => s.info(s === ctx.sessions!.active))
+            : undefined,
         };
       },
     },
     set_project: {
-      description: "Switch project. Params: projectPath",
+      description: "Switch project: moves both path resolution and the editor connection to the new .uproject. Params: projectPath",
       handler: async (ctx, p) => {
-        ctx.project.setProject(p.projectPath as string);
+        const projectPath = p.projectPath as string;
+        if (!projectPath) throw new Error("Missing 'projectPath'");
+
+        // #817: with several editors registered, switching this session onto a
+        // project another session already holds would leave two sessions
+        // pointed at one editor. Name the one that already has it instead.
+        const existing = ctx.sessions?.find(projectPath);
+        if (existing && existing !== ctx.session) {
+          throw new Error(
+            `'${existing.name}' is already registered for that project. ` +
+              `Use project(action='use_editor', editorTarget='${existing.name}') to switch to it.`,
+          );
+        }
+
+        // switchProject moves the bridge and the path resolver together (#818).
+        // Doing it here by hand is what left the socket on the previous
+        // project's editor while every path resolved against the new one.
+        const switched = await switchProject(ctx.project, ctx.bridge, projectPath);
+        // Sessions are keyed by project root, so the key has to move with the
+        // project. Without this the session stays addressable only under the
+        // project it just left.
+        const editor = ctx.sessions && ctx.session ? ctx.sessions.rekey(ctx.session) : undefined;
         const result = deploy(ctx.project);
-        try { await ctx.bridge.connect(); } catch { /* editor might not be running */ }
-        return { success: true, projectName: ctx.project.projectName, contentDir: ctx.project.contentDir, engineAssociation: ctx.project.engineAssociation, editorConnected: ctx.bridge.isConnected, bridgeSetup: deploySummary(result) };
+        return {
+          success: true,
+          editor: editor?.name,
+          projectName: ctx.project.projectName,
+          contentDir: ctx.project.contentDir,
+          engineAssociation: ctx.project.engineAssociation,
+          previousProject: switched.previousProjectPath ?? undefined,
+          editorConnected: switched.connected,
+          // The editor this connection belongs to. Always the project above.
+          editorTarget: {
+            projectPath: switched.target.projectPath,
+            port: switched.target.port,
+            portSource: switched.target.portSource,
+          },
+          // Present when no editor answered: the switch still completed, and
+          // nothing can reach the previous project's editor any more.
+          editorUnreachable: switched.connectError,
+          bridgeSetup: deploySummary(result),
+        };
+      },
+    },
+    list_editors: {
+      description: "List every editor session this server drives: name, project, bridge port, whether the socket is connected, whether anything is answering on that port, and which session untargeted calls fall through to (#817)",
+      handler: async (ctx) => {
+        if (!ctx.sessions) {
+          return {
+            editorCount: 1,
+            activeEditor: null,
+            editors: [{ name: "default", projectPath: ctx.project.projectPath, connected: ctx.bridge.isConnected, active: true }],
+            note: "This server was built without a session registry, so it drives one editor.",
+          };
+        }
+        const active = ctx.sessions.active;
+        const editors = await Promise.all(
+          ctx.sessions.list().map(async (s) => {
+            const info = s.info(s === active);
+            return {
+              ...info,
+              // The session's own host, so a project pointed elsewhere by
+              // `bridge.host` is probed where it actually lives (#817).
+              bridgeReachable: await isBridgeReachable(s.bridge.port, s.bridge.host),
+              pluginBuildStale: s.project.projectPath
+                ? (checkPluginFreshness(s.project.projectPath).stale || undefined)
+                : undefined,
+            };
+          }),
+        );
+        const ambiguous = editors.filter((e) => e.portSharedWith?.length);
+        return {
+          editorCount: editors.length,
+          activeEditor: active.name,
+          editors,
+          targeting: editors.length > 1
+            ? "Pass editor=\"<name>\" on any call to run it in that editor. Untargeted calls run in the active editor."
+            : "One editor: every call runs in it, and no 'editor' parameter is advertised.",
+          warning: ambiguous.length > 0
+            ? `These sessions share a bridge port and cannot be told apart: ${ambiguous.map((e) => e.name).join(", ")}. Give each project its own 'bridge.port' in its ue-mcp.yml, or unset UE_MCP_PORT.`
+            : undefined,
+        };
+      },
+    },
+    use_editor: {
+      description: "Make one editor session the default target for untargeted calls. Does not change the session set and never touches any editor process. Params: editorTarget (session name, project name, or .uproject path) (#817)",
+      handler: async (ctx, p) => {
+        if (!ctx.sessions) throw new Error("This server drives one editor; there is nothing to switch between.");
+        const target = p.editorTarget as string;
+        if (!target) throw new Error("Missing 'editorTarget'");
+        const session = ctx.sessions.use(target);
+        return {
+          success: true,
+          activeEditor: session.name,
+          projectPath: session.project.projectPath,
+          bridgePort: session.bridge.port,
+          editorConnected: session.bridge.isConnected,
+        };
+      },
+    },
+    add_editor: {
+      description: "Register another project as an addressable editor session, with its own bridge connection and port. Optionally launch its editor. Every category then accepts editor=\"<name>\" to run a call there. Params: projectPath, editorName? (defaults to the project name), start? (launch the editor and wait for it to be ready), timeout? (seconds, default 300) (#817)",
+      handler: async (ctx, p) => {
+        if (!ctx.sessions) throw new Error("This server was built without a session registry.");
+        const projectPath = p.projectPath as string;
+        if (!projectPath) throw new Error("Missing 'projectPath'");
+        const before = ctx.sessions.size;
+        const session = ctx.sessions.register({
+          projectPath,
+          name: typeof p.editorName === "string" && p.editorName ? p.editorName : undefined,
+        });
+        const alreadyRegistered = ctx.sessions.size === before;
+
+        const attachResult = attach(session.project);
+        let started: unknown;
+        if (p.start === true) {
+          const timeout = typeof p.timeout === "number" && p.timeout > 0 ? p.timeout : 300;
+          started = await startEditor(session.project, timeout, ctx.onProgress);
+        }
+        try { await session.bridge.connect(); } catch { /* editor may not be running yet */ }
+
+        return {
+          success: true,
+          editor: session.name,
+          alreadyRegistered: alreadyRegistered || undefined,
+          projectName: session.project.projectName,
+          projectPath: session.project.projectPath,
+          bridgePort: session.bridge.port,
+          editorConnected: session.bridge.isConnected,
+          bridgeSetup: attachSummary(attachResult),
+          started,
+          editorCount: ctx.sessions.size,
+          hint: `Call any action with editor="${session.name}" to run it there, or project(action="use_editor", editorTarget="${session.name}") to make it the default.`,
+        };
+      },
+    },
+    drop_editor: {
+      description: "Forget an editor session and close its bridge socket. The editor process is LEFT RUNNING and untouched - this detaches, it does not stop anything (use editor(stop_editor) for that). Params: editorTarget (#817)",
+      handler: async (ctx, p) => {
+        if (!ctx.sessions) throw new Error("This server drives one editor; there is nothing to drop.");
+        const target = p.editorTarget as string;
+        if (!target) throw new Error("Missing 'editorTarget'");
+        const dropped = ctx.sessions.drop(target);
+        return {
+          success: true,
+          dropped: dropped.name,
+          projectPath: dropped.projectPath,
+          editorLeftRunning: true,
+          activeEditor: ctx.sessions.active.name,
+          editorCount: ctx.sessions.size,
+        };
       },
     },
     get_info: {
@@ -296,7 +520,7 @@ export const projectTool: ToolDef = categoryTool(
       },
     },
     search_engine_cpp: {
-      description: "Search engine .h/.cpp/.inl files across Runtime/Editor/Developer/Plugins. Params: query, tree? (Runtime|Editor|Developer|Plugins|all — default Runtime), subdirectory?, maxResults? (default 500)",
+      description: "Search engine .h/.cpp/.inl files across Runtime/Editor/Developer/Plugins. Params: query, tree? (Runtime|Editor|Developer|Plugins|all - default Runtime), subdirectory?, maxResults? (default 500)",
       handler: async (ctx, p) => {
         ctx.project.ensureLoaded();
         const resolvedEngineRoot = findEngineInstall(ctx.project.engineAssociation ?? null);
@@ -367,8 +591,8 @@ export const projectTool: ToolDef = categoryTool(
     },
     execute_python_report: {
       description: "Measurement for #704: reads this session's execute_python calls and, for each, runs its taskSummary back through search_tools to flag calls that OVERLAPPED an existing dedicated action ('you used Python for X, but tool Y does X'). Returns totalCalls, overlapping[] and an overlapRate. Params: none (#704)",
-      handler: async () => {
-        const entries = getWorkarounds();
+      handler: async (ctx) => {
+        const entries = getWorkarounds(ctx);
         const overlapping: Array<{ taskSummary: string; suggestion: ToolSearchHit; codeSnippet: string }> = [];
         for (const e of entries) {
           const q = (e.taskSummary ?? "").trim();
@@ -422,13 +646,13 @@ export const projectTool: ToolDef = categoryTool(
     build: bp("Build C++ project. Params: configuration?, platform?, clean?", "build_project"),
     generate_project_files: bp("Generate IDE project files (Visual Studio, Xcode, etc.)", "generate_project_files"),
 
-    // v0.7.13 — native C++ authoring. Bridge handlers wrap
+    // v0.7.13 - native C++ authoring. Bridge handlers wrap
     // GameProjectUtils / ILiveCodingModule (same APIs used by the editor's
     // File → New C++ Class and Live Coding menus).
     create_cpp_class: {
       description: "Create a new native UCLASS in a project module. Uses the same engine template path as File → New C++ Class. Writes .h + .cpp; returns both paths plus needsEditorRestart (true unless Live Coding successfully hot-reloaded). Params: className (no prefix), parentClass? (default UObject; accepts short names like 'Actor' or /Script/<Module>.<Class> paths), moduleName? (default: first project module, use list_project_modules to pick), classDomain? ('public'|'private'|'classes', default public), subPath?",
       bridge: "create_cpp_class",
-      // AddCodeToProject regenerates IDE project files synchronously — can
+      // AddCodeToProject regenerates IDE project files synchronously - can
       // easily exceed the default 30-second cap on first use.
       timeoutMs: 300_000,
       mapParams: (p) => ({
@@ -455,7 +679,7 @@ export const projectTool: ToolDef = categoryTool(
       (p) => ({ moduleName: p.moduleName }),
     ),
     live_coding_compile: {
-      description: "Trigger a Live Coding compile (Windows only). Hot-patches method bodies of existing UCLASSes without editor restart — the fast inner loop for UFUNCTION implementations. Does NOT reliably register brand-new UCLASSes; use build_project + editor restart for those. Params: wait? (default false — fire and return 'in_progress').",
+      description: "Trigger a Live Coding compile (Windows only). Hot-patches method bodies of existing UCLASSes without editor restart - the fast inner loop for UFUNCTION implementations. Does NOT reliably register brand-new UCLASSes; use build_project + editor restart for those. Params: wait? (default false - fire and return 'in_progress').",
       bridge: "live_coding_compile",
       timeoutMs: 300_000,
       mapParams: (p) => ({ wait: p.wait }),
@@ -573,7 +797,7 @@ export const projectTool: ToolDef = categoryTool(
     },
     add_module_dependency: {
       description:
-        "Add a module to a target module's Build.cs dependency array. Params: moduleName (the Build.cs to edit — must exist in the project), dependency (module name to add, e.g. 'UMG'), access? ('public'|'private', default 'private'). Creates the corresponding AddRange block if missing. Rebuild required afterward.",
+        "Add a module to a target module's Build.cs dependency array. Params: moduleName (the Build.cs to edit - must exist in the project), dependency (module name to add, e.g. 'UMG'), access? ('public'|'private', default 'private'). Creates the corresponding AddRange block if missing. Rebuild required afterward.",
       handler: async (ctx, p) => {
         ctx.project.ensureLoaded();
         const moduleName = p.moduleName as string;
@@ -611,7 +835,7 @@ export const projectTool: ToolDef = categoryTool(
           // Insert a new AddRange block before the closing brace of the ModuleRules ctor.
           const ctorCloseRe = /(\n\s*\}\s*\n\s*\})\s*$/;
           if (!ctorCloseRe.test(content)) {
-            throw new Error(`Could not locate module ctor in ${buildCs} — edit manually.`);
+            throw new Error(`Could not locate module ctor in ${buildCs} - edit manually.`);
           }
           const newBlock = `\n\t\t${fieldName}.AddRange(\n\t\t\tnew string[]\n\t\t\t{\n\t\t\t\t"${dependency}",\n\t\t\t}\n\t\t);\n`;
           content = content.replace(ctorCloseRe, `${newBlock}$1`);
@@ -719,7 +943,11 @@ export const projectTool: ToolDef = categoryTool(
   },
   undefined,
   {
-    projectPath: z.string().optional().describe("For set_project: path to .uproject"),
+    projectPath: z.string().optional().describe("For set_project / add_editor: path to .uproject"),
+    editorName: z.string().optional().describe("For add_editor: name to address the new session by (default the project name) (#817)"),
+    editorTarget: z.string().optional().describe("For use_editor / drop_editor: session name, project name, or .uproject path (#817)"),
+    start: z.boolean().optional().describe("For add_editor: launch the editor for that project and wait until it is ready (#817)"),
+    timeout: z.number().optional().describe("For add_editor with start: seconds to wait for readiness (default 300)"),
     configName: z.string().optional().describe("For read_config/set_config: config file name"),
     query: z.string().optional().describe("For search_config/search_cpp: search text"),
     headerPath: z.string().optional().describe("For read_cpp_header: path to .h file"),
@@ -741,8 +969,8 @@ export const projectTool: ToolDef = categoryTool(
     tree: z.string().optional().describe("For search_engine_cpp: Runtime|Editor|Developer|Plugins|all (default Runtime)"),
     subdirectory: z.string().optional().describe("For search_engine_cpp: subdirectory within the chosen tree"),
 
-    // v0.7.13 — native C++ authoring
-    className: z.string().optional().describe("For create_cpp_class: new class name (no A/U prefix — handled by parent type)"),
+    // v0.7.13 - native C++ authoring
+    className: z.string().optional().describe("For create_cpp_class: new class name (no A/U prefix - handled by parent type)"),
     parentClass: z.string().optional().describe("For create_cpp_class: parent UClass. Short native names ('Actor') or /Script/<Module>.<Class> paths work. Default UObject."),
     classDomain: z.enum(["public", "private", "classes"]).optional().describe("For create_cpp_class: which folder under the module (Public/Private/Classes). Default 'public'."),
     subPath: z.string().optional().describe("For create_cpp_class: nested folder under the class domain (e.g. 'Gameplay/Abilities')."),

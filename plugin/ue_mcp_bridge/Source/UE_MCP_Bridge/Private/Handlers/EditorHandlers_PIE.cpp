@@ -4,13 +4,17 @@
 // stays in EditorHandlers.cpp::RegisterHandlers.
 
 #include "EditorHandlers.h"
+#include "UE_MCP_BridgeModule.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+
+#include "UObject/GCObjectScopeGuard.h"
 #include "HandlerJsonProperty.h"
 #include "JsonSerializer.h"
 #include "Containers/Ticker.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
+#include "Engine/Blueprint.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
@@ -23,16 +27,96 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "Modules/ModuleManager.h"
+#include "UObject/Script.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/UObjectIterator.h"
 #include "UObject/UnrealType.h"
 #include "UObject/Package.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Settings/LevelEditorPlaySettings.h"
 
 namespace
 {
+	static FDelegateHandle IgnoreErrorsPostPIEHandle;
+	static FDelegateHandle IgnoreErrorsEndPIEHandle;
+	static FTSTicker::FDelegateHandle IgnoreErrorsTimeoutHandle;
+	static bool bIgnoreErrorsBypassArmed = false;
+	static TArray<TWeakObjectPtr<UBlueprint>> SuppressedBlueprintWarnings;
+
+	static void RestoreIgnoreBlueprintErrorsState(bool bFromTimeoutTicker = false)
+	{
+		if (!bIgnoreErrorsBypassArmed)
+		{
+			return;
+		}
+
+		for (const TWeakObjectPtr<UBlueprint>& Blueprint : SuppressedBlueprintWarnings)
+		{
+			if (Blueprint.IsValid())
+			{
+				Blueprint->bDisplayCompilePIEWarning = true;
+			}
+		}
+		SuppressedBlueprintWarnings.Reset();
+		bIgnoreErrorsBypassArmed = false;
+
+		if (IgnoreErrorsPostPIEHandle.IsValid())
+		{
+			FEditorDelegates::PostPIEStarted.Remove(IgnoreErrorsPostPIEHandle);
+			IgnoreErrorsPostPIEHandle.Reset();
+		}
+		if (IgnoreErrorsEndPIEHandle.IsValid())
+		{
+			FEditorDelegates::EndPIE.Remove(IgnoreErrorsEndPIEHandle);
+			IgnoreErrorsEndPIEHandle.Reset();
+		}
+		if (!bFromTimeoutTicker && IgnoreErrorsTimeoutHandle.IsValid())
+		{
+			FTSTicker::GetCoreTicker().RemoveTicker(IgnoreErrorsTimeoutHandle);
+		}
+		IgnoreErrorsTimeoutHandle.Reset();
+	}
+
+	static void ArmIgnoreBlueprintErrorsForNextPIELaunch(const TArray<UBlueprint*>& Blueprints)
+	{
+		SuppressedBlueprintWarnings.Reset(Blueprints.Num());
+		for (UBlueprint* Blueprint : Blueprints)
+		{
+			Blueprint->bDisplayCompilePIEWarning = false;
+			SuppressedBlueprintWarnings.Add(Blueprint);
+		}
+		bIgnoreErrorsBypassArmed = true;
+
+		IgnoreErrorsPostPIEHandle = FEditorDelegates::PostPIEStarted.AddLambda(
+			[](bool) { RestoreIgnoreBlueprintErrorsState(); });
+		IgnoreErrorsEndPIEHandle = FEditorDelegates::EndPIE.AddLambda(
+			[](bool) { RestoreIgnoreBlueprintErrorsState(); });
+
+		const double Deadline = FPlatformTime::Seconds() + 30.0;
+		IgnoreErrorsTimeoutHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateLambda([Deadline](float)
+			{
+				if (FPlatformTime::Seconds() < Deadline)
+				{
+					return true;
+				}
+				RestoreIgnoreBlueprintErrorsState(true);
+				return false;
+			}));
+	}
+
+	// The server decides *whether* a caller may bypass the Blueprint-error
+	// prompt (standing config opt-in, or a live approval prompt answered by
+	// the user) and names the source here. The bridge cannot re-derive user
+	// consent, so it records the source and refuses anything it does not
+	// recognize rather than pretending to re-check it.
+	static bool IsRecognizedBypassAuthorization(const FString& Source)
+	{
+		return Source == TEXT("user_approval") || Source == TEXT("config");
+	}
+
 	static ULevelEditorPlaySettings* GetPlaySettingsForRW()
 	{
 		return GetMutableDefault<ULevelEditorPlaySettings>();
@@ -169,6 +253,103 @@ TSharedPtr<FJsonValue> FEditorHandlers::PieControl(const TSharedPtr<FJsonObject>
 			Result->SetBoolField(TEXT("waitedForAssetRegistry"), true);
 		}
 
+		bool bIgnoreBlueprintErrors = false;
+		Params->TryGetBoolField(TEXT("ignoreBlueprintErrors"), bIgnoreBlueprintErrors);
+		if (bIgnoreBlueprintErrors)
+		{
+			if (bIgnoreErrorsBypassArmed)
+			{
+				return MCPError(TEXT("A Blueprint-error bypass PIE launch is already pending"));
+			}
+
+			FString AuthorizationSource;
+			Params->TryGetStringField(TEXT("authorizationSource"), AuthorizationSource);
+			if (!IsRecognizedBypassAuthorization(AuthorizationSource))
+			{
+				return MCPError(TEXT("Blueprint-error bypass requires authorizationSource=user_approval (an approval prompt the user accepted) or authorizationSource=config (a standing ue-mcp.pie.allowIgnoreBlueprintErrors opt-in). Call editor(play_in_editor_ignore_blueprint_errors) rather than pie_control directly."));
+			}
+
+			TArray<UBlueprint*> BlueprintsToSuppress;
+			TArray<TSharedPtr<FJsonValue>> ErroredBlueprints;
+			TArray<TSharedPtr<FJsonValue>> MustCompileBlueprints;
+			for (TObjectIterator<UBlueprint> It; It; ++It)
+			{
+				UBlueprint* Blueprint = *It;
+				if (!IsValid(Blueprint))
+				{
+					continue;
+				}
+
+				// PIE recompiles every non-data Blueprint that IsPossiblyDirty()
+				// reports, which covers BS_Unknown as well as BS_Dirty. Those
+				// compiles can produce brand new errors after this handler has
+				// already decided what to suppress, so refuse them instead of
+				// arming a bypass that would not cover the result.
+				const bool bWillCompileBecauseDirty =
+					!FBlueprintEditorUtils::IsDataOnlyBlueprint(Blueprint)
+					&& Blueprint->IsPossiblyDirty();
+				const bool bErroredLevelBlueprint =
+					FBlueprintEditorUtils::IsLevelScriptBlueprint(Blueprint)
+					&& Blueprint->Status == BS_Error;
+				if (bWillCompileBecauseDirty || bErroredLevelBlueprint)
+				{
+					MustCompileBlueprints.Add(MakeShared<FJsonValueString>(Blueprint->GetPathName()));
+				}
+				else if (Blueprint->Status == BS_Error && Blueprint->bDisplayCompilePIEWarning)
+				{
+					ErroredBlueprints.Add(MakeShared<FJsonValueString>(Blueprint->GetPathName()));
+					BlueprintsToSuppress.Add(Blueprint);
+				}
+			}
+
+			if (!MustCompileBlueprints.IsEmpty())
+			{
+				TSharedPtr<FJsonObject> Blocked = MakeShared<FJsonObject>();
+				Blocked->SetBoolField(TEXT("success"), false);
+				Blocked->SetBoolField(TEXT("blocked"), true);
+				Blocked->SetStringField(TEXT("code"), TEXT("blueprints_require_compile"));
+				Blocked->SetStringField(
+					TEXT("error"),
+					TEXT("Blueprint-error bypass only applies to already-compiled, saved Blueprint errors. Compile and save the listed dirty or errored Level Blueprints first."));
+				Blocked->SetArrayField(TEXT("blueprints"), MustCompileBlueprints);
+				return MCPResult(Blocked);
+			}
+
+			// Nothing errored: this is an ordinary PIE start. Arming anyway
+			// would hold the single-bypass slot for 30s and claim a launch ran
+			// on broken Blueprints when none exist.
+			const bool bArmed = !BlueprintsToSuppress.IsEmpty();
+			if (bArmed)
+			{
+				ArmIgnoreBlueprintErrorsForNextPIELaunch(BlueprintsToSuppress);
+				UE_LOG(LogMCPBridge, Warning,
+					TEXT("PIE starting with the Blueprint compiler-error prompt suppressed for %d Blueprint(s) (authorization: %s). PIE may run stale or invalid Blueprint bytecode."),
+					BlueprintsToSuppress.Num(), *AuthorizationSource);
+				for (const UBlueprint* Blueprint : BlueprintsToSuppress)
+				{
+					UE_LOG(LogMCPBridge, Warning, TEXT("  suppressed Blueprint error: %s"), *Blueprint->GetPathName());
+				}
+			}
+
+			Result->SetBoolField(TEXT("ignoredBlueprintErrors"), bArmed);
+			Result->SetNumberField(TEXT("ignoredBlueprintErrorCount"), BlueprintsToSuppress.Num());
+			Result->SetStringField(TEXT("authorizationSource"), AuthorizationSource);
+			Result->SetArrayField(TEXT("loadedErroredBlueprints"), ErroredBlueprints);
+			Result->SetStringField(
+				TEXT("warning"),
+				bArmed
+					? TEXT("PIE may run stale or invalid Blueprint bytecode. Suppressed warning flags are restored after this PIE launch is processed.")
+					: TEXT("No loaded Blueprint was in an error state, so nothing was suppressed. This was an ordinary PIE start."));
+		}
+		else if (bIgnoreErrorsBypassArmed)
+		{
+			// An earlier bypass never reached PIE (the launch was refused
+			// somewhere else) and its watchdog has not fired yet. Restore the
+			// warning flags now so this ordinary start cannot silently inherit
+			// a suppression nobody authorized it to use.
+			RestoreIgnoreBlueprintErrorsState();
+		}
+
 		FRequestPlaySessionParams SessionParams;
 		GEditor->RequestPlaySession(SessionParams);
 		Result->SetStringField(TEXT("action"), Action);
@@ -218,8 +399,9 @@ TSharedPtr<FJsonValue> FEditorHandlers::PieGetRuntimeValue(const TSharedPtr<FJso
 	FString PropertyName;
 	if (auto Err = RequireString(Params, TEXT("propertyName"), PropertyName)) return Err;
 
-	// Search for the actor in the PIE world (accept label, name, or full path)
-	UWorld* PIEWorld = GEditor->PlayWorld;
+	// Search for the actor in the PIE world (accept label, name, or full path).
+	// #778: honour pieInstance so a client world is reachable.
+	UWorld* PIEWorld = ResolveWorldFromParams(Params, TEXT("pie"));
 	AActor* TargetActor = FindActorByLabelNameOrPath(PIEWorld, ActorPath);
 
 	if (!TargetActor)
@@ -559,7 +741,13 @@ namespace
 					{
 						It->InitializeValue_InContainer(Frame);
 					}
-					CurObject->ProcessEvent(Fn, Frame);
+					{
+						// #806: without this guard an actor getter called against
+						// the editor world is skipped and the zeroed frame reads
+						// back as a real value.
+						FEditorScriptExecutionGuard ScriptGuard;
+						CurObject->ProcessEvent(Fn, Frame);
+					}
 					FProperty* RetProp = Fn->GetReturnProperty();
 					if (RetProp)
 					{
@@ -616,16 +804,10 @@ TSharedPtr<FJsonValue> FEditorHandlers::GetRuntimeValues(const TSharedPtr<FJsonO
 	}
 	if (Paths.Num() == 0) return MCPError(TEXT("'paths' must contain at least one non-empty string"));
 
-	const FString WorldHint = OptionalString(Params, TEXT("world"));
-	UWorld* World = nullptr;
-	if (WorldHint == TEXT("editor") || !GEditor->PlayWorld)
-	{
-		World = (UWorld*)GEditor->GetEditorWorldContext().World();
-	}
-	else
-	{
-		World = (UWorld*)GEditor->PlayWorld;
-	}
+	// #778: was GEditor->PlayWorld, which is always the primary/server world.
+	const FString WorldHint = OptionalString(Params, TEXT("world"), TEXT("auto"));
+	UWorld* World = ResolveWorldFromParams(Params, *WorldHint);
+	if (!World) World = (UWorld*)GEditor->GetEditorWorldContext().World();
 	if (!World) return MCPError(TEXT("No world available"));
 
 	TArray<TSharedPtr<FJsonValue>> Rows;
@@ -714,7 +896,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetPieTimeScale(const TSharedPtr<FJsonOb
 	UWorld* World = GetPIEWorld();
 	if (!World)
 	{
-		return MCPError(TEXT("No PIE/Game world active — start PIE first"));
+		return MCPError(TEXT("No PIE/Game world active - start PIE first"));
 	}
 
 	AWorldSettings* WS = World->GetWorldSettings();
@@ -803,28 +985,54 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 	FString ActorLabel;
 	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
 
+	// #778: this used GEditor->GetPIEWorldContext(), which is always the
+	// primary (server) context, so 'pieInstance' could never reach it and a
+	// client world was unaddressable. Route through the shared resolver.
 	const FString WorldScope = OptionalString(Params, TEXT("world"), TEXT("editor")).ToLower();
-	UWorld* World = nullptr;
-	if (WorldScope == TEXT("pie"))
+	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
+	if (!World)
 	{
-		FWorldContext* PieCtx = GEditor ? GEditor->GetPIEWorldContext() : nullptr;
-		World = PieCtx ? PieCtx->World() : nullptr;
-		if (!World) return MCPError(TEXT("PIE not running - cannot invoke against PIE world"));
+		return MCPError(WorldScope == TEXT("pie")
+			? TEXT("PIE not running (or no such pieInstance) - cannot invoke against PIE world. See editor(list_pie_instances).")
+			: TEXT("No editor world available"));
 	}
-	else
-	{
-		World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
-		if (!World) return MCPError(TEXT("No editor world available"));
-	}
+
+	// Describe the world that was actually resolved, not the requested scope:
+	// world="auto" resolves to PIE when a session is running.
+	const FString WorldLabel = World->IsPlayInEditor() ? TEXT("PIE") : TEXT("editor");
 
 	// #654: also match internal UObject name and full path so unlabeled actors
 	// (e.g. AI controllers spawned at runtime, which have no editor label) can
 	// be targeted, not just editor-labelled placed actors.
+	// #806: the lookup walks the placed instances of the resolved world in a
+	// fixed label -> name -> path order, and a miss is an error. There is no
+	// class-default fallback here and there must never be one: a default object
+	// answers every call with default state, which reads as success.
 	AActor* Target = FindActorByLabelNameOrPath(World, ActorLabel);
 	if (!Target)
 	{
-		return MCPError(FString::Printf(TEXT("Actor not found in %s world (matched by label, name, or path): %s"), WorldScope == TEXT("pie") ? TEXT("PIE") : TEXT("editor"), *ActorLabel));
+		return MCPError(MCPDescribeActorLookupMiss(World, ActorLabel, WorldLabel));
 	}
+	// Defensive: the lookup iterates placed actors, so neither of these can fire
+	// today. They exist so that a future change which lets an archetype or an
+	// actor from another world through fails loudly instead of quietly
+	// answering from default state, which is the failure this issue reported.
+	if (Target->HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject))
+	{
+		return MCPError(FString::Printf(
+			TEXT("'%s' resolved to a class default object, not a placed actor. Refusing the call: a default object would answer from default state and report success."),
+			*ActorLabel));
+	}
+	if (Target->GetWorld() != World)
+	{
+		return MCPError(FString::Printf(
+			TEXT("'%s' resolved to an actor outside the %s world. Refusing the call."),
+			*ActorLabel, *WorldLabel));
+	}
+	// Read now: the call below can destroy the actor, and the response says
+	// which instance ran it.
+	const FString ResolvedActorLabel = Target->GetActorLabel();
+	const FString ResolvedActorPath = Target->GetPathName();
 
 	// #382: optional `component` redirects the call target to a named subobject
 	// (e.g. invoke `Server_Deconstruct` on the actor's BuildModeComponent).
@@ -926,8 +1134,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 				}
 				return MCPError(FString::Printf(
 					TEXT("actorArgs[%s]: actor '%s' not found in %s world"),
-					*P->GetName(), *ActorArgLabel,
-					WorldScope == TEXT("pie") ? TEXT("PIE") : TEXT("editor")));
+					*P->GetName(), *ActorArgLabel, *WorldLabel));
 			}
 			if (!RefActor->IsA(OP->PropertyClass))
 			{
@@ -959,10 +1166,30 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 		}
 	}
 
-	CallTarget->ProcessEvent(Func, ParamBuf.GetData());
+	// ProcessEvent can run arbitrary game code, including code that tears down
+	// the world and collects garbage, and CallTarget is read again below.
+	FGCObjectScopeGuard CallTargetGuard(CallTarget);
+	// #806: AActor::ProcessEvent refuses to run script in a world whose actors
+	// were never initialised for play, which is every editor world, unless the
+	// function is marked CallInEditor. The refusal is silent: the parameter
+	// frame stays zero-initialised and those zeros are then exported as if they
+	// were the answer, so K2_GetActorLocation on a placed actor reported
+	// (X=0,Y=0,Z=0) with success. FEditorScriptExecutionGuard opens the same
+	// gate the editor itself uses for CallInEditor functions, for this call
+	// only, so the placed instance actually runs the function.
+	{
+		FEditorScriptExecutionGuard ScriptGuard;
+		CallTarget->ProcessEvent(Func, ParamBuf.GetData());
+	}
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	// #806: report the instance that ran the call. The reported defect was a
+	// call that looked successful while answering from somewhere other than the
+	// placed actor, and there was nothing in the response to see that with.
+	Result->SetStringField(TEXT("resolvedActorLabel"), ResolvedActorLabel);
+	Result->SetStringField(TEXT("resolvedActorPath"), ResolvedActorPath);
+	Result->SetStringField(TEXT("world"), WorldLabel);
 	if (!ComponentName.IsEmpty()) Result->SetStringField(TEXT("component"), ComponentName);
 	Result->SetStringField(TEXT("functionName"), FunctionName);
 
@@ -972,6 +1199,19 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 		FProperty* P = *It;
 		if (P->PropertyFlags & (CPF_ReturnParm | CPF_OutParm))
 		{
+			// ParamBuf is raw bytes and invisible to GC, so an object out-param
+			// the call destroyed would be dereferenced by ExportTextItem_Direct.
+			// The scope guard above covers the target, not the results.
+			if (FObjectPropertyBase* OP = CastField<FObjectPropertyBase>(P))
+			{
+				UObject* Out = OP->GetObjectPropertyValue(OP->ContainerPtrToValuePtr<void>(ParamBuf.GetData()));
+				if (!Out) { OutVals->SetStringField(P->GetName(), TEXT("None")); continue; }
+				if (!IsValid(Out))
+				{
+					OutVals->SetStringField(P->GetName(), TEXT("(collected during the call)"));
+					continue;
+				}
+			}
 			FString S;
 			P->ExportTextItem_Direct(S, P->ContainerPtrToValuePtr<void>(ParamBuf.GetData()), nullptr, CallTarget, PPF_None);
 			OutVals->SetStringField(P->GetName(), S);
@@ -1009,8 +1249,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeStaticFunction(const TSharedPtr<FJ
 	UWorld* World = nullptr;
 	if (WorldScope == TEXT("pie"))
 	{
-		FWorldContext* PieCtx = GEditor ? GEditor->GetPIEWorldContext() : nullptr;
-		World = PieCtx ? PieCtx->World() : nullptr;
+		World = ResolveWorldFromParams(Params, TEXT("pie"));
 		if (!World) return MCPError(TEXT("PIE not running - cannot invoke against PIE world"));
 	}
 	else
@@ -1142,6 +1381,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeStaticFunction(const TSharedPtr<FJ
 		}
 	}
 
+	FGCObjectScopeGuard CDOGuard(CDO);
 	CDO->ProcessEvent(Func, ParamBuf.GetData());
 
 	auto Result = MCPSuccess();
@@ -1154,6 +1394,19 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeStaticFunction(const TSharedPtr<FJ
 		FProperty* P = *It;
 		if (P->PropertyFlags & (CPF_ReturnParm | CPF_OutParm))
 		{
+			// ParamBuf is raw bytes and invisible to GC, so an object out-param
+			// the call destroyed would be dereferenced by ExportTextItem_Direct.
+			// The scope guard above covers the CDO, not the results.
+			if (FObjectPropertyBase* OP = CastField<FObjectPropertyBase>(P))
+			{
+				UObject* Out = OP->GetObjectPropertyValue(OP->ContainerPtrToValuePtr<void>(ParamBuf.GetData()));
+				if (!Out) { OutVals->SetStringField(P->GetName(), TEXT("None")); continue; }
+				if (!IsValid(Out))
+				{
+					OutVals->SetStringField(P->GetName(), TEXT("(collected during the call)"));
+					continue;
+				}
+			}
 			FString S;
 			P->ExportTextItem_Direct(S, P->ContainerPtrToValuePtr<void>(ParamBuf.GetData()), nullptr, CDO, PPF_None);
 			OutVals->SetStringField(P->GetName(), S);
@@ -1303,64 +1556,6 @@ TSharedPtr<FJsonValue> FEditorHandlers::StageGameInput(const TSharedPtr<FJsonObj
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("inputMode"), Mode);
 	Result->SetBoolField(TEXT("showMouseCursor"), bShowCursor);
-	return MCPResult(Result);
-}
-
-// #583: fire a parameterless UFUNCTION on an actor repeatedly at an interval
-// for sustained on-demand triggering (human visual verification). Returns
-// immediately; a game-thread ticker drives the remaining calls in the
-// background and unregisters itself when the count is exhausted or the actor
-// goes away.
-TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunctionRepeating(const TSharedPtr<FJsonObject>& Params)
-{
-	FString FunctionName;
-	if (auto Err = RequireString(Params, TEXT("functionName"), FunctionName)) return Err;
-	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
-
-	const FString WorldScope = OptionalString(Params, TEXT("world"), TEXT("auto")).ToLower();
-	UWorld* World = ResolveWorldScope(WorldScope);
-	if (!World) return MCPError(TEXT("World not available"));
-
-	AActor* Target = FindActorByLabelNameOrPath(World, ActorLabel);
-	if (!Target) return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
-
-	UFunction* Func = Target->FindFunction(FName(*FunctionName));
-	if (!Func) return MCPError(FString::Printf(TEXT("Function '%s' not found on '%s'"), *FunctionName, *Target->GetClass()->GetName()));
-	if (Func->NumParms != 0) return MCPError(FString::Printf(TEXT("Function '%s' takes parameters; only parameterless functions are supported for repeating invoke"), *FunctionName));
-
-	const double Interval = FMath::Max(0.05, OptionalNumber(Params, TEXT("intervalSeconds"), 1.0));
-	const int32 Count = FMath::Clamp(OptionalInt(Params, TEXT("count"), 5), 1, 10000);
-
-	// Fire once immediately, then schedule the rest.
-	Target->ProcessEvent(Func, nullptr);
-	int32 Remaining = Count - 1;
-
-	if (Remaining > 0)
-	{
-		TWeakObjectPtr<AActor> WeakActor(Target);
-		const FString FnName = FunctionName;
-		TSharedRef<int32> RemainingRef = MakeShared<int32>(Remaining);
-		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
-			[WeakActor, FnName, RemainingRef](float) -> bool
-			{
-				AActor* A = WeakActor.Get();
-				if (!A) return false; // actor gone -> stop
-				if (UFunction* F = A->FindFunction(FName(*FnName)))
-				{
-					A->ProcessEvent(F, nullptr);
-				}
-				(*RemainingRef)--;
-				return (*RemainingRef) > 0; // continue until exhausted
-			}), (float)Interval);
-	}
-
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("actorLabel"), Target->GetActorLabel());
-	Result->SetStringField(TEXT("functionName"), FunctionName);
-	Result->SetNumberField(TEXT("count"), Count);
-	Result->SetNumberField(TEXT("intervalSeconds"), Interval);
-	Result->SetStringField(TEXT("note"), TEXT("Fired once now; remaining calls run in the background at the interval."));
 	return MCPResult(Result);
 }
 

@@ -487,7 +487,7 @@ TSharedPtr<FJsonValue> FChooserHandlers::AddRow(const TSharedPtr<FJsonObject>& P
 	UChooserTable* Table = LoadChooserTable(TablePath);
 	if (!Table) return MCPError(FString::Printf(TEXT("ChooserTable not found: %s"), *TablePath));
 
-	// Build the output struct (optional — a row can start with no output).
+	// Build the output struct (optional - a row can start with no output).
 	FInstancedStruct OutputStruct;
 	OutputStruct.InitializeAs<FAssetChooser>();
 	const FString OutputPath = OptionalString(Params, TEXT("output"));
@@ -684,4 +684,6 @@ void FChooserHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("chooser_add_row"), &AddRow);
 	Registry.RegisterHandler(TEXT("chooser_set_row"), &SetRow);
 	Registry.RegisterHandler(TEXT("chooser_delete_row"), &DeleteRow);
+	Registry.RegisterHandler(TEXT("chooser_list_object_references"), &ListObjectReferences);
+	Registry.RegisterHandler(TEXT("chooser_remap_object_references"), &RemapObjectReferences);
 }

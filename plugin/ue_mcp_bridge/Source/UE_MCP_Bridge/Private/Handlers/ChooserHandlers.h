@@ -4,7 +4,7 @@
 #include "Dom/JsonValue.h"
 #include "Dom/JsonObject.h"
 
-// #685 — ChooserTable (UChooserTable) row authoring. Chooser tables are the
+// #685 - ChooserTable (UChooserTable) row authoring. Chooser tables are the
 // data-driven selection layer behind Motion Matching (a chooser maps character
 // state to which PoseSearchDatabase to search). The engine stores columns/rows
 // as instanced structs with no scripting entry point, so extending a chooser
@@ -23,4 +23,7 @@ private:
 	static TSharedPtr<FJsonValue> AddRow(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetRow(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteRow(const TSharedPtr<FJsonObject>& Params);
+	// #754: read and repoint object references inside nested chooser tables.
+	static TSharedPtr<FJsonValue> ListObjectReferences(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RemapObjectReferences(const TSharedPtr<FJsonObject>& Params);
 };

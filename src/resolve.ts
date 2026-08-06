@@ -9,6 +9,7 @@ import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { takeEditorTarget, EditorFlagError } from "./editor-flag.js";
 
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
@@ -45,7 +46,28 @@ function currentBranch(): string {
 /* ── Main ────────────────────────────────────────────────────────── */
 
 async function resolve() {
-  const args = process.argv.slice(3);
+  // --editor picks which of this server's editors the workflow runs in. Every
+  // git and gh call below inherits the process cwd, so the target is applied
+  // by moving there once, before any of them run.
+  let target: { projectPath?: string; rest: string[] };
+  try {
+    target = takeEditorTarget(process.argv.slice(3));
+  } catch (e) {
+    fail(e instanceof EditorFlagError ? e.message : String(e));
+    return;
+  }
+  if (target.projectPath) {
+    const dir = target.projectPath.toLowerCase().endsWith(".uproject")
+      ? path.dirname(target.projectPath)
+      : target.projectPath;
+    try {
+      process.chdir(dir);
+      ok(`Working in ${dir}`);
+    } catch (e) {
+      fail(`Could not enter ${dir}: ${e instanceof Error ? e.message : e}`);
+    }
+  }
+  const args = target.rest;
   const ciMode = args.includes("--ci") || !!process.env.CI;
   const issueArg = args.find((a) => !a.startsWith("-"));
   const issueNum = Number(issueArg);
@@ -137,9 +159,9 @@ async function resolve() {
     `## Codebase`,
     ``,
     `This is a TypeScript MCP server for Unreal Engine with a C++ plugin.`,
-    `- src/tools/ — tool handlers (one file per category)`,
-    `- src/ — core server (bridge.ts, types.ts, index.ts, instructions.ts)`,
-    `- plugin/ — C++ Unreal Engine plugin source`,
+    `- src/tools/ - tool handlers (one file per category)`,
+    `- src/ - core server (bridge.ts, types.ts, index.ts, instructions.ts)`,
+    `- plugin/ - C++ Unreal Engine plugin source`,
     `- Read CLAUDE.md for project conventions.`,
     ``,
     `## Instructions`,

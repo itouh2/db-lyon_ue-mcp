@@ -52,11 +52,11 @@ private:
 	static TSharedPtr<FJsonValue> GetActorsByClass(const TSharedPtr<FJsonObject>& Params);
 	// #582 find actors that own a component of a given class
 	static TSharedPtr<FJsonValue> GetActorsByComponentClass(const TSharedPtr<FJsonObject>& Params);
-	// v0.7.19 issue #146 — actor class histogram (counts by class name)
+	// v0.7.19 issue #146 - actor class histogram (counts by class name)
 	static TSharedPtr<FJsonValue> CountActorsByClass(const TSharedPtr<FJsonObject>& Params);
-	// v0.7.19 issue #150 — RuntimeVirtualTextureVolume / component summary
+	// v0.7.19 issue #150 - RuntimeVirtualTextureVolume / component summary
 	static TSharedPtr<FJsonValue> GetRVTSummary(const TSharedPtr<FJsonObject>& Params);
-	// v0.7.19 issue #151 — set WaterBodyComponent property via runtime class lookup
+	// v0.7.19 issue #151 - set WaterBodyComponent property via runtime class lookup
 	static TSharedPtr<FJsonValue> SetWaterBodyProperty(const TSharedPtr<FJsonObject>& Params);
 	// #188: get actor origin + extent bounds
 	static TSharedPtr<FJsonValue> GetActorBounds(const TSharedPtr<FJsonObject>& Params);
@@ -66,6 +66,16 @@ private:
 	static TSharedPtr<FJsonValue> SetActorProperty(const TSharedPtr<FJsonObject>& Params);
 	// #220: bulk delete actors by label prefix / class / tag
 	static TSharedPtr<FJsonValue> DeleteActors(const TSharedPtr<FJsonObject>& Params);
+	// Safely delete actors with exact editor labels across explicit level
+	// packages. Defaults to a dry run and saves only levels changed by a
+	// committed request.
+	static TSharedPtr<FJsonValue> DeleteExactLabeledActorsInLevels(const TSharedPtr<FJsonObject>& Params);
+	// #767: bulk-assign World Outliner folder paths in one transaction.
+	static TSharedPtr<FJsonValue> SetActorFolderPath(const TSharedPtr<FJsonObject>& Params);
+	// #746: World Partition actor descriptors - see unloaded actors and stream
+	// them in, instead of every actor query silently reporting zero for them.
+	static TSharedPtr<FJsonValue> ListActorDescs(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> LoadActorDescs(const TSharedPtr<FJsonObject>& Params);
 	// #219: actor tag CRUD
 	static TSharedPtr<FJsonValue> AddActorTag(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveActorTag(const TSharedPtr<FJsonObject>& Params);
@@ -74,6 +84,10 @@ private:
 	// #205: actor attach/detach + mobility
 	static TSharedPtr<FJsonValue> AttachActor(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DetachActor(const TSharedPtr<FJsonObject>& Params);
+	// Attach an exact named/root SceneComponent to an exact named/root parent
+	// SceneComponent, optionally at a validated socket.
+	static TSharedPtr<FJsonValue> AttachComponent(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> DetachComponent(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetActorMobility(const TSharedPtr<FJsonObject>& Params);
 	// #204: edit-level current sub-level
 	static TSharedPtr<FJsonValue> GetCurrentEditLevel(const TSharedPtr<FJsonObject>& Params);

@@ -2,6 +2,8 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 
+#include "VolumeHelpers_Internal.h"
+
 // Core / Editor
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
@@ -388,7 +390,7 @@ AActor* FDemoHandlers::SpawnPointLight(const FString& Label, FVector Location,
 	UPointLightComponent* Comp = Light->PointLightComponent;
 	if (Comp)
 	{
-		// Movable mobility — purely dynamic light, no lightmap bake required.
+		// Movable mobility - purely dynamic light, no lightmap bake required.
 		// Without this UE flags every spawned light as "lighting needs to be
 		// rebuilt" because Static is the default and the demo never bakes.
 		Comp->SetMobility(EComponentMobility::Movable);
@@ -936,7 +938,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepPostProcess()
 	return Result;
 }
 
-// Step 14: Niagara VFX — continuous particle aura above hero sphere
+// Step 14: Niagara VFX - continuous particle aura above hero sphere
 TSharedPtr<FJsonObject> FDemoHandlers::StepNiagaraVfx()
 {
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -956,7 +958,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepNiagaraVfx()
 		UEditorAssetLibrary::DeleteAsset(NiagaraAssetPath);
 	}
 
-	// Load the Fountain emitter template from engine content — a fully configured
+	// Load the Fountain emitter template from engine content - a fully configured
 	// continuous-spawn emitter with sprite renderer, velocity, lifetime, etc.
 	UNiagaraEmitter* FountainEmitter = LoadObject<UNiagaraEmitter>(
 		nullptr, TEXT("/Niagara/DefaultAssets/Templates/Emitters/Fountain.Fountain"));
@@ -1062,7 +1064,10 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepPcgScatter()
 
 	PCGVol->SetActorLabel(TEXT("Demo_PCGScatter"));
 	PCGVol->SetFolderPath(*DemoConstants::FOLDER);
-	PCGVol->SetActorScale3D(FVector(30.0, 30.0, 3.0));
+	// Scale alone leaves an AVolume's bounds at zero because a bare SpawnActor
+	// gives it no brush, so the PCG surface sampler had nothing to scatter
+	// within. Same fix spawn_volume has carried since #238.
+	UEMCP::BuildVolumeAsCube(World, PCGVol, FVector(3000.0, 3000.0, 300.0));
 
 	// Create a PCG graph directly (no factory needed)
 	UPCGComponent* PCGComp = PCGVol->FindComponentByClass<UPCGComponent>();
@@ -1101,7 +1106,7 @@ TSharedPtr<FJsonObject> FDemoHandlers::StepOrbitRings()
 	const float Height = 280.0f;
 	const int32 NumOrbs = 8;
 
-	// Spawn an invisible pivot actor at the hero sphere's height — all orbs attach to this
+	// Spawn an invisible pivot actor at the hero sphere's height - all orbs attach to this
 	FTransform PivotTransform(FRotator::ZeroRotator, FVector(0.0, 0.0, 0.0));
 	AActor* PivotActor = World->SpawnActor<AActor>(AActor::StaticClass(), PivotTransform);
 	if (!PivotActor)

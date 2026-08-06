@@ -1,15 +1,15 @@
 # CLAUDE.md
 
-Operating guide for Claude Code (and any AI agent) working in this repo. Shared team knowledge — checked into the repo so every contributor gets the same rulebook.
+Operating guide for Claude Code (and any AI agent) working in this repo. Shared team knowledge - checked into the repo so every contributor gets the same rulebook.
 
 ## Repo at a glance
 
-- **TS server** (`src/`) — the MCP server. Wraps the UE bridge over WebSocket, exposes 19 category tools with 440+ actions.
-- **C++ plugin** (`plugin/ue_mcp_bridge/`) — the editor-side bridge. Lives in `Private/Handlers/*.cpp`, registers actions with `FMCPHandlerRegistry`.
-- **Test project** (`tests/ue_mcp/`) — the dedicated UE project used for smoke testing. The plugin is deployed here from `plugin/` via the deployer. This is the **only** safe target for live tests.
-- **Docs** (`docs/`) — MkDocs site. `docs/release-notes-X.Y.Z.md` is the canonical release body.
+- **TS server** (`src/`) - the MCP server. Wraps the UE bridge over WebSocket, exposes 19 category tools with 440+ actions.
+- **C++ plugin** (`plugin/ue_mcp_bridge/`) - the editor-side bridge. Lives in `Private/Handlers/*.cpp`, registers actions with `FMCPHandlerRegistry`.
+- **Test project** (`tests/ue_mcp/`) - the dedicated UE project used for smoke testing. The plugin is deployed here from `plugin/` via the deployer. This is the **only** safe target for live tests.
+- **Docs** (`docs/`) - MkDocs site. `docs/release-notes-X.Y.Z.md` is the canonical release body.
 
-Edit only under `plugin/ue_mcp_bridge/`. The deployer syncs to `tests/ue_mcp/Plugins/UE_MCP_Bridge/` — never hand-copy.
+Edit only under `plugin/ue_mcp_bridge/`. The deployer syncs to `tests/ue_mcp/Plugins/UE_MCP_Bridge/` - never hand-copy.
 
 ## Development workflow
 
@@ -19,9 +19,17 @@ Edit only under `plugin/ue_mcp_bridge/`. The deployer syncs to `tests/ue_mcp/Plu
 - **No batching "housekeeping" commits** that sweep up everything at once. If you wrote five fixes, write five commits.
 - **Claude owns git.** Stage, commit, push when ready. Don't push the user into running git commands.
 
+#### Squash or merge commit
+
+The merge style follows the commit count, and writing five commits only to squash them back into one throws the work away.
+
+- **One logical change in the PR: squash-merge.** `gh pr merge <n> --squash --delete-branch`. Review fixups and typo passes are noise on main.
+- **Several independently meaningful commits: merge commit.** `gh pr merge <n> --merge`. Each fix keeps its own SHA, which is what issue comments cite when they say which commit closed the issue. Squashing seven fixes leaves seven issues pointing at one SHA whose message describes something else.
+- **Never rewrite a SHA that has already been cited** in an issue, a release note, or a comment. The citation is a promise that the commit exists.
+
 ### Versioning
 
-**Hard rule: patch-level bumps only.** Version bumps in this repo are always `X.Y.Z → X.Y.(Z+1)`. Never increment major or minor without explicit sign-off. This holds even for genuinely large features — the answer is still a patch bump, and if you think otherwise, ask first.
+**Hard rule: patch-level bumps only.** Version bumps in this repo are always `X.Y.Z → X.Y.(Z+1)`. Never increment major or minor without explicit sign-off. This holds even for genuinely large features - the answer is still a patch bump, and if you think otherwise, ask first.
 
 - Bump `package.json` version.
 - Commit and push. **Do not create git tags.** CI detects the version bump on `main` and publishes to npm + creates the GitHub release automatically.
@@ -29,17 +37,38 @@ Edit only under `plugin/ue_mcp_bridge/`. The deployer syncs to `tests/ue_mcp/Plu
 ### Building the plugin
 
 - TS: `npx tsc --noEmit` for type-checking, `npx tsc` for emit. Build output goes to `dist/`.
-- UE C++: `npm run build`. This calls `scripts/build.js` which invokes Unreal's Build.bat against `tests/ue_mcp/ue_mcp.uproject`.
+- UE C++: `npm run build`. This calls `scripts/build.js`, which always builds the `ue_mcpEditor` target against `tests/ue_mcp/ue_mcp.uproject` and nothing else.
+- Test builds pass `-NoEngineChanges`, so Unreal aborts with the offending file list if the build would overwrite anything already in the engine tree. Set `UE_MCP_ALLOW_TEST_ENGINE_CHANGES=true` only to bootstrap engine outputs in an engine you are willing to have written to.
+- Optional: `UE_MCP_TEST_ENGINE_ROOT` pins the engine to build and run with, and `UE_MCP_PROTECTED_ENGINE_ROOTS` is a deny list of roots the scripts refuse to touch at all. The deny list outranks every other setting, including the opt-in above.
 - `npm run up:build` stops the editor, builds, and relaunches. Use when iterating live.
 - The deployer (`scripts/deploy.mjs`, also called implicitly by `npm run up`) syncs `plugin/` → `tests/ue_mcp/Plugins/UE_MCP_Bridge/`. Run it after plugin source edits before building.
 
-### Smoke tests — REQUIRED
+### Smoke tests - REQUIRED
 
 `npm run test:smoke` exercises every registered handler via the live WebSocket bridge. **Run this before shipping a release.**
 
 - Target **only** `tests/ue_mcp/ue_mcp.uproject`. Confirm the MCP connection via `project(get_status)` before running. If the editor is connected to anything else (the user's real project, another workspace), abort.
 - Smoke tests execute real mutations (create blueprints, delete assets, modify levels). A misrouted run against a real project can corrupt an active editor session.
 - 440+ handlers. Pass = every handler responds either with success or an expected parameter-validation error. Any timeout or `Unknown method` is a real failure.
+
+### Golden baseline - the advertised surface
+
+`tests/golden/editor-down.json` is a recording of what a client is handed at startup with one project and no editor running: the `initialize` instructions and every tool in `tools/list` with its full input schema. `tests/unit/golden-editor-down.test.ts` starts the real server over stdio, records the same thing again, and fails if the two differ. It runs as part of `npm run test:unit`, so CI gates on it.
+
+- **A failure is not automatically a bug.** It says the startup contract moved. Read the diff.
+- **Re-record intentionally** with `npm run golden:record`, then review the diff before committing it. Never edit the JSON by hand.
+- The recording is hermetic: a throwaway project in a temp directory, `UE_MCP_PORT=1` so nothing can be listening, every inherited `UE_MCP_*` variable dropped, and the user-scoped config/state/auth files redirected. Absolute paths are rewritten before serialization and asserted absent, so the file verifies on any machine.
+- The `epic_*` actions enrichment injects are **sorted in the recording**, alongside the path, port and timestamp rewrites. Unreal's toolset registry promises the set of tools, not the sequence, and a restart that reshuffles it would otherwise report a surface change on a healthy editor. Only the snapshot is normalised; the server advertises exactly what it always did. A category's own actions keep their declared order, which is authored and does carry meaning.
+- The editor-connected half (`tests/golden/editor-connected.json`) is the same recording made with a live editor attached, guarded by `tests/live/golden-connected.test.ts` in the live tier because it needs a running editor. Re-record it with `npm run golden:record -- --connected`. The recorder asserts the surface really was enriched from the live editor rather than a cache or the baked snapshot, so the two baselines cannot be recorded from the same source by accident.
+
+### Live tier
+
+`npm run test:live` runs `tests/live/` against an editor that is **already running**, through the shipped server: the connected golden baseline, per-path dispatch and leak assertions, addressing, gating, the union surface, and the records the bridge publishes. It never starts or stops an editor.
+
+- Targets `tests/ue_mcp` only, verified by asking the editor which project it has open, and aborts before sending anything otherwise.
+- One editor is enough. Cases needing more than one use a second session for a project whose editor is not running, since the session count is what arms targeting and gating.
+- The leak assertions need the parameter echo, which is armed at editor startup: launch with `UE_MCP_PARAM_ECHO=1` to include them. Without it they skip and say why.
+- `tests/live/matrix.ts` is the written form of plan item 7.3 of #817: every case, and where its assertion lives (live, engine-free and referenced, owned by the C++ tier, or pending on unshipped work). `tests/live/coverage.test.ts` fails when a reference stops resolving.
 
 ### Clean plugin rebuild recipe
 
@@ -89,6 +118,21 @@ CI **gates the publish job** on a single pre-staged input: the draft GitHub rele
 
 Release notes structure (below the frontmatter): one-line summary, then `### Server` / `### Bug fixes` / `### Internals` sections. See prior releases on GitHub for the style. (The `docs/release-notes-*.md` files in the repo predate this flow and are kept as references only.)
 
+### Prereleases
+
+A version with a prerelease suffix (`1.2.0-beta`, `1.2.0-beta.2`, `1.3.0-rc.1`) goes through the exact same flow: draft release with headline frontmatter, bump, push. CI routes it to its own channel automatically.
+
+- **npm dist-tag** comes from the first prerelease identifier, so `1.2.0-beta` and `1.2.0-beta.2` publish under `beta` and `1.3.0-rc.1` under `rc`. `npx ue-mcp` keeps resolving to the newest plain `X.Y.Z`; testers opt in with `ue-mcp@beta`.
+- **The GitHub release** is marked as a prerelease, so it does not take the "Latest" badge or answer `/releases/latest`.
+- **The publish gate** asks whether that exact version is already on the registry, so a prerelease does not wedge every later push.
+- The rules live in `scripts/release-version.mjs` (unit tested in `tests/unit/release-version.test.ts`), mirrored for the shipped CLI in `src/version-check.ts`. Change one and the parity test will tell you to change the other.
+
+The tag name still has to match the version exactly: `gh release create v1.2.0-beta --draft --notes-file ...`.
+
+#### Cutting the stable release the betas led up to
+
+Prerelease notes stay incremental: the `1.2.0-beta.3` page says what changed since `beta.2`. Stable notes are cumulative, because the betas never took the "Latest" badge and everything they shipped is invisible from the `1.2.0` page otherwise. `npm run release:notes -- --version 1.2.0 --notes-file <what landed since the last beta> --out /tmp/v1.2.0.md` builds that union: it reads every published prerelease of the same `X.Y.Z` in semver order, merges their bodies section by section, folds bullets that repeat or cite the same issue number, and unions the headlines back off the `landing/headline` commit statuses. It prints what it merged, what it deduped and any headline item it had to drop for the six-item cap, then runs its own output through `scripts/release-headline.mjs` so the file cannot fail the publish gate later. Reread the summary paragraph before you create the draft, since it may have come from a beta. A stable release with no prereleases passes its notes file straight through.
+
 ## Issue handling
 
 - **Never close an issue without shipping code that resolves it.** Not "out of scope for this patch", not "prerequisite shipped", not "follow-up". Issues close only when the fix ships.
@@ -107,10 +151,11 @@ Each category has a paired `Private/Handlers/<Category>Handlers.{h,cpp}`. Handle
 - **Param names must exactly match between the TS schema and the C++ handler.** Drift is how silent failures start. Audit new actions in both places.
 - Modules that may not be loaded (Water, WaterSpline, etc.) should be reached via `LoadClass<>()` at runtime rather than a `Build.cs` dependency. Fail with a clear "plugin X not available" error instead of a link-time break.
 
-### Writing style — public artifacts
+### Writing style - public artifacts
 
-- **No em dashes (`—`).** Use hyphens (` - `), colons, parentheses, or split into sentences. Applies to commit messages, release notes, docs, PR bodies, code comments.
-- **Never name competitor or comparison projects in public artifacts.** Commit messages, release notes, PR bodies, GitHub release bodies, code comments, docs — any of these. Even when the work is literally closing a gap against another project, describe the work on its own terms ("adds module input authoring"), not as "catching up to X" or "matching Y". Gap-analysis context belongs in private discussion, never in public git history.
+- **No em dashes (`—`).** Use hyphens (` - `), colons, parentheses, or split into sentences. Applies to commit messages, release notes, docs, PR bodies, code comments. <!-- em-dash-allowed: the rule has to show the character it bans -->
+  CI enforces this in `.github/workflows/em-dash.yml`, which runs on **every branch push** as well as on pull requests, so a bad character is caught when you push rather than after it reaches main. It scans the whole tracked tree plus the commit messages in the pushed range. Run `npm run audit:em-dash` locally to get the same answer, and `npm run audit:em-dash -- --explain` for the exemption policy.
+- **Never name competitor or comparison projects in public artifacts.** Commit messages, release notes, PR bodies, GitHub release bodies, code comments, docs - any of these. Even when the work is literally closing a gap against another project, describe the work on its own terms ("adds module input authoring"), not as "catching up to X" or "matching Y". Gap-analysis context belongs in private discussion, never in public git history.
 
 ### MCP design principle
 
@@ -124,6 +169,9 @@ npm run up:build        # Stop editor, build plugin, relaunch
 npm run build           # Build the UE C++ plugin only
 npx tsc --noEmit        # Type-check TS
 npm run test:smoke      # Live smoke tests (tests/ue_mcp only)
+npm run test:live       # Live tier against a running editor (tests/ue_mcp only)
+npm run golden:record   # Re-record tests/golden/editor-down.json (review the diff)
+npm run release:notes   # Compose cumulative stable notes from a version's prereleases
 npm test                # Vitest unit tests
 node scripts/deploy.mjs # Sync plugin/ → tests/ue_mcp/Plugins/
 ```

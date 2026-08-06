@@ -30,7 +30,7 @@ This:
 4. Claude reads code, implements the fix, runs `npx tsc --noEmit`, and commits.
 5. The script then pushes the branch and opens a PR against `db-lyon/ue-mcp`.
 
-Requires `gh` and `claude` CLIs, write access to the repo (or a fork to push to), and you must run it from inside a `ue-mcp` clone — it operates on the working tree, not a temp clone.
+Requires `gh` and `claude` CLIs, write access to the repo (or a fork to push to), and you must run it from inside a `ue-mcp` clone - it operates on the working tree, not a temp clone.
 
 ## Building
 
@@ -39,7 +39,27 @@ npx tsc                # TypeScript -> dist/ (what the server ships as)
 npm run build          # UE C++ plugin build (requires editor closed)
 ```
 
-`npx tsc` emits the TypeScript server into `dist/`. `npm run build` is the C++ plugin build that runs Unreal's `Build.bat` against the test project and requires the editor to be closed first. Use `npm run up:build` to chain stop-build-start during plugin iteration.
+`npx tsc` emits the TypeScript server into `dist/`. `npm run build` is the C++ plugin build that runs Unreal's build tool against the test project and requires the editor to be closed first.
+
+The build script only ever builds the `ue_mcpEditor` target against the bundled `tests/ue_mcp/ue_mcp.uproject`, and it refuses to start if that resolves anywhere else. It also passes `-NoEngineChanges`, so Unreal itself aborts the build and prints the offending file list if the build would overwrite a file that already exists under the engine tree. That is what keeps a test build from invalidating the outputs of a shared source engine you use for other work.
+
+Engine selection order is `UE_MCP_TEST_ENGINE_ROOT`, then `UE_BUILD_TOOL_PATH`, then the default install locations. A pinned root that has no build tool is an error rather than a silent fallback to an engine you did not ask for.
+
+Two optional environment variables tune the guard:
+
+```powershell
+# Roots the build and run scripts must never touch, whatever else is set.
+$env:UE_MCP_PROTECTED_ENGINE_ROOTS = 'D:\UE-Primary;D:\UE-Release'
+
+# Pin the engine used for test builds and editor launches.
+$env:UE_MCP_TEST_ENGINE_ROOT = 'D:\UE-Test'
+
+npm run build
+```
+
+`UE_MCP_PROTECTED_ENGINE_ROOTS` uses the platform path-list delimiter (`;` on Windows, `:` on macOS and Linux). A selected engine equal to or nested under a protected root is rejected, including when it arrives through `UE_BUILD_TOOL_PATH` or `UE_EDITOR_PATH`.
+
+A fresh engine may need to create its engine-side outputs once. For that bootstrap only, set `UE_MCP_ALLOW_TEST_ENGINE_CHANGES=true` to drop `-NoEngineChanges`. Protected roots stay forbidden even with this opt-in, and the build prints a warning naming the variable so an opt-in left in your environment is visible. Use `npm run up:build` to chain stop-build-start during plugin iteration.
 
 ## Running
 
@@ -134,21 +154,65 @@ Smoke tests run against a **live editor** and verify tool functionality end-to-e
 npm run test:level
 npm run test:blueprint
 npm run test:material
-# ... 16 suites total — see scripts in package.json
+# ... 16 suites total - see scripts in package.json
 
 # All suites (Vitest)
 npm test
 
-# Full smoke test runner — exercises every registered handler
+# Full smoke test runner - exercises every registered handler
 npm run test:smoke
 ```
 
 !!! warning "Smoke tests require the test project"
-    The smoke runner targets `tests/ue_mcp/ue_mcp.uproject` only. Real mutations execute against the connected editor (creating blueprints, deleting assets, modifying the level). **Never run smoke tests against a real project.** The runner aborts if it detects a connection to anything else.
+    The smoke runner targets `tests/ue_mcp/ue_mcp.uproject` only. Real mutations execute against the connected editor (creating blueprints, deleting assets, modifying the level). **Never run smoke tests against a real project.** After connecting, the runner asks the editor which project it has open and aborts before sending anything if the answer is not `tests/ue_mcp`. Non-loopback hosts are refused outright.
 
 !!! note "Prerequisites"
     - Editor running with the test project
     - Bridge connected (`project(action="get_status")` returns `editorConnected: true`)
+
+#### How the harness finds the bridge
+
+The editor binds a per-project port, not a fixed one, and publishes the port it
+actually bound to `tests/ue_mcp/Saved/UE_MCP_Bridge/port.json`. Both harnesses
+(`scripts/smoke-test.js` and the Vitest suites) resolve the endpoint through
+`scripts/bridge-target.mjs`, which probes in this order:
+
+1. The port recorded in that lockfile.
+2. The port derived from the project path, which is what the bridge binds when
+   nothing is in its way.
+3. The legacy fixed port `9877`, for older bridges.
+
+Start the editor and run the tests; no environment variable is needed. When
+nothing answers, the failure names the lockfile path it read, the state that
+file was in (missing, malformed, or stale with a dead pid), and every port it
+tried. `--port` on the runner and `UE_MCP_TEST_PORT` for the Vitest suites still
+pin the port for unusual setups, and neither weakens the project check above.
+
+### Live Tier
+
+The live tier drives a real editor through the shipped server: the advertised
+surface with an editor attached, per-path dispatch, addressing, gating, and the
+records the bridge publishes.
+
+```bash
+npm run test:live
+```
+
+It attaches to an editor that is **already running** and never starts or stops
+one. The preflight finds the bridge, asks the editor which project it has open,
+prints the target, and aborts with the ports it tried when nothing answers, so
+"no editor" is one message rather than a wall of failed assertions. Like the
+smoke runner, it drives `tests/ue_mcp` and refuses every other project.
+
+- **One editor is enough.** Cases that need more than one editor use a second
+  session for a throwaway project whose editor is not running: a session is
+  registered for every project regardless of editor state, and the session
+  count is what arms targeting, gating and the union refusal.
+- **The leak assertions need the parameter echo**, which can only be armed when
+  the editor process starts. Launch the editor with `UE_MCP_PARAM_ECHO=1` in its
+  environment to include them; without it they skip and the runner says so.
+- `tests/live/matrix.ts` records, case by case, where each assertion lives, and
+  `tests/live/coverage.test.ts` checks every reference still resolves.
 
 ### Test Suites
 
@@ -221,11 +285,11 @@ For a full editor restart: `editor(action="restart_editor")`
 ## Dependencies
 
 ### Runtime
-- `@modelcontextprotocol/sdk` — MCP protocol implementation
-- `ws` — WebSocket client
-- `zod` — Schema validation
+- `@modelcontextprotocol/sdk` - MCP protocol implementation
+- `ws` - WebSocket client
+- `zod` - Schema validation
 
 ### Dev
-- `typescript` — Type checking
-- `tsx` — TypeScript execution (dev mode)
-- `vitest` — Test runner
+- `typescript` - Type checking
+- `tsx` - TypeScript execution (dev mode)
+- `vitest` - Test runner

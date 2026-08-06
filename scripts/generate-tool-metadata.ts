@@ -116,9 +116,13 @@ function splitDescription(raw: string | undefined): { desc: string; params: stri
   return { desc, params: rest.slice(0, end).trim().replace(/\.$/, "") };
 }
 
-/** Replace em dashes with hyphens (CLAUDE.md style rule for public artifacts). */
+/**
+ * Replace em dashes with hyphens (CLAUDE.md style rule for public artifacts).
+ * The literal in the pattern is the character being stripped, so it is the one
+ * place in this repo that has to keep it. Leave it alone during style sweeps.
+ */
 function deEm(s: string): string {
-  return s.replace(/\s*—\s*/g, " - ");
+  return s.replace(/\s*—\s*/g, " - "); // em-dash-allowed: the literal is the character being stripped
 }
 
 /** Escape pipes in a markdown table cell. */

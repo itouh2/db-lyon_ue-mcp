@@ -1,5 +1,7 @@
-import type { TaskResult, RollbackRecord } from "@db-lyon/flowkit";
+import type { TaskResult } from "@db-lyon/flowkit";
+import { liftRollback } from "./rollback.js";
 import { UeMcpTask } from "../task.js";
+import { stripEditorTarget } from "../types.js";
 
 /**
  * Generic task for bridge-delegation actions.
@@ -24,7 +26,10 @@ export class BridgeTask extends UeMcpTask {
   }
 
   async execute(): Promise<TaskResult> {
-    const { method, ...params } = this.options as Record<string, unknown>;
+    const { method, ...rest } = this.options as Record<string, unknown>;
+    // `editor` selects the session the step runs in, so it must not travel
+    // on to the editor as a bridge parameter.
+    const params = stripEditorTarget(rest);
     if (!method || typeof method !== "string") {
       throw new Error('BridgeTask requires a "method" option');
     }
@@ -34,23 +39,12 @@ export class BridgeTask extends UeMcpTask {
       return { success: true, data: { result: raw } };
     }
 
-    const { rollback, ...rest } = raw as Record<string, unknown>;
-    const result: TaskResult = { success: true, data: rest };
-
-    if (rollback && typeof rollback === "object") {
-      const rb = rollback as { method?: unknown; payload?: unknown };
-      if (typeof rb.method === "string") {
-        const record: RollbackRecord = {
-          taskName: rb.method,
-          payload:
-            rb.payload && typeof rb.payload === "object"
-              ? (rb.payload as Record<string, unknown>)
-              : {},
-        };
-        result.rollback = record;
-      }
-    }
-
+    // Pass the response through intact; the rollback descriptor is part of the
+    // documented response shape, not an internal field to be consumed here.
+    const obj = raw as Record<string, unknown>;
+    const result: TaskResult = { success: true, data: obj };
+    const record = liftRollback(obj.rollback);
+    if (record) result.rollback = record;
     return result;
   }
 }

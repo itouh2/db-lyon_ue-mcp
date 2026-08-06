@@ -24,10 +24,14 @@ private:
 	// #251: standalone ULandscapeLayerInfoObject creation (does not require
 	// a landscape in the world).
 	static TSharedPtr<FJsonValue> CreateLandscapeLayerInfo(const TSharedPtr<FJsonObject>& Params);
-	// v0.7.19 issue #150 — concise material + component count summary per proxy
+	// v0.7.19 issue #150 - concise material + component count summary per proxy
 	static TSharedPtr<FJsonValue> GetMaterialUsageSummary(const TSharedPtr<FJsonObject>& Params);
 	// #733: enumerate loaded World Partition landscape streaming proxies with
 	// per-proxy world bounds, and resolve which proxy covers a world position.
 	static TSharedPtr<FJsonValue> ListLandscapeProxies(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> FindLandscapeProxyAt(const TSharedPtr<FJsonObject>& Params);
+	// #742: sculpting and weight painting - the writes the category has always
+	// advertised but never had.
+	static TSharedPtr<FJsonValue> Sculpt(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> PaintLayer(const TSharedPtr<FJsonObject>& Params);
 };

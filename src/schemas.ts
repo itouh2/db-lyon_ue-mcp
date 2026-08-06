@@ -48,8 +48,26 @@ export const UeMcpConfigSchema = z
     bridge: z
       .object({
         port: z.number().int().min(1).max(65535).optional(),
+        // Per-project equivalent of UE_MCP_HOST (#817). The env var is a global
+        // default that applies to every session at once; this is how one
+        // project reaches an editor on another host without moving the rest.
+        host: z.string().optional(),
       })
       .optional(),
+    // Per-project equivalents of UE_EDITOR_PATH and UE_BUILD_TOOL_PATH (#817).
+    // Both env vars are global, so with more than one project they force every
+    // editor through one binary even when the projects are on different engine
+    // versions. Unset means the engine the project's EngineAssociation names.
+    editor: z
+      .object({
+        path: z.string().optional(),
+        buildToolPath: z.string().optional(),
+      })
+      .optional(),
+    // Per-project equivalent of UE_MCP_ENV (#817): which `ue-mcp.<env>.yml`
+    // overlay this project merges. The env var still wins and still applies to
+    // every project at once.
+    env: z.string().optional(),
     // Per-asset exclusive locking for concurrent agents. Opt-in: `enabled`
     // wraps mutating dispatch in acquire/release around the shared bridge
     // registry. `ttlSeconds` is the lease length a crashed agent's locks
@@ -75,6 +93,17 @@ export const UeMcpConfigSchema = z
     context: z
       .object({
         strategy: z.enum(["full", "lean", "micro"]).optional(),
+      })
+      .optional(),
+    // Play In Editor. `allowIgnoreBlueprintErrors` pre-authorizes
+    // editor(play_in_editor_ignore_blueprint_errors), the one action that
+    // suppresses the editor's unresolved-Blueprint-error prompt. Off by
+    // default: without it every call blocks on an MCP approval prompt.
+    // Belongs in an untracked layer (ue-mcp.local.yml) unless the whole team
+    // really wants PIE to start over known Blueprint errors.
+    pie: z
+      .object({
+        allowIgnoreBlueprintErrors: z.boolean().optional(),
       })
       .optional(),
     // Per-plugin runtime config, keyed by plugin slug (`recipes`, i.e. the

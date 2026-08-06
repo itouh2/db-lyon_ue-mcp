@@ -76,8 +76,7 @@ void FMaterialHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("delete_material_expression"), &DeleteMaterialExpression);
 	Registry.RegisterHandler(TEXT("disconnect_material_property"), &DisconnectMaterialProperty);
 
-	// v0.7.9 — depth
-	Registry.RegisterHandler(TEXT("create_material_from_texture"), &CreateMaterialFromTexture);
+	// v0.7.9 - depth
 	Registry.RegisterHandler(TEXT("duplicate_material"), &DuplicateMaterial);
 	Registry.RegisterHandler(TEXT("validate_material"), &ValidateMaterial);
 	Registry.RegisterHandler(TEXT("get_material_shader_stats"), &GetMaterialShaderStats);
@@ -2155,7 +2154,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetExpressionValue(const TSharedPtr<FJ
 		}
 	}
 
-	// #185: Generic UPROPERTY fallback — set arbitrary properties on any expression node
+	// #185: Generic UPROPERTY fallback - set arbitrary properties on any expression node
 	// by property name (e.g. Noise node Levels, Quality, NoiseFunction, etc.)
 	if (!bValueSet)
 	{
@@ -2363,6 +2362,21 @@ namespace
 		if (Hit(TEXT("geometrycollections")) || Hit(TEXT("geometry_collections"))) { OutUsage = MATUSAGE_GeometryCollections; return true; }
 		return false;
 	}
+
+	// UMaterial::SetMaterialUsage became a one-argument virtual in UE 5.8. The
+	// only form before that takes a bNeedsRecompile out param, and the 5.8
+	// build keeps it as a deprecated inline shim that forwards and ignores the
+	// param. Calling the one-argument form on 5.7 is a hard compile error
+	// (C2660), so pick the form the engine in hand actually declares.
+	static bool ApplyMaterialUsage(UMaterial* Material, EMaterialUsage Usage)
+	{
+#if UE_MCP_HAS_5_8_API
+		return Material->SetMaterialUsage(Usage);
+#else
+		bool bNeedsRecompile = false;
+		return Material->SetMaterialUsage(bNeedsRecompile, Usage);
+#endif
+	}
 }
 
 // #617 read/write a MaterialExpressionCustom's HLSL Code, named inputs, and
@@ -2501,8 +2515,9 @@ TSharedPtr<FJsonValue> FMaterialHandlers::SetMaterialUsage(const TSharedPtr<FJso
 			Unknown.Add(U);
 			continue;
 		}
-		bool bNeedsRecompile = false;
-		Material->SetMaterialUsage(bNeedsRecompile, Usage);
+		// The bNeedsRecompile out param is gone in the virtual implementation;
+		// the shim that kept it always ignored the value anyway.
+		ApplyMaterialUsage(Material, Usage);
 		Applied.Add(U);
 	}
 
@@ -2601,8 +2616,7 @@ TSharedPtr<FJsonValue> FMaterialHandlers::CreateMaterialSimple(const TSharedPtr<
 				EMaterialUsage U;
 				if (ParseMaterialUsage(S, U))
 				{
-					bool bNeeds = false;
-					Material->SetMaterialUsage(bNeeds, U);
+					ApplyMaterialUsage(Material, U);
 				}
 			}
 		}

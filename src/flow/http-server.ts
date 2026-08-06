@@ -1,7 +1,8 @@
 import * as http from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { createFlowTool } from "./flow-tool.js";
-import type { ToolContext } from "../types.js";
+import { sessionContext, EDITOR_TARGET_PARAM, type ToolContext } from "../types.js";
+import { refuseUntargetedCall } from "../editor-gate.js";
 import { info, warn, error as logError } from "../log.js";
 import { subscribeFlowEvents, type FlowEvent } from "./events.js";
 
@@ -46,7 +47,7 @@ function hostIsAllowed(req: http.IncomingMessage): boolean {
   return ALLOWED_HOSTS.has(bare.toLowerCase());
 }
 
-// #144 — expose flow.run, flow.plan, flow.list over loopback HTTP so non-MCP
+// #144 - expose flow.run, flow.plan, flow.list over loopback HTTP so non-MCP
 // clients (editor plugins, CI, curl) can invoke flows without speaking stdio
 // MCP. Intentionally tiny: routes mirror the three flow actions, responses
 // mirror the existing flow result shape.
@@ -91,15 +92,18 @@ export function startFlowHttpServer(
         return send(401, { error: "Missing or invalid token" });
       }
 
+      const activeContext = (): ToolContext =>
+        ctx.sessions ? sessionContext(ctx, ctx.sessions.active) : ctx;
+
       if (method === "GET" && (pathname === "/" || pathname === "/flows")) {
-        const result = await flowTool.handler(ctx, { action: "list" });
+        const result = await flowTool.handler(activeContext(), { action: "list" });
         return send(200, result);
       }
 
       const planMatch = pathname.match(/^\/flows\/([^/]+)\/plan$/);
       if (method === "GET" && planMatch) {
         const flowName = decodeURIComponent(planMatch[1]);
-        const result = await flowTool.handler(ctx, { action: "plan", flowName });
+        const result = await flowTool.handler(activeContext(), { action: "plan", flowName });
         return send(200, result);
       }
 
@@ -111,13 +115,42 @@ export function startFlowHttpServer(
           action: "run",
           flowName,
         };
+        // Untargeted runs follow the active session, the same as the MCP
+        // surface, rather than staying pinned to whichever session was
+        // active when this server started.
+        let runCtx = activeContext();
+        let targeted = false;
         if (body && typeof body === "object") {
           const b = body as Record<string, unknown>;
           if (b.params !== undefined) params.params = b.params;
           if (b.skip !== undefined) params.skip = b.skip;
           if (b.rollback_on_failure !== undefined) params.rollback_on_failure = b.rollback_on_failure;
+          // #817: the HTTP surface addresses an editor the same way the MCP
+          // surface does. Resolving here (rather than forwarding `editor` into
+          // the flow) keeps the routing instruction off every step's options.
+          if (typeof b.editor === "string" && b.editor && ctx.sessions) {
+            try {
+              runCtx = sessionContext(ctx, ctx.sessions.resolve(b.editor));
+            } catch (e) {
+              return send(404, { error: e instanceof Error ? e.message : String(e) });
+            }
+            targeted = true;
+          }
         }
-        const result = await flowTool.handler(ctx, params);
+        // Same gate as the MCP surface (#817): beyond one editor a run has to
+        // say which one it means, because a flow is whatever its steps are and
+        // the fall-through would edit a project nobody named. Inert at one
+        // editor, where this returns null without classifying anything.
+        if (!targeted && ctx.sessions && ctx.sessions.size > 1) {
+          const refusal = refuseUntargetedCall({
+            taskName: "flow.run",
+            editors: ctx.sessions.list().map((s) => s.name),
+            activeEditor: ctx.sessions.active.name,
+            targetParam: EDITOR_TARGET_PARAM,
+          });
+          if (refusal) return send(400, { error: refusal });
+        }
+        const result = await flowTool.handler(runCtx, params);
         return send(200, result);
       }
 

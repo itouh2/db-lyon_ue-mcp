@@ -1,13 +1,14 @@
 import { z } from "zod";
 import type { IBridge } from "./bridge.js";
 import type { ProjectContext } from "./project.js";
+import type { EditorSession, SessionRegistry } from "./session.js";
 import { McpError, ErrorCode } from "./errors.js";
 
 /**
  * Elicit a deterministic, user-mediated form response via the MCP client.
  * The server blocks until the client returns one of accept / decline / cancel.
  * Returns null when the connected client did not advertise the `elicitation`
- * capability — handlers that rely on this gate must refuse to proceed in
+ * capability - handlers that rely on this gate must refuse to proceed in
  * that case rather than fall back to an agent-mediated approval.
  */
 export type ElicitFn = (params: ElicitParams) => Promise<ElicitResult>;
@@ -34,22 +35,60 @@ export interface ElicitResult {
 export interface ToolContext {
   bridge: IBridge;
   project: ProjectContext;
+  /** The editor this call was routed to. `bridge` and `project` are always
+   *  this session's, so a handler cannot resolve a path in one project while
+   *  calling into another project's editor. Absent only for a context built
+   *  outside the session registry (tests, direct handler invocation). */
+  session?: EditorSession;
+  /** Every editor this server drives. Handlers that address sessions
+   *  (list_editors / use_editor / add_editor / drop_editor) read it from
+   *  here rather than from module state. */
+  sessions?: SessionRegistry;
   /** Lazy accessor for the active flow registry. Returns the merged
    *  built-in + ue-mcp.yml flows. Used by project(get_status) so agents
-   *  see which canonical sequences are pre-encoded for this project. */
-  getFlows?: () => Array<{ name: string; description?: string }>;
+   *  see which canonical sequences are pre-encoded for this project.
+   *  Takes the session to read, because flows are declared in each project's
+   *  own ue-mcp.yml; omitted means this context's session. */
+  getFlows?: (forSession?: EditorSession) => Array<{ name: string; description?: string }>;
   /** Lazy accessor for the loaded plugin set. Returns one PluginInfo per
    *  entry in the user's `plugins:` array, active or skipped. Used by the
-   *  `plugins` introspection category. */
-  getPlugins?: () => PluginInfo[];
+   *  `plugins` introspection category. Session-scoped for the same reason
+   *  as getFlows: `plugins:` is per project. */
+  getPlugins?: (forSession?: EditorSession) => PluginInfo[];
   /** MCP elicitation gate. When defined, calling this blocks the active
    *  tool invocation until the user responds in their MCP client UI. When
    *  undefined, the connected client does not declare the elicitation
-   *  capability — handlers that need a deterministic user signal MUST
+   *  capability - handlers that need a deterministic user signal MUST
    *  refuse instead of degrading to an agent-mediated channel. Used by
    *  feedback(submit) to gate every GitHub post on real user approval. */
   elicit?: ElicitFn;
+  /**
+   * Live progress for a long call, rendered by the MCP client while the tool
+   * is still running.
+   *
+   * This is the ONLY channel a user actually sees mid-call: an MCP server's
+   * stderr is captured to a client log file, never to the transcript, so a
+   * progress bar printed there is invisible. Present only when the client
+   * passed a progress token with the request.
+   */
+  onProgress?: ProgressFn;
+  /**
+   * Who is on the other end of the transport, from the MCP `initialize`
+   * handshake. Used to explain client-specific rendering limits in a result
+   * rather than leaving the user staring at a call that looks frozen.
+   */
+  client?: { name: string; version?: string };
 }
+
+export interface ProgressUpdate {
+  /** Monotonic units done. With `total`, clients render a bar. */
+  progress: number;
+  total?: number;
+  /** One line describing what is happening right now. */
+  message: string;
+}
+
+export type ProgressFn = (update: ProgressUpdate) => void;
 
 export interface PluginInfo {
   name: string;
@@ -76,6 +115,58 @@ export interface ToolDef {
   schema: Record<string, z.ZodType>;
   handler: (ctx: ToolContext, params: Record<string, unknown>) => Promise<unknown>;
   actions: Record<string, ActionSpec>;
+  /** Set once the per-call editor target has been injected into `schema`.
+   *  Dispatch reads it to know whether an `editor` param is a routing
+   *  instruction (strip it) or one of the tool's own params (forward it). */
+  injectedEditorParam?: boolean;
+  /** Set once the destination-editor parameter has been injected (#817). */
+  injectedMigrateParam?: boolean;
+  /**
+   * Build an independent copy of this tool (#817).
+   *
+   * Epic enrichment and plugin injection mutate `actions`, `schema` and
+   * `description` in place, so two editors sharing one ToolDef share whatever
+   * either of them was enriched with: a project with a toolset the other does
+   * not have would advertise that toolset on both. Each session therefore
+   * gets its own graph, cloned from the pristine one before anything touches
+   * it.
+   *
+   * Set by `categoryTool`, which is the only thing that can rebuild the
+   * dispatch closure so the copy reads its OWN actions rather than the
+   * original's. A tool built by hand carries no rebuilder and is copied
+   * structurally instead.
+   */
+  rebuild?: (actions: Record<string, ActionSpec>) => ToolDef;
+}
+
+/**
+ * An independent copy of one tool. Prefers the rebuilder so the copy's
+ * handler dispatches against the copy's actions; falls back to a structural
+ * copy of the mutated containers for hand-written tools, whose handlers do
+ * not read `actions` at all.
+ */
+export function cloneToolDef(tool: ToolDef): ToolDef {
+  // An action-less tool cannot go back through categoryTool: the action enum
+  // it builds needs at least one name. Nothing enriches such a tool either, so
+  // the structural copy below is sufficient.
+  if (tool.rebuild && Object.keys(tool.actions).length > 0) {
+    const copy = tool.rebuild({ ...tool.actions });
+    copy.description = tool.description;
+    copy.schema = { ...tool.schema };
+    copy.injectedEditorParam = tool.injectedEditorParam;
+    copy.injectedMigrateParam = tool.injectedMigrateParam;
+    return copy;
+  }
+  return {
+    ...tool,
+    schema: { ...tool.schema },
+    actions: { ...tool.actions },
+  };
+}
+
+/** An independent copy of a whole tool graph. */
+export function cloneToolGraph(tools: ToolDef[]): ToolDef[] {
+  return tools.map(cloneToolDef);
 }
 
 export interface ActionSpec {
@@ -85,6 +176,135 @@ export interface ActionSpec {
   handler?: (ctx: ToolContext, params: Record<string, unknown>) => Promise<unknown>;
   /** Override the bridge call timeout in milliseconds. Defaults to 30s. */
   timeoutMs?: number;
+  /**
+   * This action moves something INTO a second editor, so its category takes a
+   * `toEditor` parameter alongside the `editor` one every category gets (#817).
+   * Declared on the action rather than assumed from its name, and injected
+   * under the same rule: only while this server drives more than one editor.
+   * `asset(migrate)` is the one action that has it.
+   */
+  destinationEditor?: boolean;
+}
+
+/**
+ * The per-call editor target (#817). Injected into every category tool only
+ * while this server drives more than one editor, so a single-editor client
+ * sees the schema it has always seen. Declared once here because the flow
+ * tool, the micro gateway, and plugin-provided categories inject the same
+ * parameter and must describe it identically.
+ */
+export const EDITOR_TARGET_PARAM = "editor";
+
+/**
+ * Add the target parameter to a tool. Refuses when the tool already declares
+ * `editor` of its own: silently shadowing a plugin's parameter would send its
+ * value to the router instead of the handler, so the collision is reported
+ * and that tool stays untargeted rather than quietly changing meaning.
+ */
+export function injectEditorTarget(
+  tool: ToolDef,
+  sessionNames: string[],
+): { injected: boolean; reason?: string } {
+  if (tool.injectedEditorParam) {
+    tool.schema = { ...tool.schema, [EDITOR_TARGET_PARAM]: editorTargetSchema(sessionNames) };
+    return { injected: true };
+  }
+  if (EDITOR_TARGET_PARAM in tool.schema) {
+    return {
+      injected: false,
+      reason: `'${tool.name}' declares its own '${EDITOR_TARGET_PARAM}' parameter, so per-call targeting is unavailable for it. Rename that parameter to make the category targetable.`,
+    };
+  }
+  tool.schema = { ...tool.schema, [EDITOR_TARGET_PARAM]: editorTargetSchema(sessionNames) };
+  tool.injectedEditorParam = true;
+  return { injected: true };
+}
+
+/** Undo injectEditorTarget, restoring the single-editor schema exactly. */
+export function removeEditorTarget(tool: ToolDef): boolean {
+  if (!tool.injectedEditorParam) return false;
+  const { [EDITOR_TARGET_PARAM]: _dropped, ...rest } = tool.schema;
+  tool.schema = rest;
+  tool.injectedEditorParam = false;
+  return true;
+}
+
+/**
+ * The destination editor for an action that moves content between two of them
+ * (#817). `editor` says where a call runs; this says where its output lands.
+ */
+export const MIGRATE_TARGET_PARAM = "toEditor";
+
+/** Does any of this tool's actions move content into a second editor? */
+export function hasDestinationEditorAction(tool: ToolDef): boolean {
+  return Object.values(tool.actions).some((spec) => spec.destinationEditor === true);
+}
+
+/**
+ * Add the destination parameter, under the same rule as the target parameter:
+ * only while more than one editor is registered, and never over a parameter the
+ * tool already declares.
+ */
+export function injectMigrateTarget(
+  tool: ToolDef,
+  sessionNames: string[],
+): { injected: boolean; reason?: string } {
+  if (!hasDestinationEditorAction(tool)) return { injected: false };
+  if (!tool.injectedMigrateParam && MIGRATE_TARGET_PARAM in tool.schema) {
+    return {
+      injected: false,
+      reason: `'${tool.name}' declares its own '${MIGRATE_TARGET_PARAM}' parameter, so cross-editor migration is unavailable for it.`,
+    };
+  }
+  tool.schema = { ...tool.schema, [MIGRATE_TARGET_PARAM]: migrateTargetSchema(sessionNames) };
+  tool.injectedMigrateParam = true;
+  return { injected: true };
+}
+
+/** Undo injectMigrateTarget, restoring the single-editor schema exactly. */
+export function removeMigrateTarget(tool: ToolDef): boolean {
+  if (!tool.injectedMigrateParam) return false;
+  const { [MIGRATE_TARGET_PARAM]: _dropped, ...rest } = tool.schema;
+  tool.schema = rest;
+  tool.injectedMigrateParam = false;
+  return true;
+}
+
+export function migrateTargetSchema(sessionNames: string[]): z.ZodType {
+  return z
+    .string()
+    .optional()
+    .describe(
+      `migrate: the editor to migrate INTO (${sessionNames.join(", ")}), by session name, ` +
+        `project name, or .uproject path. Its Content directory becomes destinationContentDir ` +
+        `and its asset registry is rescanned afterwards, so the assets are visible there ` +
+        `without a manual rescan. Pass this or destinationContentDir, not both.`,
+    );
+}
+
+export function editorTargetSchema(sessionNames: string[]): z.ZodType {
+  return z
+    .string()
+    .optional()
+    .describe(
+      `Editor session to run this call in: a session name (${sessionNames.join(", ")}), ` +
+        `a project name, or a .uproject path. Defaults to the active session ` +
+        `(project(action="list_editors") reports it).`,
+    );
+}
+
+export interface CategoryOptions {
+  /**
+   * Fold a category's accepted parameter spellings into its canonical ones
+   * before dispatch, in one place instead of once per action (#798).
+   *
+   * It runs after the action is resolved and before the action's own
+   * `mapParams`, so it also covers actions injected into the category after
+   * construction (Epic toolset wrappers, plugin native modules). Throwing
+   * from here is how a category rejects a malformed or contradictory
+   * parameter combination with a specific message.
+   */
+  normalizeParams?: (params: Record<string, unknown>) => Record<string, unknown>;
 }
 
 export function categoryTool(
@@ -93,6 +313,7 @@ export function categoryTool(
   actions: Record<string, ActionSpec>,
   actionDocs?: string,
   extraSchema?: Record<string, z.ZodType>,
+  options?: CategoryOptions,
 ): ToolDef {
   const actionNames = Object.keys(actions) as [string, ...string[]];
 
@@ -104,7 +325,7 @@ export function categoryTool(
     })
     .join("\n");
 
-  return {
+  const def: ToolDef = {
     name,
     description: `${summary}\n\nActions:\n${docs}`,
     schema: {
@@ -112,22 +333,36 @@ export function categoryTool(
       ...extraSchema,
     },
     actions,
-    handler: async (ctx, params) => {
+    handler: async (ctx, rawParams) => {
+      // `editor` is a routing instruction, never a handler parameter, and only
+      // on a tool that had it injected. Strip it here so no path can forward
+      // it into a bridge call.
+      const params = def.injectedEditorParam ? stripEditorTarget(rawParams) : rawParams;
       const action = params.action as string;
       const spec = actions[action];
       if (!spec) {
-        throw new McpError(ErrorCode.UNKNOWN_ACTION, `Unknown action '${action}'. Available: ${actionNames.join(", ")}`);
+        // Read the live keys, not the construction-time tuple: enrichment adds
+        // epic_* actions after the fact, and a stale list here sends an agent
+        // hunting for an action the tool actually has.
+        throw new McpError(ErrorCode.UNKNOWN_ACTION, `Unknown action '${action}'. Available: ${Object.keys(actions).join(", ")}`);
       }
+      const normalized = options?.normalizeParams ? options.normalizeParams(params) : params;
       if (spec.handler) {
-        return spec.handler(ctx, params);
+        return spec.handler(ctx, normalized);
       }
       if (spec.bridge) {
-        const mapped = spec.mapParams ? spec.mapParams(params) : stripAction(params);
+        const mapped = spec.mapParams ? spec.mapParams(normalized) : stripAction(normalized);
         return ctx.bridge.call(spec.bridge, mapped, spec.timeoutMs);
       }
       throw new McpError(ErrorCode.NO_HANDLER, `Action '${action}' has no handler or bridge method`);
     },
   };
+  // Rebuilding through the same constructor is what makes a per-session copy
+  // real: the handler closes over `actions`, so a copy that only replaced the
+  // record would still dispatch against the original's.
+  def.rebuild = (nextActions) =>
+    categoryTool(name, summary, nextActions, actionDocs, extraSchema, options);
+  return def;
 }
 
 function stripAction(params: Record<string, unknown>): Record<string, unknown> {
@@ -135,11 +370,38 @@ function stripAction(params: Record<string, unknown>): Record<string, unknown> {
   return rest;
 }
 
+/**
+ * Re-point a context at one editor. Bridge, project and session move together
+ * so a handler can never resolve a path in one project while calling into
+ * another project's editor.
+ */
+export function sessionContext(ctx: ToolContext, session: EditorSession): ToolContext {
+  const { getFlows, getPlugins } = ctx;
+  return {
+    ...ctx,
+    bridge: session.guarded,
+    project: session.project,
+    session,
+    // Rebound, not copied: these read per-project config, so leaving them
+    // pointed at the context's previous session would report one editor's
+    // flows and plugins under another editor's name.
+    getFlows: getFlows ? () => getFlows(session) : undefined,
+    getPlugins: getPlugins ? () => getPlugins(session) : undefined,
+  };
+}
+
+/** Drop the routing parameter from a param bag. */
+export function stripEditorTarget(params: Record<string, unknown>): Record<string, unknown> {
+  if (!(EDITOR_TARGET_PARAM in params)) return params;
+  const { [EDITOR_TARGET_PARAM]: _dropped, ...rest } = params;
+  return rest;
+}
+
 export function bp(bridge: string, mapParams?: (p: Record<string, unknown>) => Record<string, unknown>): ActionSpec;
 export function bp(description: string, bridge: string, mapParams?: (p: Record<string, unknown>) => Record<string, unknown>): ActionSpec;
 export function bp(...args: unknown[]): ActionSpec {
-  // bp(bridge) or bp(bridge, mapParams) — no description
-  // bp(description, bridge) or bp(description, bridge, mapParams) — with description
+  // bp(bridge) or bp(bridge, mapParams) - no description
+  // bp(description, bridge) or bp(description, bridge, mapParams) - with description
   if (args.length >= 2 && typeof args[0] === "string" && typeof args[1] === "string") {
     return { description: args[0] as string, bridge: args[1] as string, mapParams: args[2] as ((p: Record<string, unknown>) => Record<string, unknown>) | undefined };
   }
@@ -168,7 +430,7 @@ export interface DirectiveMachine {
 
 export interface DirectiveResponse {
   __directive: true;
-  directive: string;            // instruction text — emitted as its own content block
+  directive: string;            // instruction text - emitted as its own content block
   machine?: DirectiveMachine;   // structured mirror for programmatic consumers
   result: unknown;              // actual tool result
 }

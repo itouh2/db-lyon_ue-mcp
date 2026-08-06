@@ -2,6 +2,7 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerAssetCreate.h"
+#include "HandlerJsonProperty.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "IAssetTools.h"
@@ -53,11 +54,11 @@
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 
-// IK Rig (#93) — use subdirectory path for UE 5.7
+// IK Rig (#93) - use subdirectory path for UE 5.7
 #include "Rig/IKRigDefinition.h"
 #include "RigEditor/IKRigController.h"
 
-// Control Rig (#11) — ControlRigBlueprint removed in UE 5.7, use reflection
+// Control Rig (#11) - ControlRigBlueprint removed in UE 5.7, use reflection
 #include "ControlRig.h"
 #include "Rigs/RigHierarchy.h"
 
@@ -78,6 +79,7 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("scan_animation_tracks"), &ScanAnimationTracks);
 	Registry.RegisterHandler(TEXT("create_anim_blueprint"), &CreateAnimBlueprint);
 	Registry.RegisterHandler(TEXT("create_anim_montage"), &CreateMontage);
+	Registry.RegisterHandler(TEXT("author_montages_batch"), &AuthorMontagesBatch);
 	Registry.RegisterHandler(TEXT("create_blendspace"), &CreateBlendspace);
 	Registry.RegisterHandler(TEXT("create_blendspace_1d"), &CreateBlendspace1D);
 	Registry.RegisterHandler(TEXT("add_blend_sample"), &AddBlendSample);
@@ -121,6 +123,11 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("set_montage_slot"), &SetMontageSlot);
 	Registry.RegisterHandler(TEXT("add_montage_section"), &AddMontageSection);
 
+	// Montage segment authoring (#826)
+	Registry.RegisterHandler(TEXT("add_montage_segment"), &AddMontageSegment);
+	Registry.RegisterHandler(TEXT("remove_montage_segment"), &RemoveMontageSegment);
+	Registry.RegisterHandler(TEXT("list_montage_segments"), &ListMontageSegments);
+
 	// IK Rig (#93)
 	Registry.RegisterHandler(TEXT("create_ik_rig"), &CreateIKRig);
 	Registry.RegisterHandler(TEXT("read_ik_rig"), &ReadIKRig);
@@ -133,26 +140,27 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 
 	// Control Rig (#11)
 	Registry.RegisterHandler(TEXT("list_control_rig_variables"), &ListControlRigVariables);
+	Registry.RegisterHandler(TEXT("read_control_rig_graph"), &ReadControlRigGraph);
 	Registry.RegisterHandler(TEXT("read_control_rig_hierarchy"), &ReadControlRigHierarchy);
 
-	// v0.7.11 — depth
+	// v0.7.11 - depth
 	Registry.RegisterHandler(TEXT("set_root_motion_settings"), &SetRootMotionSettings);
 	Registry.RegisterHandler(TEXT("add_virtual_bone"), &AddVirtualBone);
 	Registry.RegisterHandler(TEXT("remove_virtual_bone"), &RemoveVirtualBone);
 	Registry.RegisterHandler(TEXT("create_anim_composite"), &CreateAnimComposite);
 	Registry.RegisterHandler(TEXT("list_anim_modifiers"), &ListAnimModifiers);
 
-	// v0.7.11 — issue fixes
+	// v0.7.11 - issue fixes
 	Registry.RegisterHandler(TEXT("create_ik_retargeter"), &CreateIKRetargeter);
 	Registry.RegisterHandler(TEXT("read_ik_retargeter"), &ReadIKRetargeter);
 	Registry.RegisterHandler(TEXT("set_anim_blueprint_skeleton"), &SetAnimBlueprintSkeleton);
 	Registry.RegisterHandler(TEXT("read_bone_track"), &ReadBoneTrack);
 
-	// v1.0.0-rc.2 — animation authoring gaps (#153, #154)
+	// v1.0.0-rc.2 - animation authoring gaps (#153, #154)
 	Registry.RegisterHandler(TEXT("set_sequence_properties"), &SetSequenceProperties);
 	Registry.RegisterHandler(TEXT("bake_root_motion_from_bone"), &BakeRootMotionFromBone);
 
-	// v0.7.15 — PoseSearch (motion matching)
+	// v0.7.15 - PoseSearch (motion matching)
 	Registry.RegisterHandler(TEXT("create_pose_search_database"), &CreatePoseSearchDatabase);
 	Registry.RegisterHandler(TEXT("set_pose_search_schema"), &SetPoseSearchSchema);
 	Registry.RegisterHandler(TEXT("add_pose_search_sequence"), &AddPoseSearchSequence);
@@ -173,11 +181,11 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("add_pose_history_node"), &AddPoseHistoryNode);
 	Registry.RegisterHandler(TEXT("set_motion_matching_chooser"), &SetMotionMatchingChooser);
 
-	// #713 — distance-matching graph authoring
+	// #713 - distance-matching graph authoring
 	Registry.RegisterHandler(TEXT("add_sequence_evaluator"), &AddSequenceEvaluator);
 	Registry.RegisterHandler(TEXT("bind_anim_node_function"), &BindAnimNodeFunction);
 
-	// #419/#420 — live-actor skeletal reads + rebind + preview (moved from Level)
+	// #419/#420 - live-actor skeletal reads + rebind + preview (moved from Level)
 	Registry.RegisterHandler(TEXT("get_bone_transform"), &GetBoneTransform);
 	Registry.RegisterHandler(TEXT("list_bones"), &ListBones);
 	Registry.RegisterHandler(TEXT("rebind_leader_pose"), &RebindLeaderPose);
@@ -485,8 +493,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadAnimMontage(const TSharedPtr<FJso
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UAnimMontage* Montage = Cast<UAnimMontage>(LoadedAsset);
+	UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
 	if (!Montage)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
@@ -626,8 +633,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateMontage(const TSharedPtr<FJsonO
 	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
-	UObject* SourceAsset = UEditorAssetLibrary::LoadAsset(AnimSequencePath);
-	UAnimSequence* SourceSequence = Cast<UAnimSequence>(SourceAsset);
+	UAnimSequence* SourceSequence = LoadAssetByPath<UAnimSequence>(AnimSequencePath);
 	if (!SourceSequence)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimSequence at '%s'"), *AnimSequencePath));
@@ -649,6 +655,267 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateMontage(const TSharedPtr<FJsonO
 	Result->SetStringField(TEXT("class"), Created.Asset->GetClass()->GetName());
 	MCPSetDeleteAssetRollback(Result, Created.Asset->GetPathName());
 
+	return MCPResult(Result);
+}
+
+namespace
+{
+	bool MontageBatchCallSucceeded(const TSharedPtr<FJsonValue>& Response, FString& OutError)
+	{
+		if (!Response.IsValid() || Response->Type != EJson::Object)
+		{
+			OutError = TEXT("Handler returned an invalid response");
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject> Object = Response->AsObject();
+		bool bSuccess = false;
+		if (!Object.IsValid() || !Object->TryGetBoolField(TEXT("success"), bSuccess) || !bSuccess)
+		{
+			if (!Object.IsValid() || !Object->TryGetStringField(TEXT("error"), OutError))
+			{
+				OutError = TEXT("Handler reported failure without an error message");
+			}
+			return false;
+		}
+		return true;
+	}
+
+	void CopyOptionalNumber(
+		const TSharedPtr<FJsonObject>& Source,
+		const TCHAR* Field,
+		const TSharedPtr<FJsonObject>& Destination)
+	{
+		double Value = 0.0;
+		if (Source->TryGetNumberField(Field, Value))
+		{
+			Destination->SetNumberField(Field, Value);
+		}
+	}
+
+	bool SaveMontagePackage(const FString& AssetPath, FString& OutError)
+	{
+		UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
+		if (!Montage)
+		{
+			OutError = FString::Printf(TEXT("Failed to reload authored montage '%s' for saving"), *AssetPath);
+			return false;
+		}
+
+		if (!SaveAssetPackage(Montage))
+		{
+			OutError = FString::Printf(
+				TEXT("Failed to save authored montage package '%s'"),
+				*Montage->GetOutermost()->GetName());
+			return false;
+		}
+		return true;
+	}
+}
+
+// Batch-author montages with deterministic per-item results. Existing montages
+// are configured in place, while newly-created montages are included in a
+// delete_asset_batch rollback descriptor.
+TSharedPtr<FJsonValue> FAnimationHandlers::AuthorMontagesBatch(const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* Items = nullptr;
+	if (!Params->TryGetArrayField(TEXT("items"), Items) || !Items)
+	{
+		return MCPError(TEXT("Missing 'items' array"));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ItemResults;
+	TArray<TSharedPtr<FJsonValue>> CreatedPaths;
+	int32 Succeeded = 0;
+	int32 Failed = 0;
+
+	for (int32 ItemIndex = 0; ItemIndex < Items->Num(); ++ItemIndex)
+	{
+		const TSharedPtr<FJsonObject> Item = (*Items)[ItemIndex].IsValid()
+			? (*Items)[ItemIndex]->AsObject()
+			: nullptr;
+		TSharedPtr<FJsonObject> ItemResult = MakeShared<FJsonObject>();
+		ItemResult->SetNumberField(TEXT("index"), ItemIndex);
+
+		FString Name;
+		FString SequencePath;
+		if (!Item.IsValid() ||
+			!Item->TryGetStringField(TEXT("name"), Name) || Name.IsEmpty() ||
+			!Item->TryGetStringField(TEXT("animSequencePath"), SequencePath) || SequencePath.IsEmpty())
+		{
+			ItemResult->SetBoolField(TEXT("success"), false);
+			ItemResult->SetStringField(TEXT("stage"), TEXT("validate"));
+			ItemResult->SetStringField(TEXT("error"), TEXT("Each item requires non-empty 'name' and 'animSequencePath'"));
+			ItemResults.Add(MakeShared<FJsonValueObject>(ItemResult));
+			++Failed;
+			continue;
+		}
+
+		const FString PackagePath = OptionalString(Item, TEXT("packagePath"), TEXT("/Game/Animations"));
+		const FString MontagePath = PackagePath + TEXT("/") + Name;
+		const bool bExistedBefore = UEditorAssetLibrary::DoesAssetExist(MontagePath);
+
+		TSharedPtr<FJsonObject> CreateParams = MakeShared<FJsonObject>();
+		CreateParams->SetStringField(TEXT("name"), Name);
+		CreateParams->SetStringField(TEXT("animSequencePath"), SequencePath);
+		CreateParams->SetStringField(TEXT("packagePath"), PackagePath);
+		CreateParams->SetStringField(TEXT("onConflict"), OptionalString(Item, TEXT("onConflict"), TEXT("skip")));
+
+		FString Error;
+		// Which authoring step a failure came from. Every step below writes to
+		// the same montage, so the sub-handler's message alone ("Failed to load
+		// AnimMontage at ...") does not say what the caller got wrong.
+		FString Stage;
+		if (!MontageBatchCallSucceeded(FAnimationHandlers::CreateMontage(CreateParams), Error))
+		{
+			ItemResult->SetBoolField(TEXT("success"), false);
+			ItemResult->SetStringField(TEXT("name"), Name);
+			ItemResult->SetStringField(TEXT("stage"), TEXT("create"));
+			ItemResult->SetStringField(TEXT("error"), Error);
+			ItemResults.Add(MakeShared<FJsonValueObject>(ItemResult));
+			++Failed;
+			continue;
+		}
+
+		bool bItemSuccess = true;
+		const FString SlotName = OptionalString(Item, TEXT("slotName"));
+		if (!SlotName.IsEmpty())
+		{
+			TSharedPtr<FJsonObject> SlotParams = MakeShared<FJsonObject>();
+			SlotParams->SetStringField(TEXT("assetPath"), MontagePath);
+			SlotParams->SetStringField(TEXT("slotName"), SlotName);
+			double TrackIndex = 0.0;
+			if (Item->TryGetNumberField(TEXT("trackIndex"), TrackIndex))
+			{
+				SlotParams->SetNumberField(TEXT("trackIndex"), TrackIndex);
+			}
+			bItemSuccess = MontageBatchCallSucceeded(FAnimationHandlers::SetMontageSlot(SlotParams), Error);
+			if (!bItemSuccess) Stage = TEXT("slot");
+		}
+
+		TSharedPtr<FJsonObject> PropertyParams = MakeShared<FJsonObject>();
+		PropertyParams->SetStringField(TEXT("assetPath"), MontagePath);
+		CopyOptionalNumber(Item, TEXT("rateScale"), PropertyParams);
+		CopyOptionalNumber(Item, TEXT("blendIn"), PropertyParams);
+		CopyOptionalNumber(Item, TEXT("blendOut"), PropertyParams);
+		CopyOptionalNumber(Item, TEXT("sequenceLength"), PropertyParams);
+		if (bItemSuccess && PropertyParams->Values.Num() > 1)
+		{
+			bItemSuccess = MontageBatchCallSucceeded(FAnimationHandlers::SetMontageProperties(PropertyParams), Error);
+			if (!bItemSuccess) Stage = TEXT("properties");
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* Sections = nullptr;
+		if (bItemSuccess && Item->TryGetArrayField(TEXT("sections"), Sections) && Sections)
+		{
+			for (const TSharedPtr<FJsonValue>& SectionValue : *Sections)
+			{
+				const TSharedPtr<FJsonObject> Section = SectionValue.IsValid() ? SectionValue->AsObject() : nullptr;
+				FString SectionName;
+				if (!Section.IsValid() || !Section->TryGetStringField(TEXT("sectionName"), SectionName))
+				{
+					bItemSuccess = false;
+					Stage = TEXT("sections");
+					Error = TEXT("Each section requires 'sectionName'");
+					break;
+				}
+				TSharedPtr<FJsonObject> SectionParams = MakeShared<FJsonObject>();
+				SectionParams->SetStringField(TEXT("assetPath"), MontagePath);
+				SectionParams->SetStringField(TEXT("sectionName"), SectionName);
+				CopyOptionalNumber(Section, TEXT("startTime"), SectionParams);
+				FString LinkedSection;
+				if (Section->TryGetStringField(TEXT("linkedSection"), LinkedSection))
+				{
+					SectionParams->SetStringField(TEXT("linkedSection"), LinkedSection);
+				}
+				if (!MontageBatchCallSucceeded(FAnimationHandlers::AddMontageSection(SectionParams), Error))
+				{
+					bItemSuccess = false;
+					Stage = TEXT("sections");
+					break;
+				}
+			}
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* Notifies = nullptr;
+		if (bItemSuccess && Item->TryGetArrayField(TEXT("notifies"), Notifies) && Notifies)
+		{
+			for (const TSharedPtr<FJsonValue>& NotifyValue : *Notifies)
+			{
+				const TSharedPtr<FJsonObject> Notify = NotifyValue.IsValid() ? NotifyValue->AsObject() : nullptr;
+				FString NotifyName;
+				double TriggerTime = 0.0;
+				if (!Notify.IsValid() ||
+					!Notify->TryGetStringField(TEXT("notifyName"), NotifyName) ||
+					!Notify->TryGetNumberField(TEXT("triggerTime"), TriggerTime))
+				{
+					bItemSuccess = false;
+					Stage = TEXT("notifies");
+					Error = TEXT("Each notify requires 'notifyName' and numeric 'triggerTime'");
+					break;
+				}
+				TSharedPtr<FJsonObject> NotifyParams = MakeShared<FJsonObject>();
+				NotifyParams->SetStringField(TEXT("assetPath"), MontagePath);
+				NotifyParams->SetStringField(TEXT("notifyName"), NotifyName);
+				NotifyParams->SetNumberField(TEXT("triggerTime"), TriggerTime);
+				FString NotifyClass;
+				if (Notify->TryGetStringField(TEXT("notifyClass"), NotifyClass))
+				{
+					NotifyParams->SetStringField(TEXT("notifyClass"), NotifyClass);
+				}
+				const TSharedPtr<FJsonObject>* NotifyProperties = nullptr;
+				if (Notify->TryGetObjectField(TEXT("properties"), NotifyProperties) && NotifyProperties)
+				{
+					NotifyParams->SetObjectField(TEXT("notifyProperties"), *NotifyProperties);
+				}
+				if (!MontageBatchCallSucceeded(FAnimationHandlers::AddAnimNotify(NotifyParams), Error))
+				{
+					bItemSuccess = false;
+					Stage = TEXT("notifies");
+					break;
+				}
+			}
+		}
+
+		if (bItemSuccess)
+		{
+			bItemSuccess = SaveMontagePackage(MontagePath, Error);
+			if (!bItemSuccess) Stage = TEXT("save");
+		}
+
+		ItemResult->SetBoolField(TEXT("success"), bItemSuccess);
+		ItemResult->SetStringField(TEXT("name"), Name);
+		ItemResult->SetStringField(TEXT("assetPath"), MontagePath);
+		ItemResult->SetBoolField(TEXT("created"), !bExistedBefore);
+		ItemResult->SetBoolField(TEXT("existed"), bExistedBefore);
+		if (!bItemSuccess)
+		{
+			ItemResult->SetStringField(TEXT("stage"), Stage);
+			ItemResult->SetStringField(TEXT("error"), Error);
+			++Failed;
+		}
+		else
+		{
+			++Succeeded;
+		}
+		if (!bExistedBefore)
+		{
+			CreatedPaths.Add(MakeShared<FJsonValueString>(MontagePath));
+		}
+		ItemResults.Add(MakeShared<FJsonValueObject>(ItemResult));
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetNumberField(TEXT("requested"), Items->Num());
+	Result->SetNumberField(TEXT("succeeded"), Succeeded);
+	Result->SetNumberField(TEXT("failed"), Failed);
+	Result->SetArrayField(TEXT("items"), ItemResults);
+	if (CreatedPaths.Num() > 0)
+	{
+		TSharedPtr<FJsonObject> RollbackPayload = MakeShared<FJsonObject>();
+		RollbackPayload->SetArrayField(TEXT("assetPaths"), CreatedPaths);
+		MCPSetRollback(Result, TEXT("delete_asset_batch"), RollbackPayload);
+	}
 	return MCPResult(Result);
 }
 
@@ -745,9 +1012,8 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 
 	FString NotifyClassName = OptionalString(Params, TEXT("notifyClass"));
 
-	// Load the animation asset — could be a montage or a sequence
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UAnimSequenceBase* AnimAsset = Cast<UAnimSequenceBase>(LoadedAsset);
+	// Load the animation asset - could be a montage or a sequence
+	UAnimSequenceBase* AnimAsset = LoadAssetByPath<UAnimSequenceBase>(AssetPath);
 	if (!AnimAsset)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimSequenceBase at '%s'"), *AssetPath));
@@ -776,7 +1042,11 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 	UAnimNotify* NewNotify = nullptr;
 	if (!NotifyClassName.IsEmpty())
 	{
-		UClass* NotifyClass = FindFirstObject<UClass>(*NotifyClassName);
+		UClass* NotifyClass = LoadObject<UClass>(nullptr, *NotifyClassName);
+		if (!NotifyClass)
+		{
+			NotifyClass = FindFirstObject<UClass>(*NotifyClassName);
+		}
 		if (!NotifyClass)
 		{
 			// Try with full path prefix
@@ -785,6 +1055,49 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 		if (NotifyClass && NotifyClass->IsChildOf(UAnimNotify::StaticClass()))
 		{
 			NewNotify = NewObject<UAnimNotify>(AnimAsset, NotifyClass);
+		}
+	}
+
+	// notifyProperties writes onto the spawned notify OBJECT, so it only has
+	// somewhere to land when notifyClass resolved. Reporting success while
+	// quietly dropping the requested values is the failure mode this guards.
+	const TSharedPtr<FJsonObject>* NotifyProperties = nullptr;
+	if (Params->TryGetObjectField(TEXT("notifyProperties"), NotifyProperties)
+		&& NotifyProperties && (*NotifyProperties).IsValid() && (*NotifyProperties)->Values.Num() > 0)
+	{
+		if (!NewNotify)
+		{
+			if (NotifyClassName.IsEmpty())
+			{
+				return MCPError(TEXT("'notifyProperties' requires 'notifyClass': a bare notify event has no notify object to write properties onto"));
+			}
+			return MCPError(FString::Printf(
+				TEXT("notifyClass '%s' did not resolve to a UAnimNotify subclass, so 'notifyProperties' could not be applied"),
+				*NotifyClassName));
+		}
+
+		for (const TPair<FString, TSharedPtr<FJsonValue>>& Entry : (*NotifyProperties)->Values)
+		{
+			FProperty* Property = NewNotify->GetClass()->FindPropertyByName(FName(*Entry.Key));
+			if (!Property)
+			{
+				return MCPError(FString::Printf(
+					TEXT("Notify class '%s' has no property '%s'"),
+					*NewNotify->GetClass()->GetName(),
+					*Entry.Key));
+			}
+			FString PropertyError;
+			if (!MCPJsonProperty::SetJsonOnProperty(
+				Property,
+				Property->ContainerPtrToValuePtr<void>(NewNotify),
+				Entry.Value,
+				PropertyError))
+			{
+				return MCPError(FString::Printf(
+					TEXT("Failed to set notify property '%s': %s"),
+					*Entry.Key,
+					*PropertyError));
+			}
 		}
 	}
 
@@ -861,8 +1174,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveAnimNotify(const TSharedPtr<FJs
 		return MCPError(TEXT("Pass at least one of 'notifyName' or 'notifyClass'"));
 	}
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UAnimSequenceBase* AnimAsset = Cast<UAnimSequenceBase>(LoadedAsset);
+	UAnimSequenceBase* AnimAsset = LoadAssetByPath<UAnimSequenceBase>(AssetPath);
 	if (!AnimAsset)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimSequenceBase at '%s'"), *AssetPath));
@@ -1353,7 +1665,7 @@ static void SetMontageSequenceLength(UAnimMontage* Montage, float NewLength)
 }
 
 // ---------------------------------------------------------------------------
-// set_montage_sequence — Replace the animation sequence in a montage's slot track
+// set_montage_sequence - Replace the animation sequence in a montage's slot track
 // Params: assetPath, animSequencePath, slotIndex? (default 0)
 // ---------------------------------------------------------------------------
 TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageSequence(const TSharedPtr<FJsonObject>& Params)
@@ -1367,16 +1679,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageSequence(const TSharedPtr<F
 	double SlotIndex = OptionalNumber(Params, TEXT("slotIndex"), 0.0);
 
 	// Load the montage
-	UObject* MontageAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UAnimMontage* Montage = Cast<UAnimMontage>(MontageAsset);
+	UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
 	if (!Montage)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
 	}
 
 	// Load the new sequence
-	UObject* SeqAsset = UEditorAssetLibrary::LoadAsset(AnimSequencePath);
-	UAnimSequence* NewSequence = Cast<UAnimSequence>(SeqAsset);
+	UAnimSequence* NewSequence = LoadAssetByPath<UAnimSequence>(AnimSequencePath);
 	if (!NewSequence)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimSequence at '%s'"), *AnimSequencePath));
@@ -1460,7 +1770,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageSequence(const TSharedPtr<F
 }
 
 // ---------------------------------------------------------------------------
-// set_montage_properties — Set montage properties (duration, rate, blending)
+// set_montage_properties - Set montage properties (duration, rate, blending)
 // Params: assetPath, sequenceLength?, rateScale?, blendIn?, blendOut?
 // ---------------------------------------------------------------------------
 TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageProperties(const TSharedPtr<FJsonObject>& Params)
@@ -1468,8 +1778,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageProperties(const TSharedPtr
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* MontageAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UAnimMontage* Montage = Cast<UAnimMontage>(MontageAsset);
+	UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
 	if (!Montage)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
@@ -1484,7 +1793,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageProperties(const TSharedPtr
 	TArray<FString> Modified;
 	bool bAnyChanged = false;
 
-	// sequenceLength — update via property reflection (SequenceLength is protected)
+	// sequenceLength - update via property reflection (SequenceLength is protected)
 	double SeqLen;
 	const bool bHasSeqLen = Params->TryGetNumberField(TEXT("sequenceLength"), SeqLen);
 	if (bHasSeqLen)
@@ -1598,8 +1907,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageSlot(const TSharedPtr<FJson
 
 	int32 TrackIndex = OptionalInt(Params, TEXT("trackIndex"), 0);
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UAnimMontage* Montage = Cast<UAnimMontage>(LoadedAsset);
+	UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
 	if (!Montage)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
@@ -1644,6 +1952,136 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageSlot(const TSharedPtr<FJson
 	return MCPResult(Result);
 }
 
+// ─── #826  montage segment authoring helpers ────────────────────────
+//
+// UAnimMontage::SlotAnimTracks carries no script-visible specifier, so the whole
+// slot -> FAnimTrack -> FAnimSegment chain is unreachable from Python. Every
+// multi-segment montage edit therefore has to be driven from here.
+
+namespace MCPMontageSegments
+{
+	/** Resolve the slot a call targets. 'slotName' wins over 'slotIndex', and
+	 *  omitting both targets slot 0, which is the one create_montage produces.
+	 *  Never creates a slot: callers that may create do so after validating, so
+	 *  a rejected call cannot leave an empty slot on the asset. */
+	static FSlotAnimationTrack* FindSlot(
+		UAnimMontage* Montage,
+		const TSharedPtr<FJsonObject>& Params,
+		int32& OutSlotIndex,
+		FString& OutError)
+	{
+		const FString SlotName = OptionalString(Params, TEXT("slotName"));
+		if (!SlotName.IsEmpty())
+		{
+			const FName Wanted(*SlotName);
+			for (int32 Idx = 0; Idx < Montage->SlotAnimTracks.Num(); ++Idx)
+			{
+				if (Montage->SlotAnimTracks[Idx].SlotName == Wanted)
+				{
+					OutSlotIndex = Idx;
+					return &Montage->SlotAnimTracks[Idx];
+				}
+			}
+
+			TArray<FString> Known;
+			for (const FSlotAnimationTrack& Track : Montage->SlotAnimTracks)
+			{
+				Known.Add(Track.SlotName.ToString());
+			}
+			OutError = FString::Printf(
+				TEXT("Montage has no slot named '%s' (slots: %s)"),
+				*SlotName,
+				Known.Num() > 0 ? *FString::Join(Known, TEXT(", ")) : TEXT("none"));
+			return nullptr;
+		}
+
+		const int32 SlotIndex = OptionalInt(Params, TEXT("slotIndex"), 0);
+		if (!Montage->SlotAnimTracks.IsValidIndex(SlotIndex))
+		{
+			OutError = FString::Printf(
+				TEXT("slotIndex %d out of range (montage has %d slot(s))"),
+				SlotIndex, Montage->SlotAnimTracks.Num());
+			return nullptr;
+		}
+		OutSlotIndex = SlotIndex;
+		return &Montage->SlotAnimTracks[SlotIndex];
+	}
+
+	/** Lay every slot's segments out back to back in array order, refresh the
+	 *  sections and notifies that link to them, then write the montage length the
+	 *  new layout implies. Without this pass an edited montage keeps its old
+	 *  length and its section markers point at times that no longer exist, which
+	 *  is what makes the asset unplayable past the first segment. */
+	static float Relayout(UAnimMontage* Montage)
+	{
+		for (FSlotAnimationTrack& Track : Montage->SlotAnimTracks)
+		{
+			float Cursor = 0.0f;
+			for (FAnimSegment& Segment : Track.AnimTrack.AnimSegments)
+			{
+				Segment.StartPos = Cursor;
+				Cursor += Segment.GetLength();
+			}
+		}
+
+		// Re-resolve section/notify links against the new segment positions.
+		Montage->UpdateLinkableElements();
+
+		const float NewLength = Montage->CalculateSequenceLength();
+
+		// Pull anything now past the end back in before the length shrinks.
+		for (FCompositeSection& Section : Montage->CompositeSections)
+		{
+			if (Section.GetTime() > NewLength) Section.SetTime(NewLength);
+		}
+		for (FAnimNotifyEvent& Notify : Montage->Notifies)
+		{
+			if (Notify.GetTime() > NewLength) Notify.SetTime(NewLength);
+		}
+
+		Montage->SetCompositeLength(NewLength);
+
+		Montage->CompositeSections.Sort([](const FCompositeSection& A, const FCompositeSection& B)
+		{
+			return A.GetTime() < B.GetTime();
+		});
+		UAnimMontageFactory::EnsureStartingSection(Montage);
+
+		// Also refreshes the montage's common target frame rate, which follows
+		// whatever the segments now reference.
+		Montage->PostEditChange();
+
+		// SetCompositeLength quantizes to whole frames, so report what the asset
+		// actually ended up with rather than the raw sum.
+		return Montage->GetPlayLength();
+	}
+
+	/** One segment as JSON. Field names match read_montage's segment shape so a
+	 *  caller can read and address segments with the same vocabulary. */
+	static TSharedPtr<FJsonObject> DescribeSegment(const FAnimSegment& Segment, int32 SegmentIndex)
+	{
+		TSharedPtr<FJsonObject> Obj = MakeShared<FJsonObject>();
+		Obj->SetNumberField(TEXT("segmentIndex"), SegmentIndex);
+		if (const UAnimSequenceBase* Anim = Segment.GetAnimReference().Get())
+		{
+			Obj->SetStringField(TEXT("animation"), Anim->GetPathName());
+			Obj->SetStringField(TEXT("animationName"), Anim->GetName());
+		}
+		else
+		{
+			Obj->SetField(TEXT("animation"), MakeShared<FJsonValueNull>());
+		}
+		Obj->SetNumberField(TEXT("startPos"), Segment.AnimStartTime);
+		Obj->SetNumberField(TEXT("endPos"), Segment.AnimEndTime);
+		Obj->SetNumberField(TEXT("playRate"), Segment.AnimPlayRate);
+		Obj->SetNumberField(TEXT("loopCount"), Segment.LoopingCount);
+		Obj->SetNumberField(TEXT("trackStartPos"), Segment.StartPos);
+		Obj->SetNumberField(TEXT("trackEndPos"), Segment.GetEndPos());
+		Obj->SetNumberField(TEXT("length"), Segment.GetLength());
+		return Obj;
+	}
+}
+
 // ─── #27  add_montage_section ───────────────────────────────────────
 
 TSharedPtr<FJsonValue> FAnimationHandlers::AddMontageSection(const TSharedPtr<FJsonObject>& Params)
@@ -1657,11 +2095,38 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddMontageSection(const TSharedPtr<FJ
 	double StartTime = OptionalNumber(Params, TEXT("startTime"), 0.0);
 	FString LinkedSection = OptionalString(Params, TEXT("linkedSection"));
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UAnimMontage* Montage = Cast<UAnimMontage>(LoadedAsset);
+	UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
 	if (!Montage)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
+	}
+
+	// #826: anchor the section to a specific segment. A bare startTime marker
+	// drifts the moment a segment is inserted ahead of it; a linked section
+	// follows its segment instead. Resolved before the idempotency check so a
+	// bad slot or segment index is reported rather than silently skipped.
+	const bool bHasSegmentIndex = Params->HasField(TEXT("segmentIndex"));
+	int32 SlotIndex = 0;
+	int32 SegmentIndex = INDEX_NONE;
+	FString SlotNameUsed;
+	if (bHasSegmentIndex)
+	{
+		FString SlotError;
+		FSlotAnimationTrack* SlotTrack = MCPMontageSegments::FindSlot(Montage, Params, SlotIndex, SlotError);
+		if (!SlotTrack) return MCPError(SlotError);
+
+		SegmentIndex = OptionalInt(Params, TEXT("segmentIndex"), 0);
+		if (!SlotTrack->AnimTrack.AnimSegments.IsValidIndex(SegmentIndex))
+		{
+			return MCPError(FString::Printf(
+				TEXT("segmentIndex %d out of range (slot '%s' has %d segment(s))"),
+				SegmentIndex,
+				*SlotTrack->SlotName.ToString(),
+				SlotTrack->AnimTrack.AnimSegments.Num()));
+		}
+
+		SlotNameUsed = SlotTrack->SlotName.ToString();
+		StartTime = SlotTrack->AnimTrack.AnimSegments[SegmentIndex].StartPos;
 	}
 
 	// Idempotency: existing section short-circuits
@@ -1689,6 +2154,15 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddMontageSection(const TSharedPtr<FJ
 	{
 		NewSection.NextSectionName = FName(*LinkedSection);
 	}
+	if (bHasSegmentIndex)
+	{
+		// Link resolves the segment from the time; pin the index explicitly so a
+		// zero-length neighbour cannot claim the shared boundary, then refresh the
+		// cached segment begin time and length from that index.
+		NewSection.Link(Montage, static_cast<float>(StartTime), SlotIndex);
+		NewSection.SetSegmentIndex(SegmentIndex);
+		NewSection.Update();
+	}
 
 	Montage->CompositeSections.Add(NewSection);
 
@@ -1704,8 +2178,344 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddMontageSection(const TSharedPtr<FJ
 	{
 		Result->SetStringField(TEXT("linkedSection"), LinkedSection);
 	}
+	if (bHasSegmentIndex)
+	{
+		Result->SetNumberField(TEXT("segmentIndex"), SegmentIndex);
+		Result->SetNumberField(TEXT("slotIndex"), SlotIndex);
+		Result->SetStringField(TEXT("slotName"), SlotNameUsed);
+	}
 	Result->SetNumberField(TEXT("totalSections"), Montage->CompositeSections.Num());
 	// No rollback: no paired remove_montage_section handler.
+
+	return MCPResult(Result);
+}
+
+// ─── #826  add_montage_segment ──────────────────────────────────────
+
+TSharedPtr<FJsonValue> FAnimationHandlers::AddMontageSegment(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	FString AnimSequencePath;
+	if (auto Err = RequireString(Params, TEXT("animSequencePath"), AnimSequencePath)) return Err;
+
+	UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
+	if (!Montage)
+	{
+		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
+	}
+
+	UAnimSequenceBase* Source = LoadAssetByPath<UAnimSequenceBase>(AnimSequencePath);
+	if (!Source)
+	{
+		return MCPError(FString::Printf(TEXT("Failed to load AnimSequenceBase at '%s'"), *AnimSequencePath));
+	}
+	if (Source == Montage)
+	{
+		return MCPError(TEXT("A montage cannot contain itself as a segment"));
+	}
+	if (!Source->CanBeUsedInComposition())
+	{
+		return MCPError(FString::Printf(
+			TEXT("'%s' is a %s, which cannot be used as a montage segment (use an AnimSequence or AnimComposite)"),
+			*AnimSequencePath, *Source->GetClass()->GetName()));
+	}
+
+	// A segment from a foreign skeleton evaluates to garbage at runtime instead
+	// of failing loudly, so refuse it up front. Skeletons the montage's skeleton
+	// declares compatible are accepted, matching what the editor allows.
+	USkeleton* MontageSkeleton = Montage->GetSkeleton();
+	USkeleton* SourceSkeleton = Source->GetSkeleton();
+	if (MontageSkeleton && SourceSkeleton
+		&& MontageSkeleton != SourceSkeleton
+		&& !MontageSkeleton->IsCompatibleForEditor(SourceSkeleton))
+	{
+		return MCPError(FString::Printf(
+			TEXT("Skeleton mismatch: montage '%s' uses '%s' but '%s' uses '%s', which is not listed as a compatible skeleton"),
+			*Montage->GetName(), *MontageSkeleton->GetPathName(),
+			*Source->GetName(), *SourceSkeleton->GetPathName()));
+	}
+
+	const float SourceLength = Source->GetPlayLength();
+	if (SourceLength <= 0.0f)
+	{
+		return MCPError(FString::Printf(
+			TEXT("Animation '%s' has no playable length"), *AnimSequencePath));
+	}
+
+	const float StartPos = static_cast<float>(OptionalNumber(Params, TEXT("startPos"), 0.0));
+	const float EndPos = static_cast<float>(OptionalNumber(Params, TEXT("endPos"), SourceLength));
+	const float PlayRate = static_cast<float>(OptionalNumber(Params, TEXT("playRate"), 1.0));
+	const int32 LoopCount = OptionalInt(Params, TEXT("loopCount"), 1);
+
+	if (StartPos < 0.0f || EndPos > SourceLength + UE_KINDA_SMALL_NUMBER || StartPos >= EndPos)
+	{
+		return MCPError(FString::Printf(
+			TEXT("Invalid trim: startPos %.4f and endPos %.4f must satisfy 0 <= startPos < endPos <= %.4f (play length of '%s')"),
+			StartPos, EndPos, SourceLength, *Source->GetName()));
+	}
+	if (FMath::IsNearlyZero(PlayRate))
+	{
+		return MCPError(TEXT("'playRate' cannot be zero"));
+	}
+	if (LoopCount < 1)
+	{
+		return MCPError(TEXT("'loopCount' must be 1 or greater"));
+	}
+
+	// Resolve the slot without mutating: a later validation failure must not
+	// leave a stray empty slot on the montage.
+	const FString SlotNameParam = OptionalString(Params, TEXT("slotName"));
+	int32 SlotIndex = INDEX_NONE;
+	if (!SlotNameParam.IsEmpty())
+	{
+		const FName Wanted(*SlotNameParam);
+		for (int32 Idx = 0; Idx < Montage->SlotAnimTracks.Num(); ++Idx)
+		{
+			if (Montage->SlotAnimTracks[Idx].SlotName == Wanted)
+			{
+				SlotIndex = Idx;
+				break;
+			}
+		}
+	}
+	else
+	{
+		SlotIndex = OptionalInt(Params, TEXT("slotIndex"), 0);
+		if (!Montage->SlotAnimTracks.IsValidIndex(SlotIndex))
+		{
+			return MCPError(FString::Printf(
+				TEXT("slotIndex %d out of range (montage has %d slot(s)); pass 'slotName' to author a new slot"),
+				SlotIndex, Montage->SlotAnimTracks.Num()));
+		}
+	}
+
+	const bool bCreateSlot = (SlotIndex == INDEX_NONE);
+	const int32 SegmentCount = bCreateSlot
+		? 0
+		: Montage->SlotAnimTracks[SlotIndex].AnimTrack.AnimSegments.Num();
+
+	// Rejects a source whose additive type disagrees with what the track already
+	// holds, which would otherwise blend incorrectly at runtime.
+	if (!bCreateSlot)
+	{
+		FText AddReason;
+		if (!Montage->SlotAnimTracks[SlotIndex].AnimTrack.IsValidToAdd(Source, &AddReason))
+		{
+			return MCPError(FString::Printf(
+				TEXT("Cannot add '%s' to slot '%s': %s"),
+				*AnimSequencePath,
+				*Montage->SlotAnimTracks[SlotIndex].SlotName.ToString(),
+				*AddReason.ToString()));
+		}
+	}
+
+	const int32 InsertIndex = OptionalInt(Params, TEXT("insertIndex"), SegmentCount);
+	if (InsertIndex < 0 || InsertIndex > SegmentCount)
+	{
+		return MCPError(FString::Printf(
+			TEXT("insertIndex %d out of range (slot holds %d segment(s); %d appends)"),
+			InsertIndex, SegmentCount, SegmentCount));
+	}
+
+	// Everything validated: mutate.
+	if (bCreateSlot)
+	{
+		Montage->AddSlot(FName(*SlotNameParam));
+		SlotIndex = Montage->SlotAnimTracks.Num() - 1;
+	}
+
+	FAnimSegment NewSegment;
+	NewSegment.SetAnimReference(Source, /*bInitialize*/ true);
+	NewSegment.AnimStartTime = StartPos;
+	NewSegment.AnimEndTime = EndPos;
+	NewSegment.AnimPlayRate = PlayRate;
+	NewSegment.LoopingCount = LoopCount;
+
+	FSlotAnimationTrack& SlotTrack = Montage->SlotAnimTracks[SlotIndex];
+	SlotTrack.AnimTrack.AnimSegments.Insert(NewSegment, InsertIndex);
+
+	const float MontageLength = MCPMontageSegments::Relayout(Montage);
+	SaveAssetPackage(Montage);
+
+	auto Result = MCPSuccess();
+	MCPSetCreated(Result);
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetStringField(TEXT("animSequencePath"), AnimSequencePath);
+	Result->SetStringField(TEXT("slotName"), SlotTrack.SlotName.ToString());
+	Result->SetNumberField(TEXT("slotIndex"), SlotIndex);
+	Result->SetBoolField(TEXT("slotCreated"), bCreateSlot);
+	Result->SetNumberField(TEXT("segmentIndex"), InsertIndex);
+	Result->SetNumberField(TEXT("segmentCount"), SlotTrack.AnimTrack.AnimSegments.Num());
+	Result->SetObjectField(
+		TEXT("segment"),
+		MCPMontageSegments::DescribeSegment(SlotTrack.AnimTrack.AnimSegments[InsertIndex], InsertIndex));
+	Result->SetNumberField(TEXT("montageLength"), MontageLength);
+
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("assetPath"), AssetPath);
+	Payload->SetNumberField(TEXT("slotIndex"), SlotIndex);
+	Payload->SetNumberField(TEXT("segmentIndex"), InsertIndex);
+	MCPSetRollback(Result, TEXT("remove_montage_segment"), Payload);
+
+	return MCPResult(Result);
+}
+
+// ─── #826  remove_montage_segment ───────────────────────────────────
+
+TSharedPtr<FJsonValue> FAnimationHandlers::RemoveMontageSegment(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	if (!Params->HasField(TEXT("segmentIndex")))
+	{
+		return MCPError(TEXT("Missing required parameter 'segmentIndex'"));
+	}
+	const int32 SegmentIndex = OptionalInt(Params, TEXT("segmentIndex"), 0);
+
+	UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
+	if (!Montage)
+	{
+		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
+	}
+
+	int32 SlotIndex = 0;
+	FString SlotError;
+	FSlotAnimationTrack* SlotTrack = MCPMontageSegments::FindSlot(Montage, Params, SlotIndex, SlotError);
+	if (!SlotTrack) return MCPError(SlotError);
+
+	TArray<FAnimSegment>& Segments = SlotTrack->AnimTrack.AnimSegments;
+	if (Segments.Num() == 0)
+	{
+		// Idempotent replay: an empty slot has nothing left to remove.
+		auto Noop = MCPSuccess();
+		Noop->SetBoolField(TEXT("alreadyDeleted"), true);
+		Noop->SetStringField(TEXT("assetPath"), AssetPath);
+		Noop->SetStringField(TEXT("slotName"), SlotTrack->SlotName.ToString());
+		Noop->SetNumberField(TEXT("slotIndex"), SlotIndex);
+		Noop->SetNumberField(TEXT("segmentCount"), 0);
+		return MCPResult(Noop);
+	}
+	if (!Segments.IsValidIndex(SegmentIndex))
+	{
+		return MCPError(FString::Printf(
+			TEXT("segmentIndex %d out of range (slot '%s' has %d segment(s))"),
+			SegmentIndex, *SlotTrack->SlotName.ToString(), Segments.Num()));
+	}
+
+	// Copy before removal so the rollback can rebuild the exact segment.
+	const FAnimSegment Removed = Segments[SegmentIndex];
+	Segments.RemoveAt(SegmentIndex);
+
+	const float MontageLength = MCPMontageSegments::Relayout(Montage);
+	SaveAssetPackage(Montage);
+
+	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetStringField(TEXT("slotName"), SlotTrack->SlotName.ToString());
+	Result->SetNumberField(TEXT("slotIndex"), SlotIndex);
+	Result->SetNumberField(TEXT("segmentIndex"), SegmentIndex);
+	Result->SetNumberField(TEXT("segmentCount"), Segments.Num());
+	Result->SetObjectField(TEXT("removed"), MCPMontageSegments::DescribeSegment(Removed, SegmentIndex));
+	Result->SetNumberField(TEXT("montageLength"), MontageLength);
+
+	if (const UAnimSequenceBase* RemovedAnim = Removed.GetAnimReference().Get())
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("assetPath"), AssetPath);
+		Payload->SetStringField(TEXT("animSequencePath"), RemovedAnim->GetPathName());
+		Payload->SetStringField(TEXT("slotName"), SlotTrack->SlotName.ToString());
+		Payload->SetNumberField(TEXT("insertIndex"), SegmentIndex);
+		Payload->SetNumberField(TEXT("startPos"), Removed.AnimStartTime);
+		Payload->SetNumberField(TEXT("endPos"), Removed.AnimEndTime);
+		Payload->SetNumberField(TEXT("playRate"), Removed.AnimPlayRate);
+		Payload->SetNumberField(TEXT("loopCount"), Removed.LoopingCount);
+		MCPSetRollback(Result, TEXT("add_montage_segment"), Payload);
+	}
+
+	return MCPResult(Result);
+}
+
+// ─── #826  list_montage_segments ────────────────────────────────────
+
+TSharedPtr<FJsonValue> FAnimationHandlers::ListMontageSegments(const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
+
+	UAnimMontage* Montage = LoadAssetByPath<UAnimMontage>(AssetPath);
+	if (!Montage)
+	{
+		return MCPError(FString::Printf(TEXT("Failed to load AnimMontage at '%s'"), *AssetPath));
+	}
+
+	const FString SlotFilter = OptionalString(Params, TEXT("slotName"));
+
+	TArray<TSharedPtr<FJsonValue>> SlotsArray;
+	int32 TotalSegments = 0;
+	for (int32 SlotIdx = 0; SlotIdx < Montage->SlotAnimTracks.Num(); ++SlotIdx)
+	{
+		const FSlotAnimationTrack& SlotTrack = Montage->SlotAnimTracks[SlotIdx];
+		if (!SlotFilter.IsEmpty() && SlotTrack.SlotName != FName(*SlotFilter))
+		{
+			continue;
+		}
+
+		TSharedPtr<FJsonObject> SlotObj = MakeShared<FJsonObject>();
+		SlotObj->SetNumberField(TEXT("slotIndex"), SlotIdx);
+		SlotObj->SetStringField(TEXT("slotName"), SlotTrack.SlotName.ToString());
+		SlotObj->SetNumberField(TEXT("trackLength"), SlotTrack.AnimTrack.GetLength());
+
+		TArray<TSharedPtr<FJsonValue>> SegmentsArray;
+		for (int32 SegIdx = 0; SegIdx < SlotTrack.AnimTrack.AnimSegments.Num(); ++SegIdx)
+		{
+			SegmentsArray.Add(MakeShared<FJsonValueObject>(
+				MCPMontageSegments::DescribeSegment(SlotTrack.AnimTrack.AnimSegments[SegIdx], SegIdx)));
+		}
+		TotalSegments += SegmentsArray.Num();
+		SlotObj->SetNumberField(TEXT("segmentCount"), SegmentsArray.Num());
+		SlotObj->SetArrayField(TEXT("segments"), SegmentsArray);
+		SlotsArray.Add(MakeShared<FJsonValueObject>(SlotObj));
+	}
+
+	if (!SlotFilter.IsEmpty() && SlotsArray.Num() == 0)
+	{
+		TArray<FString> Known;
+		for (const FSlotAnimationTrack& Track : Montage->SlotAnimTracks)
+		{
+			Known.Add(Track.SlotName.ToString());
+		}
+		return MCPError(FString::Printf(
+			TEXT("Montage has no slot named '%s' (slots: %s)"),
+			*SlotFilter,
+			Known.Num() > 0 ? *FString::Join(Known, TEXT(", ")) : TEXT("none")));
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("assetPath"), AssetPath);
+	Result->SetNumberField(TEXT("montageLength"), Montage->GetPlayLength());
+	Result->SetNumberField(TEXT("slotCount"), SlotsArray.Num());
+	Result->SetNumberField(TEXT("totalSegments"), TotalSegments);
+	Result->SetArrayField(TEXT("slots"), SlotsArray);
+
+	// Sections, so a caller can see which markers already anchor to a segment.
+	TArray<TSharedPtr<FJsonValue>> SectionsArray;
+	for (int32 SectionIdx = 0; SectionIdx < Montage->CompositeSections.Num(); ++SectionIdx)
+	{
+		const FCompositeSection& Section = Montage->CompositeSections[SectionIdx];
+		TSharedPtr<FJsonObject> SecObj = MakeShared<FJsonObject>();
+		SecObj->SetNumberField(TEXT("sectionIndex"), SectionIdx);
+		SecObj->SetStringField(TEXT("sectionName"), Section.SectionName.ToString());
+		SecObj->SetNumberField(TEXT("startTime"), Section.GetTime());
+		SecObj->SetStringField(TEXT("nextSection"), Section.NextSectionName.ToString());
+		SecObj->SetNumberField(TEXT("slotIndex"), Section.GetSlotIndex());
+		SecObj->SetNumberField(TEXT("segmentIndex"), Section.GetSegmentIndex());
+		SectionsArray.Add(MakeShared<FJsonValueObject>(SecObj));
+	}
+	Result->SetArrayField(TEXT("sections"), SectionsArray);
 
 	return MCPResult(Result);
 }
@@ -1714,7 +2524,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ListControlRigVariables(const TShared
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	// In UE 5.7, ControlRigBlueprint was removed — load as a generic UBlueprint
+	// In UE 5.7, ControlRigBlueprint was removed - load as a generic UBlueprint
 	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
 	UBlueprint* CRBlueprint = Cast<UBlueprint>(LoadedAsset);
 	if (!CRBlueprint)
@@ -1811,7 +2621,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadControlRigHierarchy(const TShared
 }
 
 // ===========================================================================
-// v0.7.11 — Animation depth
+// v0.7.11 - Animation depth
 // ===========================================================================
 
 TSharedPtr<FJsonValue> FAnimationHandlers::SetRootMotionSettings(const TSharedPtr<FJsonObject>& Params)
