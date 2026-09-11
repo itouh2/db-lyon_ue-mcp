@@ -168,6 +168,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnLight(const TSharedPtr<FJsonObject>&
 	auto Result = MCPSuccess();
 	MCPSetCreated(Result);
 	Result->SetStringField(TEXT("actorLabel"), FinalLabel);
+	Result->SetStringField(TEXT("actorPath"), NewLight->GetPathName());
 	Result->SetStringField(TEXT("actorName"), NewLight->GetName());
 	Result->SetStringField(TEXT("lightType"), LightType);
 
@@ -182,15 +183,14 @@ TSharedPtr<FJsonValue> FLevelHandlers::SpawnLight(const TSharedPtr<FJsonObject>&
 TSharedPtr<FJsonValue> FLevelHandlers::SetLightProperties(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* Actor = FindActorByLabel(World, ActorLabel);
-	if (!Actor)
-	{
-		return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
-	}
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+	if (!Actor) return ActorErr;
+	ActorLabel = Actor->GetActorLabel();
 
 	ULightComponent* LightComponent = Actor->FindComponentByClass<ULightComponent>();
 	// #608: USkyLightComponent is not a ULightComponent, so it was previously
@@ -447,6 +447,7 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetLightProperties(const TSharedPtr<FJson
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetNumberField(TEXT("intensity"), LightComponent ? (double)LightComponent->Intensity : (SkyForProps ? (double)SkyForProps->Intensity : 0.0));
 	Result->SetBoolField(TEXT("isSkyLight"), LightComponent == nullptr && SkyForProps != nullptr);
 	Result->SetStringField(TEXT("mobility"), MobilityToString(PropertyComponent->Mobility));
@@ -517,35 +518,80 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetFogProperties(const TSharedPtr<FJsonOb
 	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
 	if (!World) return MCPError(TEXT("World not available"));
 
-	FString ActorLabel = OptionalString(Params, TEXT("actorLabel"));
-
+	// #983: a named selector goes through the shared resolver, so a duplicated
+	// label is refused with the candidate paths rather than tuning whichever
+	// fog the actor iterator reached first. Without one, "the only fog in the
+	// level" is a default this action is entitled to, and several is reported
+	// rather than picked between.
 	AExponentialHeightFog* Fog = nullptr;
-	for (TActorIterator<AExponentialHeightFog> It(World); It; ++It)
+	FMCPActorSelector FogSelector;
+	FogSelector.bRequired = false;
+	TSharedPtr<FJsonValue> FogError;
+	if (AActor* Named = MCPResolveActor(World, Params, FogError, FogSelector))
 	{
-		if (ActorLabel.IsEmpty() || It->GetActorLabel() == ActorLabel)
+		Fog = Cast<AExponentialHeightFog>(Named);
+		if (!Fog)
 		{
-			Fog = *It;
-			break;
+			return MCPError(FString::Printf(
+				TEXT("Actor '%s' is a %s, not an ExponentialHeightFog"),
+				*Named->GetActorLabel(), *Named->GetClass()->GetName()));
 		}
+	}
+	else if (FogError.IsValid())
+	{
+		return FogError;
+	}
+	else
+	{
+		TArray<AExponentialHeightFog*> Fogs;
+		for (TActorIterator<AExponentialHeightFog> It(World); It; ++It)
+		{
+			if (IsValid(*It)) Fogs.Add(*It);
+		}
+		if (Fogs.Num() > 1)
+		{
+			TArray<FString> Labels;
+			for (AExponentialHeightFog* Candidate : Fogs) Labels.Add(Candidate->GetActorLabel());
+			return MCPError(FString::Printf(
+				TEXT("%d ExponentialHeightFog actors in the level; pass actorLabel or actorPath to choose. Available: [%s]"),
+				Fogs.Num(), *FString::Join(Labels, TEXT(", "))));
+		}
+		Fog = Fogs.Num() == 1 ? Fogs[0] : nullptr;
 	}
 	if (!Fog) return MCPError(TEXT("No ExponentialHeightFog actor found"));
 
 	UExponentialHeightFogComponent* FC = Fog->GetComponent();
 	if (!FC) return MCPError(TEXT("Fog component missing"));
 
+	// The inverse of this action is this action, replayed with the values it is
+	// about to overwrite. Every previous value is therefore read BEFORE its
+	// write, and only the keys this call actually touches are carried: a
+	// payload naming a property the caller never set would restore a value
+	// nobody asked to change.
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("world"), WorldScope);
+	Rollback->SetStringField(TEXT("actorPath"), Fog->GetPathName());
+	bool bAnyChange = false;
+
 	double Density = 0.0;
 	if (Params->TryGetNumberField(TEXT("fogDensity"), Density))
 	{
+		Rollback->SetNumberField(TEXT("fogDensity"), FC->FogDensity);
+		bAnyChange = true;
 		FC->FogDensity = (float)Density;
 	}
 	double HeightFalloff = 0.0;
 	if (Params->TryGetNumberField(TEXT("fogHeightFalloff"), HeightFalloff))
 	{
+		Rollback->SetNumberField(TEXT("fogHeightFalloff"), FC->FogHeightFalloff);
+		bAnyChange = true;
 		FC->FogHeightFalloff = (float)HeightFalloff;
 	}
 	double StartDistance = 0.0;
 	if (Params->TryGetNumberField(TEXT("startDistance"), StartDistance))
 	{
+		Rollback->SetNumberField(TEXT("startDistance"), FC->StartDistance);
+		bAnyChange = true;
 		FC->StartDistance = (float)StartDistance;
 	}
 	const TSharedPtr<FJsonObject>* ColorObj = nullptr;
@@ -556,27 +602,44 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetFogProperties(const TSharedPtr<FJsonOb
 		(*ColorObj)->TryGetNumberField(TEXT("r"), R);
 		(*ColorObj)->TryGetNumberField(TEXT("g"), G);
 		(*ColorObj)->TryGetNumberField(TEXT("b"), B);
+		// Back out through the same 0-255 scaling the write applies, so the
+		// inverse replays in the units the action reads.
+		const FLinearColor PreviousInscattering = FC->FogInscatteringLuminance;
+		TSharedPtr<FJsonObject> PreviousColor = MakeShared<FJsonObject>();
+		PreviousColor->SetNumberField(TEXT("r"), PreviousInscattering.R * 255.0);
+		PreviousColor->SetNumberField(TEXT("g"), PreviousInscattering.G * 255.0);
+		PreviousColor->SetNumberField(TEXT("b"), PreviousInscattering.B * 255.0);
+		Rollback->SetObjectField(TEXT("fogInscatteringColor"), PreviousColor);
+		bAnyChange = true;
 		FC->FogInscatteringLuminance = FLinearColor(R / 255.0f, G / 255.0f, B / 255.0f);
 	}
 
 	// #608: volumetric fog controls.
 	if (Params->HasField(TEXT("enableVolumetricFog")))
 	{
+		Rollback->SetBoolField(TEXT("enableVolumetricFog"), FC->bEnableVolumetricFog != 0);
+		bAnyChange = true;
 		FC->SetVolumetricFog(OptionalBool(Params, TEXT("enableVolumetricFog"), true));
 	}
 	double VolScatterDist = 0.0;
 	if (Params->TryGetNumberField(TEXT("volumetricFogScatteringDistribution"), VolScatterDist))
 	{
+		Rollback->SetNumberField(TEXT("volumetricFogScatteringDistribution"), FC->VolumetricFogScatteringDistribution);
+		bAnyChange = true;
 		FC->SetVolumetricFogScatteringDistribution((float)VolScatterDist);
 	}
 	double VolExtinction = 0.0;
 	if (Params->TryGetNumberField(TEXT("volumetricFogExtinctionScale"), VolExtinction))
 	{
+		Rollback->SetNumberField(TEXT("volumetricFogExtinctionScale"), FC->VolumetricFogExtinctionScale);
+		bAnyChange = true;
 		FC->SetVolumetricFogExtinctionScale((float)VolExtinction);
 	}
 	double VolDistance = 0.0;
 	if (Params->TryGetNumberField(TEXT("volumetricFogDistance"), VolDistance))
 	{
+		Rollback->SetNumberField(TEXT("volumetricFogDistance"), FC->VolumetricFogDistance);
+		bAnyChange = true;
 		FC->SetVolumetricFogDistance((float)VolDistance);
 	}
 	const TSharedPtr<FJsonObject>* AlbedoObj = nullptr;
@@ -586,16 +649,47 @@ TSharedPtr<FJsonValue> FLevelHandlers::SetFogProperties(const TSharedPtr<FJsonOb
 		(*AlbedoObj)->TryGetNumberField(TEXT("r"), R);
 		(*AlbedoObj)->TryGetNumberField(TEXT("g"), G);
 		(*AlbedoObj)->TryGetNumberField(TEXT("b"), B);
+		// The albedo is stored as an FColor, so its previous value already is
+		// in the 0-255 form this action reads.
+		const FColor PreviousAlbedo = FC->VolumetricFogAlbedo;
+		TSharedPtr<FJsonObject> PreviousAlbedoJson = MakeShared<FJsonObject>();
+		PreviousAlbedoJson->SetNumberField(TEXT("r"), PreviousAlbedo.R);
+		PreviousAlbedoJson->SetNumberField(TEXT("g"), PreviousAlbedo.G);
+		PreviousAlbedoJson->SetNumberField(TEXT("b"), PreviousAlbedo.B);
+		Rollback->SetObjectField(TEXT("volumetricFogAlbedo"), PreviousAlbedoJson);
+		bAnyChange = true;
 		FC->SetVolumetricFogAlbedo(FColor((uint8)R, (uint8)G, (uint8)B));
 	}
 
 	FC->MarkRenderStateDirty();
 
 	auto Result = MCPSuccess();
-	MCPSetUpdated(Result);
+	// Keyed off what was actually written, because the same result body also
+	// says there was nothing to undo when no property was named.
+	if (bAnyChange)
+	{
+		MCPSetUpdated(Result);
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("updated"), false);
+		Result->SetBoolField(TEXT("unchanged"), true);
+	}
 	Result->SetStringField(TEXT("actorLabel"), Fog->GetActorLabel());
+	Result->SetStringField(TEXT("actorPath"), Fog->GetPathName());
 	Result->SetNumberField(TEXT("fogDensity"), FC->FogDensity);
 	Result->SetNumberField(TEXT("fogHeightFalloff"), FC->FogHeightFalloff);
+	if (bAnyChange)
+	{
+		MCPSetRollback(Result, TEXT("set_fog_properties"), Rollback);
+	}
+	else
+	{
+		// A call that named no property wrote nothing, so there is nothing to
+		// undo. Saying that is not the same as staying silent about an inverse.
+		MCPSetNoRollback(Result,
+			TEXT("This call set no fog property, so nothing changed and there is nothing to undo."));
+	}
 	return MCPResult(Result);
 }
 

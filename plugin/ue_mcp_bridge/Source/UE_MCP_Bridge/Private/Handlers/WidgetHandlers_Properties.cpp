@@ -7,6 +7,7 @@
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
 #include "HandlerJsonProperty.h"
+#include "HandlerQuery.h"
 #include "WidgetBlueprint.h"
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetTree.h"
@@ -61,17 +62,11 @@ TSharedPtr<FJsonValue> FWidgetHandlers::GetWidgetProperties(const TSharedPtr<FJs
 	FString WidgetName;
 	if (auto Err = RequireString(Params, TEXT("widgetName"), WidgetName)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
 
-	if (!WidgetBP->WidgetTree)
-	{
-		return MCPError(TEXT("WidgetTree is null"));
-	}
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	// Find the widget
 	UWidget* FoundWidget = nullptr;
@@ -265,16 +260,10 @@ TSharedPtr<FJsonValue> FWidgetHandlers::GetWidgetFullProperties(const TSharedPtr
 
 	const bool bIncludeSubtree = OptionalBool(Params, TEXT("includeSubtree"), false);
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
-	if (!WidgetBP->WidgetTree)
-	{
-		return MCPError(TEXT("WidgetTree is null"));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	UWidget* FoundWidget = nullptr;
 	WidgetBP->WidgetTree->ForEachWidget([&](UWidget* Widget)
@@ -369,11 +358,9 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ListWidgetBindings(const TSharedPtr<FJso
 	const FString FilterWidget = OptionalString(Params, TEXT("filterWidgetName"));
 	const FString FilterProperty = OptionalString(Params, TEXT("filterProperty"));
 
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
 
 	TArray<TSharedPtr<FJsonValue>> BindingsArr;
 	for (const FDelegateEditorBinding& B : WidgetBP->Bindings)
@@ -411,11 +398,9 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ClearWidgetBinding(const TSharedPtr<FJso
 
 	const FString PropertyName = OptionalString(Params, TEXT("propertyName"));
 
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
 
 	WidgetBP->Modify();
 	const int32 Removed = WidgetBP->Bindings.RemoveAll([&](const FDelegateEditorBinding& B)
@@ -436,9 +421,30 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ClearWidgetBinding(const TSharedPtr<FJso
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(WidgetBP);
-	FKismetEditorUtilities::CompileBlueprint(WidgetBP);
+	// #728: every compile of a WidgetBlueprint is a chance for the compiler to
+	// meet a widget it generates a variable for that owns no entry in
+	// WidgetVariableNameToGuidMap, which it reports as a failure. CompileChecked
+	// makes the map match first and refuses to compile if it cannot.
+	const MCPWidgetGuidMap::FSyncReport GuidSync = MCPWidgetGuidMap::CompileChecked(WidgetBP);
+	if (!GuidSync.bCompiled)
+	{
+		return MCPWidgetGuidMap::BlockedError(AssetPath, GuidSync);
+	}
 	UEditorAssetLibrary::SaveAsset(AssetPath);
 	MCPSetUpdated(Result);
+	MCPSetWidgetGuidOutcome(Result, GuidSync, AssetPath);
+	// No action puts a designer binding back on THIS blueprint. One action does
+	// write Bindings - extract_widget_subtree copies the source blueprint's
+	// bindings onto the new blueprint it lifts a subtree into - but it only
+	// ever writes the destination it just created, so it cannot restore a
+	// binding here. Naming it as the inverse would send a flow at a call that
+	// would build a second asset instead of undoing anything.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("No action restores a designer property binding on this blueprint: widget(list_bindings) reads them and widget(clear_binding) ")
+		TEXT("removes them. widget(extract_subtree) is the only action that writes Bindings, and it writes them onto the NEW blueprint it ")
+		TEXT("creates, never back onto this one. Record what widget(list_bindings) reports before clearing, and re-create the binding in ")
+		TEXT("the UMG editor if it is needed again."));
 	return MCPResult(Result);
 }
 
@@ -456,17 +462,11 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetProperty(const TSharedPtr<FJson
 	FString PropertyValue;
 	if (auto Err = RequireStringAlt(Params, TEXT("propertyValue"), TEXT("value"), PropertyValue)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
 
-	if (!WidgetBP->WidgetTree)
-	{
-		return MCPError(TEXT("WidgetTree is null"));
-	}
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	// Find the widget
 	UWidget* FoundWidget = nullptr;
@@ -484,6 +484,35 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetProperty(const TSharedPtr<FJson
 	}
 
 	bool bPropertySet = false;
+
+	// The previous value, in the SAME text form this action accepts, and only
+	// when the write goes through one of the three reflection routes below,
+	// whose input format is UE export text either way. The typed convenience
+	// branches take bespoke formats ("R,G,B,A", a bare font size, a plain
+	// string for Text) that export text does not round-trip through, so a
+	// captured value replayed at one of those would write something else. That
+	// is reported as having no rollback rather than given a wrong one.
+	FString PreviousPropertyValue;
+	bool bCapturedPreviousValue = false;
+	// True only when the capture came off a SINGLE-SEGMENT property on the
+	// widget itself, which is the one shape widget(set_style) can also address.
+	// That matters because an empty previous value cannot travel through this
+	// action at all: FStrProperty::ExportText_Internal appends nothing for an
+	// empty string when PPF_Delimited is not set, and this action's
+	// propertyValue is read with RequireStringAlt, which rejects an empty
+	// string as a missing parameter. set_style takes its value as JSON and
+	// accepts an empty one, so it is the rollback for that case.
+	bool bCapturedOnFlatWidgetProperty = false;
+	// The single path segment the capture came off, which is what the set_style
+	// rollback has to be handed. It is NOT always the incoming propertyName:
+	// ParseIntoArray drops empty segments, so "Foo." parses to one part and
+	// still counts as flat, while the raw string would be looked up verbatim by
+	// FindPropertyByName and would not be found.
+	FString FlatWidgetPropertyName;
+	// True when the flat capture came off an FStrProperty. That is the one
+	// property kind whose empty-string round trip through set_style is
+	// established rather than assumed (see the rollback note below).
+	bool bFlatCaptureWasStringProperty = false;
 
 	// Handle well-known properties by type
 	if (UTextBlock* TextBlock = Cast<UTextBlock>(FoundWidget))
@@ -735,9 +764,13 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetProperty(const TSharedPtr<FJson
 					if (LeafProp)
 					{
 						void* LeafAddr = LeafProp->ContainerPtrToValuePtr<void>(CurContainer);
+						FString PreviousText;
+						LeafProp->ExportText_Direct(PreviousText, LeafAddr, LeafAddr, Slot, PPF_None);
 						if (LeafProp->ImportText_Direct(*PropertyValue, LeafAddr, Slot, PPF_None))
 						{
 							bPropertySet = true;
+							PreviousPropertyValue = PreviousText;
+							bCapturedPreviousValue = true;
 						}
 						else
 						{
@@ -964,9 +997,13 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetProperty(const TSharedPtr<FJson
 				if (SlotProp)
 				{
 					void* SlotValuePtr = SlotProp->ContainerPtrToValuePtr<void>(Slot);
+					FString PreviousText;
+					SlotProp->ExportText_Direct(PreviousText, SlotValuePtr, SlotValuePtr, Slot, PPF_None);
 					if (SlotProp->ImportText_Direct(*PropertyValue, SlotValuePtr, Slot, PPF_None))
 					{
 						bPropertySet = true;
+						PreviousPropertyValue = PreviousText;
+						bCapturedPreviousValue = true;
 					}
 				}
 			}
@@ -1007,10 +1044,20 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetProperty(const TSharedPtr<FJson
 		if (FinalProp)
 		{
 			void* ValuePtr = FinalProp->ContainerPtrToValuePtr<void>(CurrentContainer);
+			FString PreviousText;
+			FinalProp->ExportText_Direct(PreviousText, ValuePtr, ValuePtr, FoundWidget, PPF_None);
 			if (FinalProp->ImportText_Direct(*PropertyValue, ValuePtr, FoundWidget, PPF_None))
 			{
 				FoundWidget->PostEditChange();
 				bPropertySet = true;
+				PreviousPropertyValue = PreviousText;
+				bCapturedPreviousValue = true;
+				bCapturedOnFlatWidgetProperty = (PathParts.Num() == 1);
+				if (bCapturedOnFlatWidgetProperty)
+				{
+					FlatWidgetPropertyName = PathParts[0];
+					bFlatCaptureWasStringProperty = FinalProp->IsA<FStrProperty>();
+				}
 			}
 			else
 			{
@@ -1025,13 +1072,88 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetProperty(const TSharedPtr<FJson
 	{
 		// Mark package dirty and save
 		WidgetBP->MarkPackageDirty();
-		FKismetEditorUtilities::CompileBlueprint(WidgetBP);
+		// #728: see ClearWidgetBinding. A property write compiles the blueprint,
+		// and the compile is where a missing widget variable GUID surfaces.
+		const MCPWidgetGuidMap::FSyncReport GuidSync = MCPWidgetGuidMap::CompileChecked(WidgetBP);
+		if (!GuidSync.bCompiled)
+		{
+			return MCPWidgetGuidMap::BlockedError(AssetPath, GuidSync);
+		}
 		UEditorAssetLibrary::SaveAsset(AssetPath);
 
 		auto Result = MCPSuccess();
+		MCPSetUpdated(Result);
 		Result->SetStringField(TEXT("widgetName"), WidgetName);
 		Result->SetStringField(TEXT("propertyName"), PropertyName);
 		Result->SetStringField(TEXT("propertyValue"), PropertyValue);
+		MCPSetWidgetGuidOutcome(Result, GuidSync, AssetPath);
+
+		if (bCapturedPreviousValue) { Result->SetStringField(TEXT("previousPropertyValue"), PreviousPropertyValue); }
+		if (bCapturedPreviousValue && !PreviousPropertyValue.IsEmpty())
+		{
+			TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+			Payload->SetStringField(TEXT("assetPath"), AssetPath);
+			Payload->SetStringField(TEXT("widgetName"), WidgetName);
+			Payload->SetStringField(TEXT("propertyName"), PropertyName);
+			Payload->SetStringField(TEXT("propertyValue"), PreviousPropertyValue);
+			MCPSetRollback(Result, TEXT("set_widget_property"), Payload);
+			Result->SetBoolField(TEXT("rollbackLossy"), false);
+		}
+		else if (bCapturedPreviousValue && bCapturedOnFlatWidgetProperty)
+		{
+			// The property held a value that exports to the empty string - an empty
+			// FString is the case that reaches here - and this action's propertyValue
+			// is required and non-empty, so replaying it here would come back
+			// "Missing required parameter 'propertyValue'". widget(set_style) takes
+			// its value as JSON, accepts an empty string, and reaches the same engine
+			// importer entry point at the same port flags (PPF_None, since that write
+			// is at depth 0). It addresses one top-level UPROPERTY on the widget,
+			// which is what bCapturedOnFlatWidgetProperty guarantees this is.
+			//
+			// The two routes are NOT identical, so the note claims only what holds.
+			// set_style imports with no owner object where the write above passed
+			// FoundWidget, and it does not call PostEditChange where the reflection
+			// path does. Neither matters to FStrProperty, which is the kind whose
+			// empty-string round trip is established. For any other flat kind whose
+			// empty value exports to the empty string, the importer may refuse the
+			// empty text, in which case the rollback reports that error rather than
+			// writing a wrong value.
+			TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+			Payload->SetStringField(TEXT("assetPath"), AssetPath);
+			Payload->SetStringField(TEXT("widgetName"), WidgetName);
+			Payload->SetStringField(TEXT("propertyName"), FlatWidgetPropertyName);
+			Payload->SetStringField(TEXT("value"), PreviousPropertyValue);
+			MCPSetRollback(Result, TEXT("set_widget_style"), Payload);
+			Result->SetBoolField(TEXT("rollbackLossy"), false);
+			Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+				TEXT("'%s' held a value that exports to the empty string, which set_widget_property cannot be handed back because its ")
+				TEXT("propertyValue is a required non-empty parameter. The rollback therefore goes through widget(set_style), which ")
+				TEXT("carries the value as JSON and reaches the same engine importer at the same port flags. %s"),
+				*FlatWidgetPropertyName,
+				bFlatCaptureWasStringProperty
+					? TEXT("This is a string property, so the restored value is exact.")
+					: TEXT("This is not a string property, so whether the engine importer accepts the empty text for this kind is not ")
+					  TEXT("established here: the rollback either restores the value exactly or fails with the importer's own error, and ")
+					  TEXT("it cannot write a different value. Read the property back afterwards to confirm which happened.")));
+		}
+		else if (bCapturedPreviousValue)
+		{
+			Result->SetBoolField(TEXT("rollbackPossible"), false);
+			Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+				TEXT("'%s' held a value that exports to the empty string, and neither route can put it back: set_widget_property ")
+				TEXT("requires a non-empty propertyValue, and widget(set_style) addresses one top-level UPROPERTY on the widget, ")
+				TEXT("which a slot property or a dotted path is not. Set it by hand once the flow has unwound."), *PropertyName));
+		}
+		else
+		{
+			Result->SetBoolField(TEXT("rollbackPossible"), false);
+			Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+				TEXT("'%s' was written through one of this action's typed convenience paths, whose input format (comma-separated colours and ")
+				TEXT("sizes, a bare number, a plain string) is not the UE export text the previous value reads back as, so replaying the old ")
+				TEXT("value here would write something else. Read it with widget(get_properties) and set it back by its full UPROPERTY name, ")
+				TEXT("which routes through the reflection path and does carry an exact rollback. widget(set_style) also takes JSON by ")
+				TEXT("UPROPERTY name and rolls back exactly."), *PropertyName));
+		}
 
 		return MCPResult(Result);
 	}
@@ -1047,12 +1169,9 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ReadWidgetAnimations(const TSharedPtr<FJ
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(LoadedAsset);
-	if (!WidgetBP)
-	{
-		return MCPError(FString::Printf(TEXT("Failed to load WidgetBlueprint at '%s'"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
 
 	TArray<TSharedPtr<FJsonValue>> AnimationsArray;
 
@@ -1178,8 +1297,10 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetStyle(const TSharedPtr<FJsonObj
 	TSharedPtr<FJsonValue> ValueField = Params->TryGetField(TEXT("value"));
 	if (!ValueField.IsValid()) return MCPError(TEXT("Missing 'value' (a JSON object/scalar for the style)"));
 
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!WidgetBP || !WidgetBP->WidgetTree) return MCPError(FString::Printf(TEXT("WidgetBlueprint not found: %s"), *AssetPath));
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	UWidget* Widget = FindWidgetByName(WidgetBP, WidgetName);
 	if (!Widget) return MCPError(FString::Printf(TEXT("Widget not found: %s"), *WidgetName));
@@ -1189,12 +1310,24 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetStyle(const TSharedPtr<FJsonObj
 
 	Widget->Modify();
 	void* ValuePtr = Prop->ContainerPtrToValuePtr<void>(Widget);
+
+	// The value that is there now, read before the write. A style struct comes
+	// back as UE export text and a scalar comes back typed; SetJsonOnProperty
+	// accepts both on the way back in, so the captured value replays through
+	// this same action.
+	const TSharedPtr<FJsonValue> PreviousValue = MCPQuery::PropertyToJson(Prop, ValuePtr);
+
 	FString SetErr;
 	if (!MCPJsonProperty::SetJsonOnProperty(Prop, ValuePtr, ValueField, SetErr))
 	{
 		return MCPError(FString::Printf(TEXT("Failed to set '%s': %s"), *PropertyName, *SetErr));
 	}
-	FKismetEditorUtilities::CompileBlueprint(WidgetBP);
+	// #728: see ClearWidgetBinding.
+	const MCPWidgetGuidMap::FSyncReport GuidSync = MCPWidgetGuidMap::CompileChecked(WidgetBP);
+	if (!GuidSync.bCompiled)
+	{
+		return MCPWidgetGuidMap::BlockedError(AssetPath, GuidSync);
+	}
 	SaveAssetPackage(WidgetBP);
 
 	auto Result = MCPSuccess();
@@ -1202,6 +1335,21 @@ TSharedPtr<FJsonValue> FWidgetHandlers::SetWidgetStyle(const TSharedPtr<FJsonObj
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("widgetName"), WidgetName);
 	Result->SetStringField(TEXT("propertyName"), PropertyName);
+	MCPSetWidgetGuidOutcome(Result, GuidSync, AssetPath);
+
+	// MCPQuery::PropertyToJson answers for every property kind - a scalar
+	// typed, anything else as its exported text - so the capture is always
+	// there and this is unconditional. `value` is read with TryGetField
+	// rather than a required non-empty string, so an empty previous value
+	// replays as readily as any other.
+	Result->SetField(TEXT("previousValue"), PreviousValue);
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("assetPath"), AssetPath);
+	Payload->SetStringField(TEXT("widgetName"), WidgetName);
+	Payload->SetStringField(TEXT("propertyName"), PropertyName);
+	Payload->SetField(TEXT("value"), PreviousValue);
+	MCPSetRollback(Result, TEXT("set_widget_style"), Payload);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
 	return MCPResult(Result);
 }
 
@@ -1217,20 +1365,46 @@ TSharedPtr<FJsonValue> FWidgetHandlers::BulkSetWidgetProperties(const TSharedPtr
 		return MCPError(TEXT("Missing 'properties' array ([{widgetName, propertyName, value}])"));
 	}
 
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!WidgetBP || !WidgetBP->WidgetTree) return MCPError(FString::Printf(TEXT("WidgetBlueprint not found: %s"), *AssetPath));
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 
 	TArray<TSharedPtr<FJsonValue>> Results;
+	// One entry per write that actually landed, holding the value that write
+	// replaced. Replayed back through this same action they restore exactly the
+	// properties this call changed, in the order it changed them, and touch
+	// nothing it did not.
+	TArray<TSharedPtr<FJsonValue>> InversePropertyEntries;
 	int32 Applied = 0, Failed = 0;
+	int32 EntryIndex = -1;
 	for (const TSharedPtr<FJsonValue>& EV : *Entries)
 	{
+		++EntryIndex;
 		const TSharedPtr<FJsonObject>* EObj = nullptr;
-		if (!EV->TryGetObject(EObj) || !EObj) { ++Failed; continue; }
+		if (!EV->TryGetObject(EObj) || !EObj)
+		{
+			// An entry that is not a JSON object carries no widgetName or
+			// propertyName to report it by, so it is reported by its position in
+			// the array instead. It still gets a row: `failed` counts it, and a
+			// caller told only the count would have no way to learn WHICH entry
+			// the batch could not read. Every entry produces exactly one row, so
+			// `results` lines up with `properties` index for index.
+			TSharedPtr<FJsonObject> Malformed = MakeShared<FJsonObject>();
+			Malformed->SetNumberField(TEXT("index"), EntryIndex);
+			Malformed->SetBoolField(TEXT("ok"), false);
+			Malformed->SetStringField(TEXT("error"),
+				TEXT("entry is not a JSON object ({widgetName, propertyName, value} expected)"));
+			Results.Add(MakeShared<FJsonValueObject>(Malformed));
+			++Failed;
+			continue;
+		}
 		FString WName, PName;
 		(*EObj)->TryGetStringField(TEXT("widgetName"), WName);
 		(*EObj)->TryGetStringField(TEXT("propertyName"), PName);
 		TSharedPtr<FJsonValue> Val = (*EObj)->TryGetField(TEXT("value"));
 		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
+		R->SetNumberField(TEXT("index"), EntryIndex);
 		R->SetStringField(TEXT("widgetName"), WName);
 		R->SetStringField(TEXT("propertyName"), PName);
 
@@ -1249,10 +1423,20 @@ TSharedPtr<FJsonValue> FWidgetHandlers::BulkSetWidgetProperties(const TSharedPtr
 			Results.Add(MakeShared<FJsonValueObject>(R)); ++Failed; continue;
 		}
 		Widget->Modify();
+		void* EntryValuePtr = Prop->ContainerPtrToValuePtr<void>(Widget);
+		const TSharedPtr<FJsonValue> EntryPrevious = MCPQuery::PropertyToJson(Prop, EntryValuePtr);
 		FString SetErr;
-		if (MCPJsonProperty::SetJsonOnProperty(Prop, Prop->ContainerPtrToValuePtr<void>(Widget), Val, SetErr))
+		if (MCPJsonProperty::SetJsonOnProperty(Prop, EntryValuePtr, Val, SetErr))
 		{
 			R->SetBoolField(TEXT("ok"), true); ++Applied;
+			// PropertyToJson answers for every property kind, so every write that
+			// lands contributes exactly one inverse entry and the two counts move
+			// together.
+			TSharedPtr<FJsonObject> Inverse = MakeShared<FJsonObject>();
+			Inverse->SetStringField(TEXT("widgetName"), WName);
+			Inverse->SetStringField(TEXT("propertyName"), PName);
+			Inverse->SetField(TEXT("value"), EntryPrevious);
+			InversePropertyEntries.Add(MakeShared<FJsonValueObject>(Inverse));
 		}
 		else
 		{
@@ -1263,7 +1447,12 @@ TSharedPtr<FJsonValue> FWidgetHandlers::BulkSetWidgetProperties(const TSharedPtr
 		Results.Add(MakeShared<FJsonValueObject>(R));
 	}
 
-	FKismetEditorUtilities::CompileBlueprint(WidgetBP);
+	// #728: see ClearWidgetBinding.
+	const MCPWidgetGuidMap::FSyncReport GuidSync = MCPWidgetGuidMap::CompileChecked(WidgetBP);
+	if (!GuidSync.bCompiled)
+	{
+		return MCPWidgetGuidMap::BlockedError(AssetPath, GuidSync);
+	}
 	SaveAssetPackage(WidgetBP);
 
 	auto Result = MCPSuccess();
@@ -1271,6 +1460,26 @@ TSharedPtr<FJsonValue> FWidgetHandlers::BulkSetWidgetProperties(const TSharedPtr
 	Result->SetNumberField(TEXT("applied"), Applied);
 	Result->SetNumberField(TEXT("failed"), Failed);
 	Result->SetArrayField(TEXT("results"), Results);
+	// A batch where nothing landed changed nothing, which a caller retrying
+	// after an ambiguous result has to be able to tell from a batch that did.
+	Result->SetBoolField(TEXT("unchanged"), Applied == 0);
+	MCPSetWidgetGuidOutcome(Result, GuidSync, AssetPath);
+
+	if (InversePropertyEntries.Num() > 0)
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("assetPath"), AssetPath);
+		Payload->SetArrayField(TEXT("properties"), InversePropertyEntries);
+		MCPSetRollback(Result, TEXT("bulk_set_widget_properties"), Payload);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("No write landed, so nothing was changed and there is nothing to restore. Every entry was rejected: `results` says why ")
+			TEXT("for each one."));
+	}
 	return MCPResult(Result);
 }
 
@@ -1286,8 +1495,10 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ReorderChild(const TSharedPtr<FJsonObjec
 	if (!Params->HasField(TEXT("index"))) return MCPError(TEXT("Missing 'index'"));
 	const int32 NewIndex = (int32)Params->GetNumberField(TEXT("index"));
 
-	UWidgetBlueprint* WidgetBP = Cast<UWidgetBlueprint>(UEditorAssetLibrary::LoadAsset(AssetPath));
-	if (!WidgetBP || !WidgetBP->WidgetTree) return MCPError(FString::Printf(TEXT("WidgetBlueprint not found: %s"), *AssetPath));
+	TSharedPtr<FJsonValue> ResolveError;
+	UWidgetBlueprint* WidgetBP = MCPWidget::ResolveWidgetBlueprintOrError(AssetPath, ResolveError);
+	if (!WidgetBP) return ResolveError;
+	if (!WidgetBP->WidgetTree) return MCPWidget::MissingWidgetTreeError(AssetPath);
 	UWidget* Widget = FindWidgetByName(WidgetBP, WidgetName);
 	if (!Widget) return MCPError(FString::Printf(TEXT("Widget not found: %s"), *WidgetName));
 
@@ -1300,7 +1511,12 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ReorderChild(const TSharedPtr<FJsonObjec
 
 	Parent->Modify();
 	Parent->ShiftChild(ClampedIndex, Widget);
-	FKismetEditorUtilities::CompileBlueprint(WidgetBP);
+	// #728: see ClearWidgetBinding.
+	const MCPWidgetGuidMap::FSyncReport GuidSync = MCPWidgetGuidMap::CompileChecked(WidgetBP);
+	if (!GuidSync.bCompiled)
+	{
+		return MCPWidgetGuidMap::BlockedError(AssetPath, GuidSync);
+	}
 	SaveAssetPackage(WidgetBP);
 
 	auto Result = MCPSuccess();
@@ -1310,5 +1526,16 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ReorderChild(const TSharedPtr<FJsonObjec
 	Result->SetStringField(TEXT("parent"), Parent->GetName());
 	Result->SetNumberField(TEXT("oldIndex"), OldIndex);
 	Result->SetNumberField(TEXT("newIndex"), ClampedIndex);
+	MCPSetWidgetGuidOutcome(Result, GuidSync, AssetPath);
+
+	// ShiftChild moves one child and slides the rest to close the gap, so
+	// shifting it back to the index it held restores the whole order. The
+	// reparenting is untouched, so this is exact rather than approximate.
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("assetPath"), AssetPath);
+	Payload->SetStringField(TEXT("widgetName"), WidgetName);
+	Payload->SetNumberField(TEXT("index"), OldIndex);
+	MCPSetRollback(Result, TEXT("reorder_child"), Payload);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
 	return MCPResult(Result);
 }

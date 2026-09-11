@@ -8,10 +8,15 @@
 #include "IObjectChooser.h"
 #include "ObjectChooser_Asset.h"
 #include "ObjectChooser_Class.h"
-#include "StructUtils/InstancedStruct.h"
+#include "MCPEngineCompat.h"
 #include "EditorAssetLibrary.h"
 #include "UObject/UnrealType.h"
+#if UE_MCP_HAS_5_5_API
 #include "Misc/StringOutputDevice.h"
+#else
+// 5.4 still declares FStringOutputDevice alongside FString.
+#include "Containers/UnrealString.h"
+#endif
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 
@@ -137,8 +142,15 @@ static bool BuildOutputStruct(const FString& OutputPath, const FString& OutputTy
 	}
 	else if (OutputType == TEXT("soft_asset"))
 	{
+#if UE_MCP_HAS_5_5_API
 		Out.InitializeAs<FSoftAssetChooser>();
 		Out.GetMutablePtr<FSoftAssetChooser>()->Asset = Obj;
+#else
+		// FSoftAssetChooser does not exist in 5.4; a soft result there would
+		// have to be written as a hard one, which is a different asset.
+		OutError = TEXT("soft_asset results require Unreal Engine 5.5 or newer; use outputType 'asset' on 5.4");
+		return false;
+#endif
 	}
 	else
 	{
@@ -157,12 +169,82 @@ static TSharedPtr<FJsonObject> DescribeOutput(const FInstancedStruct& Result)
 #if WITH_EDITOR
 	if (const FObjectChooserBase* Base = Result.GetPtr<FObjectChooserBase>())
 	{
+#if UE_MCP_HAS_5_5_API
 		UObject* Ref = Base->GetReferencedObject();
+#else
+		// 5.4's FObjectChooserBase has no GetReferencedObject. Every result
+		// struct it defines holds the reference in one object property, named
+		// Asset on an asset result and Chooser on a nested one, so the same
+		// answer comes out of the property system.
+		UObject* Ref = nullptr;
+		if (SS)
+		{
+			const TCHAR* const ReferenceFields[] = { TEXT("Asset"), TEXT("Chooser") };
+			for (const TCHAR* FieldName : ReferenceFields)
+			{
+				if (FObjectPropertyBase* ObjectProp = FindFProperty<FObjectPropertyBase>(SS, FieldName))
+				{
+					Ref = ObjectProp->GetObjectPropertyValue(
+						ObjectProp->ContainerPtrToValuePtr<void>(Result.GetMemory()));
+					if (Ref) break;
+				}
+			}
+		}
+#endif
 		Obj->SetStringField(TEXT("output"), Ref ? Ref->GetPathName() : FString());
 	}
 #endif
+
 	return Obj;
 }
+
+// UChooserTable::DisabledRows is 5.5 and newer. On 5.4 a chooser row cannot be
+// disabled at all, so a row always reads as enabled, the grow and remove calls
+// have nothing to keep in step, and an attempt to disable one is refused rather
+// than reported as done.
+static bool MCPChooserRowDisabled(const UChooserTable* Table, int32 RowIndex)
+{
+#if UE_MCP_HAS_5_5_API
+	return Table && Table->DisabledRows.IsValidIndex(RowIndex) && Table->DisabledRows[RowIndex];
+#else
+	return false;
+#endif
+}
+
+static void MCPChooserGrowDisabledRows(UChooserTable* Table)
+{
+#if UE_MCP_HAS_5_5_API
+	if (!Table) return;
+	while (Table->DisabledRows.Num() < Table->ResultsStructs.Num()) Table->DisabledRows.Add(false);
+#endif
+}
+
+static void MCPChooserRemoveDisabledRow(UChooserTable* Table, int32 RowIndex)
+{
+#if UE_MCP_HAS_5_5_API
+	if (Table && Table->DisabledRows.IsValidIndex(RowIndex)) Table->DisabledRows.RemoveAt(RowIndex);
+#endif
+}
+
+/** Can a row be disabled on this engine at all? */
+static constexpr bool MCPChooserRowDisableSupported()
+{
+#if UE_MCP_HAS_5_5_API
+	return true;
+#else
+	return false;
+#endif
+}
+
+static void MCPChooserSetRowDisabled(UChooserTable* Table, int32 RowIndex, bool bDisabled)
+{
+#if UE_MCP_HAS_5_5_API
+	if (!Table || !Table->ResultsStructs.IsValidIndex(RowIndex)) return;
+	MCPChooserGrowDisabledRows(Table);
+	Table->DisabledRows[RowIndex] = bDisabled;
+#endif
+}
+
 
 // Build a map ColumnIndex -> cell text from the caller's `cells` array and/or
 // `inputs` object (keyed by column index-as-string or column name).
@@ -418,6 +500,12 @@ TSharedPtr<FJsonValue> FChooserHandlers::AddColumn(const TSharedPtr<FJsonObject>
 	Res->SetNumberField(TEXT("columnIndex"), NewIndex);
 	Res->SetStringField(TEXT("columnType"), ColStruct->GetName());
 	Res->SetStringField(TEXT("name"), GetColumnName(Table->ColumnsStructs[NewIndex], NewIndex));
+	// The bridge has no action that removes a chooser column, so there is no
+	// inverse to emit and inventing one would name a handler that is not there.
+	Res->SetBoolField(TEXT("rollbackPossible"), false);
+	Res->SetStringField(TEXT("rollbackNote"),
+		FString::Printf(TEXT("There is no chooser column removal action, so this column cannot be taken back out. It is sized to the current %d row(s) and every row now carries a cell for it."),
+			GetChooserRowCount(Table)));
 	FArrayProperty* ArrProp = nullptr; void* ColData = nullptr; FString Ignored;
 	if (GetColumnRowValuesArray(Table->ColumnsStructs[NewIndex], ArrProp, ColData, Ignored))
 	{
@@ -455,7 +543,7 @@ TSharedPtr<FJsonValue> FChooserHandlers::ListRows(const TSharedPtr<FJsonObject>&
 	{
 		TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
 		Row->SetNumberField(TEXT("index"), r);
-		Row->SetBoolField(TEXT("disabled"), Table->DisabledRows.IsValidIndex(r) && Table->DisabledRows[r]);
+		Row->SetBoolField(TEXT("disabled"), MCPChooserRowDisabled(Table, r));
 		Row->SetObjectField(TEXT("output"), DescribeOutput(Table->ResultsStructs[r]));
 
 		TArray<TSharedPtr<FJsonValue>> Cells;
@@ -503,7 +591,7 @@ TSharedPtr<FJsonValue> FChooserHandlers::AddRow(const TSharedPtr<FJsonObject>& P
 	Table->Modify();
 	const int32 NewRow = Table->ResultsStructs.Num();
 	Table->ResultsStructs.Add(OutputStruct);
-	while (Table->DisabledRows.Num() < Table->ResultsStructs.Num()) Table->DisabledRows.Add(false);
+	MCPChooserGrowDisabledRows(Table);
 
 	// Grow every column's per-row array to match the new row count.
 	for (FInstancedStruct& ColStruct : Table->ColumnsStructs)
@@ -543,7 +631,16 @@ TSharedPtr<FJsonValue> FChooserHandlers::AddRow(const TSharedPtr<FJsonObject>& P
 	TSharedPtr<FJsonObject> RbPayload = MakeShared<FJsonObject>();
 	RbPayload->SetStringField(TEXT("table"), Table->GetPathName());
 	RbPayload->SetNumberField(TEXT("index"), NewRow);
-	MCPSetRollback(Res, TEXT("delete_row"), RbPayload);
+	// The rollback method is a BRIDGE method name, which is what the flow
+	// engine dispatches: "delete_row" is not registered anywhere.
+	MCPSetRollback(Res, TEXT("chooser_delete_row"), RbPayload);
+	// chooser_delete_row addresses a row by position and the table has no row id,
+	// so there is no identity to address it by instead.
+	Res->SetStringField(TEXT("rollbackNote"), FString::Printf(
+		TEXT("The inverse deletes row %d by INDEX, and that index names this row only while the table's rows are unchanged. ")
+		TEXT("A later step that deletes a row below it shifts it down, and chooser(delete_row)'s own rollback re-adds by APPENDING rather than reinserting, ")
+		TEXT("so in a flow mixing the two this index can end up naming a different row and delete the wrong one. A chooser row has no id to address it by instead."),
+		NewRow));
 	return MCPResult(Res);
 #else
 	return MCPError(TEXT("chooser row authoring requires an editor build"));
@@ -568,6 +665,32 @@ TSharedPtr<FJsonValue> FChooserHandlers::SetRow(const TSharedPtr<FJsonObject>& P
 		return MCPError(FString::Printf(TEXT("row index %d out of range (rowCount=%d)"), RowIndex, Table->ResultsStructs.Num()));
 	}
 
+	// Read the row as it stands, before any of it is overwritten: chooser_set_row
+	// is its own inverse when it is handed the previous output, disabled flag
+	// and cell text.
+	TSharedPtr<FJsonObject> PriorOutput = DescribeOutput(Table->ResultsStructs[RowIndex]);
+	const FString PriorOutputPath = PriorOutput->HasField(TEXT("output")) ? PriorOutput->GetStringField(TEXT("output")) : FString();
+	const FString PriorResultType = PriorOutput->GetStringField(TEXT("resultType"));
+	const FString PriorOutputType = PriorResultType == TEXT("EvaluateChooser") ? TEXT("evaluate")
+		: (PriorResultType == TEXT("SoftAssetChooser") ? TEXT("soft_asset") : TEXT("asset"));
+	const bool bPriorDisabled = MCPChooserRowDisabled(Table, RowIndex);
+	TArray<TSharedPtr<FJsonValue>> PriorCells;
+	int32 UnreadableCells = 0;
+	for (int32 c = 0; c < Table->ColumnsStructs.Num(); ++c)
+	{
+		FString CellText, CellErr;
+		if (GetColumnCellText(Table->ColumnsStructs[c], RowIndex, CellText, CellErr))
+		{
+			PriorCells.Add(MakeShared<FJsonValueString>(CellText));
+		}
+		else
+		{
+			// A null entry is skipped on replay, which leaves that column alone.
+			PriorCells.Add(MakeShared<FJsonValueNull>());
+			++UnreadableCells;
+		}
+	}
+
 	Table->Modify();
 
 	// Optional: replace the output object.
@@ -587,8 +710,11 @@ TSharedPtr<FJsonValue> FChooserHandlers::SetRow(const TSharedPtr<FJsonObject>& P
 	bool bDisabled;
 	if (Params->TryGetBoolField(TEXT("disabled"), bDisabled))
 	{
-		while (Table->DisabledRows.Num() < Table->ResultsStructs.Num()) Table->DisabledRows.Add(false);
-		Table->DisabledRows[RowIndex] = bDisabled;
+		if (!MCPChooserRowDisableSupported())
+		{
+			return MCPError(TEXT("This engine's UChooserTable has no per-row disabled state, so 'disabled' cannot be honoured. Remove the row instead, or omit 'disabled'."));
+		}
+		MCPChooserSetRowDisabled(Table, RowIndex, bDisabled);
 	}
 
 	// Optional: update cells.
@@ -610,11 +736,41 @@ TSharedPtr<FJsonValue> FChooserHandlers::SetRow(const TSharedPtr<FJsonObject>& P
 	Res->SetStringField(TEXT("path"), Table->GetPathName());
 	Res->SetNumberField(TEXT("rowIndex"), RowIndex);
 	Res->SetObjectField(TEXT("output"), DescribeOutput(Table->ResultsStructs[RowIndex]));
+	Res->SetObjectField(TEXT("priorOutput"), PriorOutput);
 	if (CellWarnings.Num() > 0)
 	{
 		TArray<TSharedPtr<FJsonValue>> W;
 		for (const FString& Warn : CellWarnings) W.Add(MakeShared<FJsonValueString>(Warn));
 		Res->SetArrayField(TEXT("cellWarnings"), W);
+	}
+
+	{
+		TSharedPtr<FJsonObject> RbPayload = MakeShared<FJsonObject>();
+		RbPayload->SetStringField(TEXT("table"), Table->GetPathName());
+		RbPayload->SetNumberField(TEXT("index"), RowIndex);
+		RbPayload->SetBoolField(TEXT("disabled"), bPriorDisabled);
+		RbPayload->SetArrayField(TEXT("cells"), PriorCells);
+		if (!PriorOutputPath.IsEmpty())
+		{
+			RbPayload->SetStringField(TEXT("output"), PriorOutputPath);
+			RbPayload->SetStringField(TEXT("outputType"), PriorOutputType);
+		}
+		MCPSetRollback(Res, TEXT("chooser_set_row"), RbPayload);
+	}
+	// chooser_set_row skips an empty `output` and a null cell, so those parts of
+	// the row stay as this call left them.
+	if (PriorOutputPath.IsEmpty())
+	{
+		Res->SetBoolField(TEXT("rollbackLossy"), true);
+		Res->SetStringField(TEXT("rollbackNote"),
+			TEXT("The row had no resolvable output object before this call, and chooser(set_row) treats an empty output as 'leave it alone', so the inverse restores the disabled flag and the readable cells but not the empty output."));
+	}
+	else if (UnreadableCells > 0)
+	{
+		Res->SetBoolField(TEXT("rollbackLossy"), true);
+		Res->SetStringField(TEXT("rollbackNote"), FString::Printf(
+			TEXT("%d column(s) would not export their cell for this row, so the inverse leaves those columns as this call left them; every other column, the output and the disabled flag are restored."),
+			UnreadableCells));
 	}
 	return MCPResult(Res);
 #else
@@ -640,6 +796,30 @@ TSharedPtr<FJsonValue> FChooserHandlers::DeleteRow(const TSharedPtr<FJsonObject>
 		return MCPError(FString::Printf(TEXT("row index %d out of range (rowCount=%d)"), RowIndex, Table->ResultsStructs.Num()));
 	}
 
+	// Read the row before it is dropped, so the inverse can rebuild it.
+	TSharedPtr<FJsonObject> DoomedOutput = DescribeOutput(Table->ResultsStructs[RowIndex]);
+	const FString DoomedOutputPath = DoomedOutput->HasField(TEXT("output")) ? DoomedOutput->GetStringField(TEXT("output")) : FString();
+	const FString DoomedResultType = DoomedOutput->GetStringField(TEXT("resultType"));
+	const FString DoomedOutputType = DoomedResultType == TEXT("EvaluateChooser") ? TEXT("evaluate")
+		: (DoomedResultType == TEXT("SoftAssetChooser") ? TEXT("soft_asset") : TEXT("asset"));
+	const bool bDoomedDisabled = MCPChooserRowDisabled(Table, RowIndex);
+	TArray<TSharedPtr<FJsonValue>> DoomedCells;
+	int32 UnexportableCells = 0;
+	for (int32 c = 0; c < Table->ColumnsStructs.Num(); ++c)
+	{
+		FString CellText, CellErr;
+		if (GetColumnCellText(Table->ColumnsStructs[c], RowIndex, CellText, CellErr))
+		{
+			DoomedCells.Add(MakeShared<FJsonValueString>(CellText));
+		}
+		else
+		{
+			// A null entry is skipped on replay, leaving that column at its default.
+			DoomedCells.Add(MakeShared<FJsonValueNull>());
+			++UnexportableCells;
+		}
+	}
+
 	Table->Modify();
 
 	// Drop the per-row cell from every column, then the result + disabled flag.
@@ -660,7 +840,7 @@ TSharedPtr<FJsonValue> FChooserHandlers::DeleteRow(const TSharedPtr<FJsonObject>
 		}
 	}
 	Table->ResultsStructs.RemoveAt(RowIndex);
-	if (Table->DisabledRows.IsValidIndex(RowIndex)) Table->DisabledRows.RemoveAt(RowIndex);
+	MCPChooserRemoveDisabledRow(Table, RowIndex);
 
 	FinalizeChooser(Table);
 
@@ -669,6 +849,46 @@ TSharedPtr<FJsonValue> FChooserHandlers::DeleteRow(const TSharedPtr<FJsonObject>
 	Res->SetStringField(TEXT("path"), Table->GetPathName());
 	Res->SetNumberField(TEXT("deletedIndex"), RowIndex);
 	Res->SetNumberField(TEXT("rowCount"), Table->ResultsStructs.Num());
+	Res->SetObjectField(TEXT("deletedOutput"), DoomedOutput);
+
+	{
+		TSharedPtr<FJsonObject> RbPayload = MakeShared<FJsonObject>();
+		RbPayload->SetStringField(TEXT("table"), Table->GetPathName());
+		RbPayload->SetArrayField(TEXT("cells"), DoomedCells);
+		if (!DoomedOutputPath.IsEmpty())
+		{
+			RbPayload->SetStringField(TEXT("output"), DoomedOutputPath);
+			RbPayload->SetStringField(TEXT("outputType"), DoomedOutputType);
+		}
+		MCPSetRollback(Res, TEXT("chooser_add_row"), RbPayload);
+	}
+	Res->SetBoolField(TEXT("rollbackLossy"), true);
+	{
+		FString DeleteNote = FString::Printf(
+			TEXT("chooser(add_row) APPENDS the row rather than putting it back at index %d, and a chooser resolves rows in order, so the restored row is evaluated last. "),
+			RowIndex);
+		if (DoomedOutputPath.IsEmpty())
+		{
+			// An empty `output` is "leave it alone" to chooser_add_row, so it is
+			// omitted from the payload rather than sent blank.
+			DeleteNote += TEXT("The row had no resolvable output object, so the payload carries no output and the restored row starts with an empty one. ");
+		}
+		else
+		{
+			DeleteNote += TEXT("Its output is carried in the payload. ");
+		}
+		if (UnexportableCells > 0)
+		{
+			DeleteNote += FString::Printf(
+				TEXT("%d column(s) would not export their cell for this row and are sent as null, which chooser(add_row) skips, so the restored row takes those columns' defaults. "),
+				UnexportableCells);
+		}
+		if (bDoomedDisabled)
+		{
+			DeleteNote += TEXT("It also comes back enabled: this row was disabled, so follow the rollback with chooser(set_row, index=<new index>, disabled=true).");
+		}
+		Res->SetStringField(TEXT("rollbackNote"), DeleteNote.TrimStartAndEnd());
+	}
 	return MCPResult(Res);
 #else
 	return MCPError(TEXT("chooser row authoring requires an editor build"));

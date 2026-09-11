@@ -1,6 +1,7 @@
 #include "AssetHandlers.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+#include "HandlerPagination.h"
 #include "HandlerJsonProperty.h"
 #include "HandlerPropertyText.h"
 #include "HandlerAssetCreate.h"
@@ -14,6 +15,7 @@
 #include "Engine/Level.h"
 #include "Engine/LevelScriptBlueprint.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Subsystems/AssetEditorSubsystem.h"
 #include "Editor.h"
 #include "FileHelpers.h"
@@ -75,39 +77,11 @@
 #include "AI/Navigation/NavCollisionBase.h"
 
 // ─── Protected mount guardrail ──────────────────────────────────────────
-// Engine-shipped content (/Engine/, /Script/, /Memory/, /Temp/) and Verse
-// runtime classes must never be mutated through the bridge. UE's
-// UEditorAssetLibrary::DeleteAsset will happily destroy files under
-// <engineRoot>/Engine/Content/ if not stopped - verified the hard way.
-// Apply this check to every handler that deletes, moves, or renames an
-// asset. Plugin content roots (mounted under /<PluginName>/) are NOT
-// protected here; per-project plugin content is expected to be writable.
+// The rule itself is MCPIsProtectedAssetPath in HandlerUtils.h, and the
+// refusal it produces is MCPProtectedPathError beside it, shared by every
+// asset translation unit so the write paths cannot drift apart.
 namespace
 {
-	bool IsProtectedAssetPath(const FString& Path)
-	{
-		FString P = Path;
-		P.TrimStartAndEndInline();
-		if (P.IsEmpty()) return false;
-		// Tolerate leading whitespace and the surface form (no leading slash).
-		if (!P.StartsWith(TEXT("/"))) P = TEXT("/") + P;
-		const FString L = P.ToLower();
-		if (L.StartsWith(TEXT("/engine/"))) return true;
-		if (L.StartsWith(TEXT("/script/"))) return true;
-		if (L.StartsWith(TEXT("/memory/"))) return true;
-		if (L.StartsWith(TEXT("/temp/"))) return true;
-		// Verse runtime objects surface as /Script/CoreUObject.* etc.
-		if (L.Contains(TEXT("/script/"))) return true;
-		return false;
-	}
-
-	TSharedPtr<FJsonValue> MakeProtectedPathError(const FString& Path)
-	{
-		return MCPError(FString::Printf(
-			TEXT("Refusing to mutate protected mount: %s. Engine, /Script/, /Memory/, /Temp/ are read-only via the bridge."),
-			*Path));
-	}
-
 	// Split "/Game/Foo/Bar.Bar" (or "/Game/Foo/Bar") into mount "/Game/" + rel "Foo/Bar".
 	// Returns false if the path is malformed or has no mount segment.
 	bool SplitMountAndRel(const FString& AssetOrPackagePath, FString& OutMountRoot, FString& OutRelPath, FString& OutPackageName, FString& OutAssetName)
@@ -164,6 +138,32 @@ namespace
 void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 {
 	Registry.RegisterHandler(TEXT("list_assets"), &ListAssets);
+	Registry.RegisterHandler(TEXT("read_uv_channels"), &ReadUvChannels);
+	Registry.RegisterHandler(TEXT("set_uv_channel_count"), &SetUvChannelCount);
+	Registry.RegisterHandler(TEXT("unwrap_uvs"), &UnwrapUvs);
+	Registry.RegisterHandler(TEXT("transform_uvs"), &TransformUvs);
+	Registry.RegisterHandler(TEXT("generate_lightmap_uvs"), &GenerateLightmapUvs);
+	Registry.RegisterHandler(TEXT("export_uv_layout"), &ExportUvLayout);
+	Registry.RegisterHandler(TEXT("check_uvs"), &CheckUvs);
+
+	// Procedural mesh operations (AssetHandlers_GeometryScript.cpp). Each one
+	// converts the LOD to a DynamicMesh, runs a solver over it and writes a
+	// StaticMesh back, which is minutes rather than milliseconds on a dense
+	// mesh. The default handler timeout would report a hang while the editor
+	// was still working.
+	Registry.RegisterHandlerWithTimeout(TEXT("apply_mesh_simplify"), &SimplifyMesh, 300.0f);
+	Registry.RegisterHandlerWithTimeout(TEXT("apply_mesh_remesh"), &RemeshMesh, 300.0f);
+	Registry.RegisterHandlerWithTimeout(TEXT("apply_mesh_mirror"), &MirrorMesh, 300.0f);
+	Registry.RegisterHandlerWithTimeout(TEXT("apply_mesh_hole_fill"), &FillMeshHoles, 300.0f);
+	Registry.RegisterHandlerWithTimeout(TEXT("generate_mesh_collision"), &GenerateMeshCollision, 300.0f);
+	Registry.RegisterHandlerWithTimeout(TEXT("apply_mesh_fracture"), &FractureMesh, 600.0f);
+
+	// Asset hygiene (AssetHandlers_Hygiene.cpp). Both walk the asset registry
+	// across a whole content directory, so both are bounded by their own
+	// maxAssets rather than by the default timeout.
+	Registry.RegisterHandlerWithTimeout(TEXT("audit_asset_hygiene"), &AuditAssetHygiene, 300.0f);
+	Registry.RegisterHandlerWithTimeout(TEXT("fix_asset_hygiene"), &FixAssetHygiene, 300.0f);
+
 	Registry.RegisterHandler(TEXT("search_assets"), &SearchAssets);
 	Registry.RegisterHandler(TEXT("read_asset"), &ReadAsset);
 	Registry.RegisterHandler(TEXT("read_asset_properties"), &ReadAssetProperties);
@@ -173,6 +173,9 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("delete_asset"), &DeleteAsset);
 	Registry.RegisterHandler(TEXT("delete_asset_batch"), &DeleteAssetBatch);
 	Registry.RegisterHandler(TEXT("bulk_rename_assets"), &BulkRename);
+	// #908: bounded redirector clean-up after a move. Timeout raised because a
+	// fix-up loads and resaves every referencing package.
+	Registry.RegisterHandlerWithTimeout(TEXT("fixup_redirectors"), &FixupRedirectors, 300.0f);
 	Registry.RegisterHandler(TEXT("create_data_asset"), &CreateDataAsset);
 	// Bounded batch upsert plus its rollback inverse. A 500-item batch that
 	// preflights every item on a transient copy before touching a package can
@@ -183,6 +186,9 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// #726: generic create-any-concrete-UObject-class asset (physical materials,
 	// curves, settings objects) - not restricted to UDataAsset subclasses.
 	Registry.RegisterHandler(TEXT("create_asset_by_class"), &CreateAssetByClass);
+	// #975: a named subobject inside an existing asset package, which
+	// create_asset_by_class cannot make because it always creates a package.
+	Registry.RegisterHandler(TEXT("create_subobject"), &CreateSubobject);
 	Registry.RegisterHandler(TEXT("save_asset"), &SaveAsset);
 	Registry.RegisterHandler(TEXT("save_all_dirty"), &SaveAllDirty);
 	Registry.RegisterHandler(TEXT("list_textures"), &ListTextures);
@@ -264,6 +270,7 @@ void FAssetHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("set_stringtable_entry"), &SetStringTableEntry);
 	Registry.RegisterHandler(TEXT("remove_stringtable_entry"), &RemoveStringTableEntry);
 	Registry.RegisterHandler(TEXT("import_stringtable"), &ImportStringTable);
+	Registry.RegisterHandler(TEXT("import_stringtable_csv"), &ImportStringTableCsv);
 
 	// v0.7.8 stubs - FTS5-backed asset search
 	Registry.RegisterHandler(TEXT("search_assets_fts"), &SearchAssetsFTS);
@@ -355,8 +362,21 @@ TSharedPtr<FJsonValue> FAssetHandlers::SearchAssetsFTS(const TSharedPtr<FJsonObj
 {
 	FString Query;
 	if (auto Err = RequireString(Params, TEXT("query"), Query)) return Err;
-	const int32 MaxResults = OptionalInt(Params, TEXT("maxResults"), 50);
 	const FString ClassFilter = OptionalString(Params, TEXT("classFilter"), TEXT(""));
+
+	// T3: paged. `maxResults` used to cut the ranked list and say nothing about
+	// what it had cut, so a caller reading the top 50 could not tell a project
+	// with 50 matches from one with 5000. The server now scores every match and
+	// hands out pages of them, and `maxResults` is mapped onto `limit` on the
+	// TypeScript side so the old spelling still sizes a page.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("search_assets_fts|query=%s|classFilter=%s"), *Query, *ClassFilter),
+			/*DefaultLimit*/ 50, /*MaxLimit*/ 2000, Page))
+	{
+		return Err;
+	}
 
 	TArray<FString> QueryToks;
 	TokenizeLower(Query, QueryToks);
@@ -392,27 +412,37 @@ TSharedPtr<FJsonValue> FAssetHandlers::SearchAssetsFTS(const TSharedPtr<FJsonObj
 		if (S > 0) Hits.Add({ S, &Data });
 	}
 
-	Hits.Sort([](const FHit& A, const FHit& B) { return A.Score > B.Score; });
-	const int32 Kept = FMath::Min(Hits.Num(), MaxResults);
-
-	TArray<TSharedPtr<FJsonValue>> Arr;
-	Arr.Reserve(Kept);
-	for (int32 i = 0; i < Kept; ++i)
+	// Score alone is not an order: TArray::Sort is not stable and equal scores
+	// would come back in a different sequence between two calls, which is
+	// exactly what a page anchor cannot survive. Ties break on the object path,
+	// so the ranked list is one fixed sequence for a given query.
+	Hits.Sort([](const FHit& A, const FHit& B)
 	{
-		const FAssetData& D = *Hits[i].Data;
+		if (A.Score != B.Score) return A.Score > B.Score;
+		return A.Data->GetObjectPathString() < B.Data->GetObjectPathString();
+	});
+
+	TArray<MCPPagination::FPageRow> Rows;
+	Rows.Reserve(Hits.Num());
+	for (const FHit& Hit : Hits)
+	{
+		const FAssetData& D = *Hit.Data;
 		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 		R->SetStringField(TEXT("path"), D.PackageName.ToString());
 		R->SetStringField(TEXT("name"), D.AssetName.ToString());
 		R->SetStringField(TEXT("class"), D.AssetClassPath.GetAssetName().ToString());
-		R->SetNumberField(TEXT("score"), Hits[i].Score);
-		Arr.Add(MakeShared<FJsonValueObject>(R));
+		R->SetNumberField(TEXT("score"), Hit.Score);
+		// The OBJECT path is the anchor, not the package name reported as
+		// 'path': one package can hold more than one asset, and a page boundary
+		// has to name exactly one row.
+		Rows.Add({ D.GetObjectPathString(), MakeShared<FJsonValueObject>(R) });
 	}
 
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
 	Result->SetStringField(TEXT("query"), Query);
 	Result->SetNumberField(TEXT("totalMatched"), Hits.Num());
-	Result->SetNumberField(TEXT("resultCount"), Arr.Num());
-	Result->SetArrayField(TEXT("results"), Arr);
+	MCPPagination::EmitPage(Page, Rows, TEXT("results"), Result);
+	Result->SetNumberField(TEXT("resultCount"), Result->GetIntegerField(TEXT("count")));
 	return MCPResult(Result);
 }
 
@@ -435,6 +465,11 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReindexAssetsFTS(const TSharedPtr<FJsonOb
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
 	Result->SetStringField(TEXT("directory"), Directory);
 	Result->SetNumberField(TEXT("indexedCount"), Found.Num());
+	Result->SetBoolField(TEXT("unchanged"), true);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("A rescan makes the in-memory asset registry agree with what is on disk. No asset, package or file changed, ")
+		TEXT("so there is nothing to undo, and un-scanning a path is not an operation the registry offers."));
 	return MCPResult(Result);
 }
 
@@ -442,22 +477,37 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListAssets(const TSharedPtr<FJsonObject>&
 {
 	const FString Directory = OptionalString(Params, TEXT("directory"), TEXT("/Game"));
 	const bool bRecursive = OptionalBool(Params, TEXT("recursive"), true);
-	// #766/#790: the old default of 2000 built a single response large enough
-	// to drop the bridge on a big folder ("Bridge connection lost" at roughly
-	// 700 assets). Page instead: a smaller default, a real offset, and enough
-	// counters that a caller can walk the whole set deterministically rather
-	// than guessing whether it got everything.
-	const int32 MaxResults = FMath::Clamp(OptionalInt(Params, TEXT("maxResults"), 500), 1, 5000);
-	const int32 Offset = FMath::Max(0, OptionalInt(Params, TEXT("offset"), 0));
 	const FString ClassFilter = OptionalString(Params, TEXT("classFilter"));
+
+	// #766/#790 established that one response for a big folder drops the
+	// bridge, and answered it with a raw row offset. T3 replaces that offset
+	// with the shared cursor: an offset re-read a moved collection at a row
+	// number and could not tell that it had, while a cursor names the row it
+	// resumes after and reports when that row moved or vanished.
+	if (Params.IsValid() && Params->HasField(TEXT("offset")))
+	{
+		return MCPError(TEXT(
+			"'offset' is no longer how list_assets pages, because a row number cannot tell you the "
+			"folder changed underneath it. Pass the 'nextCursor' this action returned as 'cursor', "
+			"and size the page with 'limit' (1 to 5000, default 500). Omit both for the first page."));
+	}
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("list_assets|directory=%s|recursive=%d|classFilter=%s"),
+				*Directory, bRecursive ? 1 : 0, *ClassFilter),
+			/*DefaultLimit*/ 500, /*MaxLimit*/ 5000, Page))
+	{
+		return Err;
+	}
 
 	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
 	TArray<FAssetData> Found;
 	Registry.GetAssetsByPath(FName(*Directory), Found, bRecursive);
 
 	// AssetRegistry order is not a stable contract, so paging over it could
-	// overlap or skip entries between calls. Sort so offset/limit paging is
-	// genuinely deterministic, which is what the action advertises.
+	// overlap or skip entries between calls. Sort so the enumeration is one
+	// fixed sequence, which is what a page anchor resumes into.
 	// TArray::Sort is not stable, so tie on AssetName too: multi-asset packages
 	// would otherwise order arbitrarily and paging could still overlap or skip.
 	Found.Sort([](const FAssetData& A, const FAssetData& B)
@@ -466,8 +516,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListAssets(const TSharedPtr<FJsonObject>&
 		return A.AssetName.LexicalLess(B.AssetName);
 	});
 
-	TArray<TSharedPtr<FJsonValue>> Out;
-	int32 TotalMatched = 0;
+	TArray<MCPPagination::FPageRow> Rows;
 	for (const FAssetData& Data : Found)
 	{
 		const FString ClassName = Data.AssetClassPath.GetAssetName().ToString();
@@ -475,37 +524,25 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListAssets(const TSharedPtr<FJsonObject>&
 		{
 			continue;
 		}
-		// Count every match before slicing, so totalMatched is the real size of
-		// the result set and not just what fitted in this page.
-		const int32 MatchIndex = TotalMatched++;
-		if (MatchIndex < Offset) continue;
-		if (Out.Num() >= MaxResults) continue;
 
 		TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
 		Item->SetStringField(TEXT("path"), Data.PackageName.ToString());
 		Item->SetStringField(TEXT("name"), Data.AssetName.ToString());
 		Item->SetStringField(TEXT("className"), ClassName);
-		Out.Add(MakeShared<FJsonValueObject>(Item));
+		// The OBJECT path is the anchor, not the package name reported as
+		// 'path': a package holding two assets would otherwise give two rows
+		// the same identity and a resume could not tell them apart.
+		Rows.Add({ Data.GetObjectPathString(), MakeShared<FJsonValueObject>(Item) });
 	}
-
-	const int32 NextOffset = Offset + Out.Num();
-	const bool bHasMore = NextOffset < TotalMatched;
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("directory"), Directory);
 	Result->SetBoolField(TEXT("recursive"), bRecursive);
-	Result->SetNumberField(TEXT("assetCount"), Out.Num());
-	Result->SetNumberField(TEXT("totalMatched"), TotalMatched);
-	Result->SetNumberField(TEXT("offset"), Offset);
-	Result->SetBoolField(TEXT("hasMore"), bHasMore);
-	if (bHasMore)
-	{
-		Result->SetNumberField(TEXT("nextOffset"), NextOffset);
-		Result->SetStringField(TEXT("note"), FString::Printf(
-			TEXT("Showing %d of %d matches. Re-run with offset=%d for the next page."),
-			Out.Num(), TotalMatched, NextOffset));
-	}
-	Result->SetArrayField(TEXT("assets"), Out);
+	// Every match is enumerated before the page is cut, so totalMatched is the
+	// real size of the result set rather than what fitted in this page.
+	Result->SetNumberField(TEXT("totalMatched"), Rows.Num());
+	MCPPagination::EmitPage(Page, Rows, TEXT("assets"), Result);
+	Result->SetNumberField(TEXT("assetCount"), Result->GetIntegerField(TEXT("count")));
 	return MCPResult(Result);
 }
 
@@ -518,8 +555,21 @@ TSharedPtr<FJsonValue> FAssetHandlers::SearchAssets(const TSharedPtr<FJsonObject
 	{
 		Directory = TEXT("/Game/");
 	}
-	int32 MaxResults = OptionalInt(Params, TEXT("maxResults"), 50);
 	bool bSearchAll = OptionalBool(Params, TEXT("searchAll"));
+
+	// T3: paged. This used to stop at `maxResults` matches and report only how
+	// many it had returned, so a caller searching a large root read the first
+	// 50 hits as though they were the whole answer. `maxResults` is mapped onto
+	// `limit` on the TypeScript side, so the old spelling still sizes a page.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("search_assets|query=%s|directory=%s|searchAll=%d"),
+				*Query, *Directory, bSearchAll ? 1 : 0),
+			/*DefaultLimit*/ 50, /*MaxLimit*/ 2000, Page))
+	{
+		return Err;
+	}
 
 	// Unified path: always use IAssetRegistry::GetAssets (with PackagePaths) so
 	// substring matches hit AssetName + ObjectPath consistently. The previous
@@ -542,11 +592,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::SearchAssets(const TSharedPtr<FJsonObject
 	TArray<FAssetData> AllAssets;
 	AssetRegistry.GetAssets(Filter, AllAssets);
 
-	TArray<TSharedPtr<FJsonValue>> ResultsArray;
+	TArray<MCPPagination::FPageRow> Rows;
 	FString QueryLower = Query.ToLower();
 	for (const FAssetData& AssetData : AllAssets)
 	{
-		if (ResultsArray.Num() >= MaxResults) break;
 		FString AssetPath = AssetData.GetObjectPathString();
 		FString AssetName = AssetData.AssetName.ToString();
 		if (!Query.IsEmpty())
@@ -568,14 +617,25 @@ TSharedPtr<FJsonValue> FAssetHandlers::SearchAssets(const TSharedPtr<FJsonObject
 		Item->SetStringField(TEXT("path"), AssetData.PackageName.ToString());
 		Item->SetStringField(TEXT("name"), AssetName);
 		Item->SetStringField(TEXT("className"), AssetData.AssetClassPath.GetAssetName().ToString());
-		ResultsArray.Add(MakeShared<FJsonValueObject>(Item));
+		// The object path is the anchor: it names one asset even when a package
+		// holds several, and 'path' above reports the package for compatibility.
+		Rows.Add({ AssetPath, MakeShared<FJsonValueObject>(Item) });
 	}
+
+	// The asset registry does not promise an enumeration order, so the matches
+	// are sorted before paging. Without it the same page can come back in a
+	// different order between two calls and the anchor would report a change
+	// that is only the registry reshuffling. Sorted on the rows rather than on
+	// the registry results, so the object path each comparison reads is the one
+	// already built above.
+	Rows.Sort([](const MCPPagination::FPageRow& A, const MCPPagination::FPageRow& B)
+		{ return A.Id < B.Id; });
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("query"), Query);
 	Result->SetStringField(TEXT("searchScope"), bSearchAll ? (bHasDirectory ? Directory : TEXT("all")) : Directory);
-	Result->SetNumberField(TEXT("resultCount"), ResultsArray.Num());
-	Result->SetArrayField(TEXT("results"), ResultsArray);
+	MCPPagination::EmitPage(Page, Rows, TEXT("results"), Result);
+	Result->SetNumberField(TEXT("resultCount"), Result->GetIntegerField(TEXT("count")));
 
 	return MCPResult(Result);
 }
@@ -585,12 +645,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReadAsset(const TSharedPtr<FJsonObject>& 
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
 
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	if (!Asset)
-	{
-		// Fallback to LoadObject for full object paths
-		Asset = LoadObject<UObject>(nullptr, *AssetPath);
-	}
+	// The LoadAsset-then-LoadObject pair this action has always used now lives
+	// in MCPLoadAssetObject, so the type-specific readers resolve a path the
+	// same way this one does (#930).
+	UObject* Asset = MCPLoadAssetObject(AssetPath);
 	if (!Asset)
 	{
 		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
@@ -715,14 +773,21 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReadAsset(const TSharedPtr<FJsonObject>& 
 // own properties (ParentClass, etc.) are rarely what a caller wants. Resolve to
 // the generated-class CDO so asset property reads/writes hit the real defaults
 // and can author Instanced sub-object arrays. Non-Blueprint assets pass through.
-static UObject* MCPResolveAssetToCDO(UObject* Asset)
+//
+// OutBlueprint carries the wrapper back out, because a write to the CDO has
+// bookkeeping the CDO alone cannot do: the package to save is the Blueprint's,
+// and the compiler's own record of the variable's default has to be reconciled
+// with the value just written (#931).
+static UObject* MCPResolveAssetToCDO(UObject* Asset, UBlueprint** OutBlueprint = nullptr)
 {
+	if (OutBlueprint) *OutBlueprint = nullptr;
 	if (UBlueprint* BP = Cast<UBlueprint>(Asset))
 	{
 		if (UClass* GenClass = BP->GeneratedClass)
 		{
 			if (UObject* CDO = GenClass->GetDefaultObject())
 			{
+				if (OutBlueprint) *OutBlueprint = BP;
 				return CDO;
 			}
 		}
@@ -730,16 +795,124 @@ static UObject* MCPResolveAssetToCDO(UObject* Asset)
 	return Asset;
 }
 
+// #931: a property write marked the package dirty and stopped there, so it read
+// back correctly, survived until the editor closed, and was gone on the next
+// start. A GameplayAbility whose default reverted computed correct values and
+// applied no effect, with nothing pointing at the cause. A write now either
+// reaches the package on disk or says why it did not, and never reports plain
+// success for a change that only exists in memory.
+//
+// Returns true when the package was written. On false, OutReason carries the
+// sentence to hand back to the caller.
+static bool MCPPersistAssetWrite(UObject* Asset, UBlueprint* OwningBlueprint, bool bSave, FString& OutReason)
+{
+	OutReason.Reset();
+	UPackage* Package = Asset ? Asset->GetOutermost() : nullptr;
+	if (!Package)
+	{
+		OutReason = TEXT("The asset has no package, so there is nothing to write.");
+		return false;
+	}
+
+	const FString PackageName = Package->GetName();
+	if (!bSave)
+	{
+		OutReason = FString::Printf(
+			TEXT("save=false was requested, so '%s' is dirty in memory only and the change is lost when the editor closes. ")
+			TEXT("Call asset(save) for it, or repeat the write with save=true."),
+			*PackageName);
+		return false;
+	}
+	// Protected mounts and read-only package files are both answered before the
+	// engine is asked to write, by the one shared guard (#932): asking it to
+	// open a file it cannot is what took the editor down with a fatal error.
+	// For a Blueprint the package's asset is the UBlueprint; the CDO is one of
+	// its exports and rides along, so the guard and the save see the same
+	// object.
+	UObject* WriteTarget = OwningBlueprint ? static_cast<UObject*>(OwningBlueprint) : Asset;
+	return SaveAssetPackageChecked(WriteTarget, OutReason);
+}
+
+// A CDO write is a genuine package export and survives both the save and a
+// later recompile, but two pieces of editor bookkeeping do not happen on their
+// own, and both read as "my write did not take" (#931).
+//
+// UBlueprintGeneratedClass keeps a post-construct property list that newly
+// spawned instances initialise from, and only MarkBlueprintAsModified rebuilds
+// it. And FBPVariableDescription::DefaultValue, when it is not empty, is
+// replayed onto the CDO by the next full compile AFTER the old CDO's values are
+// copied forward, so a stale string default silently overwrites the value that
+// was just written. Clearing it makes the CDO the single record of the default,
+// which is what the Blueprint editor's own Class Defaults panel does.
+static void MCPNoteBlueprintCDOWrite(UBlueprint* Blueprint, const FString& PropertyPath)
+{
+	if (!Blueprint) return;
+
+	// The root segment is the variable the compiler knows by name. A dotted or
+	// indexed path lands inside that variable's value, and the string default
+	// it would replay covers the whole variable either way.
+	FString RootName = PropertyPath;
+	int32 Cut = INDEX_NONE;
+	if (RootName.FindChar(TEXT('.'), Cut)) RootName = RootName.Left(Cut);
+	if (RootName.FindChar(TEXT('['), Cut)) RootName = RootName.Left(Cut);
+	const FName RootVarName(*RootName);
+
+	FProperty* ChangedProperty = nullptr;
+	if (UClass* GenClass = Blueprint->GeneratedClass)
+	{
+		ChangedProperty = GenClass->FindPropertyByName(RootVarName);
+	}
+
+	for (FBPVariableDescription& Variable : Blueprint->NewVariables)
+	{
+		if (Variable.VarName == RootVarName)
+		{
+			Variable.DefaultValue.Empty();
+			break;
+		}
+	}
+
+	FPropertyChangedEvent ChangeEvent(ChangedProperty, EPropertyChangeType::ValueSet);
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint, ChangeEvent);
+}
+
+/** Report where a property write ended up: the package, whether it reached
+ *  disk, and the reason when it did not. A write the caller asked to persist
+ *  and that did not persist is a failure, not a success with a footnote. */
+static void MCPDescribePropertyWritePersistence(
+	TSharedPtr<FJsonObject>& Result,
+	UObject* Asset,
+	const FString& PropertyName,
+	bool bSaveRequested,
+	bool bPersisted,
+	const FString& PersistReason)
+{
+	if (UPackage* Package = Asset ? Asset->GetOutermost() : nullptr)
+	{
+		Result->SetStringField(TEXT("packageName"), Package->GetName());
+		Result->SetBoolField(TEXT("packageDirty"), Package->IsDirty());
+	}
+	Result->SetBoolField(TEXT("persisted"), bPersisted);
+	Result->SetBoolField(TEXT("saved"), bPersisted);
+	if (bPersisted) return;
+
+	Result->SetStringField(TEXT("persistError"), PersistReason);
+	if (bSaveRequested)
+	{
+		Result->SetBoolField(TEXT("success"), false);
+		Result->SetStringField(TEXT("error"), FString::Printf(
+			TEXT("Set '%s' in memory but could not persist it: %s"), *PropertyName, *PersistReason));
+	}
+}
+
 TSharedPtr<FJsonValue> FAssetHandlers::ReadAssetProperties(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
 
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> LoadError;
+	UObject* Asset = MCPRequireAssetObject(AssetPath, LoadError);
+	if (!Asset) return LoadError;
 	Asset = MCPResolveAssetToCDO(Asset); // #568
 
 	FString ValueFormat;
@@ -1000,17 +1173,11 @@ TSharedPtr<FJsonValue> FAssetHandlers::DuplicateAsset(const TSharedPtr<FJsonObje
 	const FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
 
 	// #441: DoesAssetExist returns false for some Blueprints in 5.7 even when
-	// the registry/loader can resolve them. Confirm via load-or-load_blueprint
+	// the registry/loader can resolve them. Confirm via the shared resolver
 	// before erroring out so duplicate doesn't bounce off valid paths.
-	UObject* SourceObj = UEditorAssetLibrary::LoadAsset(SourcePath);
-	if (!SourceObj)
-	{
-		SourceObj = LoadObject<UObject>(nullptr, *SourcePath);
-	}
-	if (!SourceObj)
-	{
-		return MCPError(FString::Printf(TEXT("Source asset not found: %s"), *SourcePath));
-	}
+	TSharedPtr<FJsonValue> SourceLoadError;
+	UObject* SourceObj = MCPRequireAssetObject(SourcePath, SourceLoadError, TEXT("Source asset"));
+	if (!SourceObj) return SourceLoadError;
 
 	// Idempotency: if the destination already exists, short-circuit.
 	if (UEditorAssetLibrary::DoesAssetExist(DestPath))
@@ -1172,7 +1339,7 @@ static TSharedPtr<FJsonValue> RenameWorldWithExternals(const FString& SourceAsse
 	Gather(ExtActorsSrc, SrcActors);
 	Gather(ExtObjectsSrc, SrcObjects);
 
-	UObject* World = UEditorAssetLibrary::LoadAsset(SourceAssetPath);
+	UObject* World = MCPLoadAssetObject(SourceAssetPath);
 	if (!World)
 	{
 		return MCPError(FString::Printf(TEXT("Failed to load World asset: %s. No changes made."), *SourceAssetPath));
@@ -1488,8 +1655,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::RenameAsset(const TSharedPtr<FJsonObject>
 		return MCPError(TEXT("Missing 'sourcePath'+'destinationPath' or 'assetPath'+'newName'"));
 	}
 
-	if (IsProtectedAssetPath(SourcePath)) return MakeProtectedPathError(SourcePath);
-	if (IsProtectedAssetPath(DestPath))   return MakeProtectedPathError(DestPath);
+	if (MCPIsProtectedAssetPath(SourcePath)) return MCPProtectedPathError(SourcePath);
+	if (MCPIsProtectedAssetPath(DestPath))   return MCPProtectedPathError(DestPath);
 
 	// Idempotency: if already at destination, no-op.
 	if (SourcePath == DestPath)
@@ -1583,7 +1750,7 @@ namespace
 		UAssetEditorSubsystem* AES = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>();
 		if (!AES) return false;
 
-		UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
+		UObject* Asset = MCPLoadAssetObject(AssetPath);
 		if (!Asset) return false;
 
 		const TArray<IAssetEditorInstance*> Editors = AES->FindEditorsForAsset(Asset);
@@ -1595,6 +1762,89 @@ namespace
 		return true;
 	}
 
+	// #976: UEditorAssetLibrary::DeleteAsset is the FORCE-delete entry point.
+	// Its own header says so: "It doesn't check if the asset has references in
+	// other Levels or by Actors." Both delete handlers called it whatever the
+	// caller passed for `force`, so a referenced asset was destroyed and its
+	// referencers were rewritten to point at nothing, with `force=false`
+	// reading as a safety flag that did not exist.
+	//
+	// The Asset Registry holds the same reference graph the Content Browser's
+	// reference viewer draws, so asking it first is what turns a force delete
+	// back into a checked one. Self-references are dropped: a package always
+	// lists itself.
+	TArray<FString> CollectPackageReferencers(const FString& AssetPath)
+	{
+		TArray<FString> Out;
+
+		const FMCPAssetPathForms Forms = MCPAssetPathForms(AssetPath);
+		if (Forms.PackagePath.IsEmpty()) return Out;
+
+		FAssetRegistryModule& ARM = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+		const FName PackageFName(*Forms.PackagePath);
+		TArray<FName> Refs;
+		ARM.Get().GetReferencers(PackageFName, Refs);
+		for (const FName& R : Refs)
+		{
+			if (R != PackageFName)
+			{
+				Out.AddUnique(R.ToString());
+			}
+		}
+		Out.Sort([](const FString& A, const FString& B) { return A < B; });
+		return Out;
+	}
+
+	/** The refusal a checked delete hands back. Names the packages that would
+	 *  have been rewritten, so the caller can decide rather than discover. */
+	void ApplyReferencerRefusalToJson(
+		const TSharedPtr<FJsonObject>& Out,
+		const FString& AssetPath,
+		const TArray<FString>& Referencers)
+	{
+		// Long lists are the interesting case and truncating them would hide
+		// exactly the referencer a caller is looking for, so the count is
+		// reported alongside a bounded sample rather than a silent slice.
+		constexpr int32 MaxNamed = 25;
+		const int32 Named = FMath::Min(Referencers.Num(), MaxNamed);
+
+		TArray<FString> Sample;
+		Sample.Append(Referencers.GetData(), Named);
+
+		Out->SetStringField(TEXT("error"), FString::Printf(
+			TEXT("'%s' is referenced by %d package(s) and force=false, so it was not deleted. ")
+			TEXT("Deleting it would rewrite those referencers to point at nothing. ")
+			TEXT("Repoint or delete the referencers first, or pass force=true to delete anyway. Referencers: %s%s"),
+			*AssetPath,
+			Referencers.Num(),
+			*FString::Join(Sample, TEXT(", ")),
+			Referencers.Num() > Named ? TEXT(", ...") : TEXT("")));
+		Out->SetStringField(TEXT("path"), AssetPath);
+		Out->SetBoolField(TEXT("deleted"), false);
+		Out->SetStringField(TEXT("reason"), TEXT("has_referencers"));
+		Out->SetNumberField(TEXT("referencerCount"), Referencers.Num());
+
+		TArray<TSharedPtr<FJsonValue>> RefsJson;
+		for (const FString& R : Referencers)
+		{
+			RefsJson.Add(MakeShared<FJsonValueString>(R));
+		}
+		Out->SetArrayField(TEXT("referencers"), RefsJson);
+	}
+
+	/** Run the checked-delete gate for one path. Returns true and fills Out
+	 *  with the refusal when the asset has referencers; false when the delete
+	 *  may proceed. Both delete handlers go through this so the single and
+	 *  batch forms cannot drift into enforcing different rules. */
+	bool CheckedDeleteRefusal(const FString& AssetPath, const TSharedPtr<FJsonObject>& Out)
+	{
+		const TArray<FString> Referencers = CollectPackageReferencers(AssetPath);
+		if (Referencers.IsEmpty()) return false;
+		Out->SetStringField(TEXT("status"), TEXT("refused"));
+		ApplyReferencerRefusalToJson(Out, AssetPath, Referencers);
+		return true;
+	}
+
 	FDeleteDiagnostics DiagnoseDeleteFailure(const FString& AssetPath)
 	{
 		FDeleteDiagnostics Diag;
@@ -1603,7 +1853,7 @@ namespace
 		{
 			if (UAssetEditorSubsystem* AES = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
 			{
-				if (UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath))
+				if (UObject* Asset = MCPLoadAssetObject(AssetPath))
 				{
 					Diag.bOpenInEditor = AES->FindEditorsForAsset(Asset).Num() > 0;
 				}
@@ -1626,7 +1876,7 @@ namespace
 		// #601: when there are no editors/on-disk referencers the delete still
 		// fails for non-obvious reasons. Gather the common culprits so callers
 		// get something actionable instead of a bare "unknown".
-		if (UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath))
+		if (UObject* Asset = MCPLoadAssetObject(AssetPath))
 		{
 			// Live (in-memory) references beyond the asset's own package.
 			FReferencerInformationList RefInfo;
@@ -1697,7 +1947,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteAsset(const TSharedPtr<FJsonObject>
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("path"), TEXT("assetPath"), AssetPath)) return Err;
 
-	if (IsProtectedAssetPath(AssetPath)) return MakeProtectedPathError(AssetPath);
+	if (MCPIsProtectedAssetPath(AssetPath)) return MCPProtectedPathError(AssetPath);
 
 	const bool bForce = OptionalBool(Params, TEXT("force"), false);
 
@@ -1708,6 +1958,18 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteAsset(const TSharedPtr<FJsonObject>
 		Result->SetStringField(TEXT("path"), AssetPath);
 		Result->SetBoolField(TEXT("alreadyDeleted"), true);
 		return MCPResult(Result);
+	}
+
+	// #976: the delete below is a force delete, so the reference check has to
+	// happen here rather than being left to an API that does not do one.
+	if (!bForce)
+	{
+		TSharedPtr<FJsonObject> Refused = MakeShared<FJsonObject>();
+		Refused->SetBoolField(TEXT("success"), false);
+		if (CheckedDeleteRefusal(AssetPath, Refused))
+		{
+			return MCPResult(Refused);
+		}
 	}
 
 	bool bClosedEditor = false;
@@ -1721,6 +1983,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteAsset(const TSharedPtr<FJsonObject>
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("path"), AssetPath);
 	Result->SetBoolField(TEXT("deleted"), bSuccess);
+	Result->SetBoolField(TEXT("forced"), bForce);
 	if (bClosedEditor)
 	{
 		Result->SetBoolField(TEXT("closedOpenEditor"), true);
@@ -1731,7 +1994,23 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteAsset(const TSharedPtr<FJsonObject>
 		ApplyDiagnosticsToJson(Result, DiagnoseDeleteFailure(AssetPath));
 	}
 
-	// Delete is non-reversible by default.
+	// Scoped to what actually happened, the way the batch delete scopes its
+	// note to the entries with status deleted. A delete the editor refused or
+	// could not finish left the asset where it was, and saying the package is
+	// gone would be describing a different call.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	if (bSuccess)
+	{
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The package is gone from disk and the bridge holds no copy of it, so no call recreates the asset that was ")
+			TEXT("deleted. There is no inverse action. Take the snapshot before the delete if the step has to be recoverable."));
+	}
+	else
+	{
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Nothing was deleted: the asset is still at this path, so there is nothing to undo. The diagnostics on this ")
+			TEXT("result say why the delete did not finish."));
+	}
 	return MCPResult(Result);
 }
 
@@ -1749,6 +2028,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteAssetBatch(const TSharedPtr<FJsonOb
 	int32 Deleted = 0;
 	int32 Absent = 0;
 	int32 Failed = 0;
+	int32 Refused = 0;
 	int32 ClosedEditors = 0;
 
 	int32 Protected = 0;
@@ -1763,7 +2043,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteAssetBatch(const TSharedPtr<FJsonOb
 		TSharedPtr<FJsonObject> Entry = MakeShared<FJsonObject>();
 		Entry->SetStringField(TEXT("path"), Path);
 
-		if (IsProtectedAssetPath(Path))
+		if (MCPIsProtectedAssetPath(Path))
 		{
 			Entry->SetStringField(TEXT("status"), TEXT("protected"));
 			Entry->SetStringField(TEXT("reason"), TEXT("Engine/Script/Memory/Temp mounts are read-only via the bridge"));
@@ -1773,6 +2053,15 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteAssetBatch(const TSharedPtr<FJsonOb
 		{
 			Entry->SetStringField(TEXT("status"), TEXT("absent"));
 			Absent++;
+		}
+		else if (!bForce && CheckedDeleteRefusal(Path, Entry))
+		{
+			// #976: same rule as the single delete. Per-asset, because one
+			// referenced entry in a batch is not a reason to refuse the rest,
+			// and a bare "failed" count never said which entry was skipped or
+			// why. Status is its own value so a caller can tell a refusal
+			// apart from a delete the editor attempted and could not finish.
+			Refused++;
 		}
 		else
 		{
@@ -1803,9 +2092,15 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteAssetBatch(const TSharedPtr<FJsonOb
 	Result->SetNumberField(TEXT("deleted"), Deleted);
 	Result->SetNumberField(TEXT("absent"), Absent);
 	Result->SetNumberField(TEXT("failed"), Failed);
+	Result->SetNumberField(TEXT("refused"), Refused);
+	Result->SetBoolField(TEXT("forced"), bForce);
 	if (Protected > 0) Result->SetNumberField(TEXT("protected"), Protected);
 	Result->SetNumberField(TEXT("total"), PerPath.Num());
 	if (ClosedEditors > 0) Result->SetNumberField(TEXT("closedEditors"), ClosedEditors);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Every package with status deleted is gone from disk and the bridge holds no copy of it, so no call recreates ")
+		TEXT("them. There is no inverse action. Take the snapshot before the delete if the step has to be recoverable."));
 	return MCPResult(Result);
 }
 
@@ -1892,7 +2187,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRename(const TSharedPtr<FJsonObject>&
 			continue;
 		}
 
-		if (IsProtectedAssetPath(SourcePath) || IsProtectedAssetPath(NewPackagePath))
+		if (MCPIsProtectedAssetPath(SourcePath) || MCPIsProtectedAssetPath(NewPackagePath))
 		{
 			Record->SetStringField(TEXT("status"), TEXT("protected"));
 			Record->SetStringField(TEXT("reason"), TEXT("Engine/Script/Memory/Temp mounts are read-only via the bridge"));
@@ -1913,7 +2208,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRename(const TSharedPtr<FJsonObject>&
 			continue;
 		}
 
-		UObject* Asset = UEditorAssetLibrary::LoadAsset(SourcePath);
+		UObject* Asset = MCPLoadAssetObject(SourcePath);
 		if (!Asset)
 		{
 			Record->SetStringField(TEXT("status"), TEXT("not_found"));
@@ -1944,9 +2239,17 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRename(const TSharedPtr<FJsonObject>&
 	bool bOk = AssetTools.RenameAssets(BatchRenames);
 
 	// Mark each batched rename with its post-op status.
+	// Every entry that landed also produces the entry that puts it back, so the
+	// inverse covers exactly the renames that happened rather than the ones
+	// that were asked for.
 	int32 Succeeded = 0;
 	int32 Failed = 0;
 	int32 Idx = 0;
+	TArray<TSharedPtr<FJsonValue>> ReverseRenames;
+	// Two entries naming the same source collapse onto one asset, so a reverse
+	// list built without this would carry a second entry whose source no
+	// longer exists and which comes back not_found.
+	TSet<FString> ReverseSeen;
 	for (int32 i = 0; i < PerItem.Num(); ++i)
 	{
 		TSharedPtr<FJsonObject> Rec = PerItem[i]->AsObject();
@@ -1962,11 +2265,66 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRename(const TSharedPtr<FJsonObject>&
 		{
 			Rec->SetStringField(TEXT("status"), TEXT("renamed"));
 			Succeeded++;
+
+			if (!ReverseSeen.Contains(DestFullPath))
+			{
+				ReverseSeen.Add(DestFullPath);
+				FString SourcePath;
+				Rec->TryGetStringField(TEXT("sourcePath"), SourcePath);
+				const FMCPAssetPathForms SourceForms = MCPAssetPathForms(SourcePath);
+				TSharedPtr<FJsonObject> Reverse = MakeShared<FJsonObject>();
+				Reverse->SetStringField(TEXT("sourcePath"), DestFullPath);
+				Reverse->SetStringField(TEXT("newPackagePath"), FPaths::GetPath(SourceForms.PackagePath));
+				Reverse->SetStringField(TEXT("newName"), SourceForms.AssetName);
+				ReverseRenames.Add(MakeShared<FJsonValueObject>(Reverse));
+			}
 		}
 		else
 		{
 			Rec->SetStringField(TEXT("status"), TEXT("failed"));
 			Failed++;
+		}
+	}
+
+	// #908: RenameAssets runs one redirector fix-up pass, and a referencer that
+	// is not loaded is invisible to it, so a stub is left at the old path with
+	// nothing in the response saying so. 29 renames left 19 of them, and the
+	// first sign of it was a later search finding redirectors nobody expected.
+	IAssetRegistry& RenameRegistry =
+		FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	int32 RedirectorsLeft = 0;
+	TArray<TSharedPtr<FJsonValue>> RedirectorPackages;
+	for (const TSharedPtr<FJsonValue>& Value : PerItem)
+	{
+		TSharedPtr<FJsonObject> Rec = Value.IsValid() ? Value->AsObject() : nullptr;
+		if (!Rec.IsValid()) continue;
+		FString Status;
+		Rec->TryGetStringField(TEXT("status"), Status);
+		if (Status != TEXT("renamed")) continue;
+
+		FString SourcePath;
+		Rec->TryGetStringField(TEXT("sourcePath"), SourcePath);
+		const FMCPAssetPathForms SourceForms = MCPAssetPathForms(SourcePath);
+
+		bool bRedirectorLeft = false;
+		TArray<FAssetData> AtOldPath;
+		RenameRegistry.GetAssetsByPackageName(FName(*SourceForms.PackagePath), AtOldPath);
+		for (const FAssetData& Data : AtOldPath)
+		{
+			if (Data.IsRedirector()) { bRedirectorLeft = true; break; }
+		}
+		// The registry can lag a rename that just happened, so an in-memory
+		// redirector counts too rather than reading as a clean result.
+		if (!bRedirectorLeft && FindObject<UObjectRedirector>(nullptr, *SourceForms.ObjectPath))
+		{
+			bRedirectorLeft = true;
+		}
+
+		Rec->SetBoolField(TEXT("redirectorLeft"), bRedirectorLeft);
+		if (bRedirectorLeft)
+		{
+			++RedirectorsLeft;
+			RedirectorPackages.Add(MakeShared<FJsonValueString>(SourceForms.PackagePath));
 		}
 	}
 
@@ -1978,6 +2336,38 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRename(const TSharedPtr<FJsonObject>&
 	Result->SetNumberField(TEXT("skipped"), Skipped);
 	Result->SetNumberField(TEXT("total"), PerItem.Num());
 	Result->SetArrayField(TEXT("results"), PerItem);
+	Result->SetNumberField(TEXT("redirectorsLeft"), RedirectorsLeft);
+	Result->SetNumberField(TEXT("redirectorsRemoved"), FMath::Max(0, Succeeded - RedirectorsLeft));
+	Result->SetArrayField(TEXT("redirectorPackages"), RedirectorPackages);
+	if (RedirectorsLeft > 0)
+	{
+		Result->SetStringField(TEXT("note"), FString::Printf(
+			TEXT("%d of %d renamed assets left an ObjectRedirector at the old path, still pointed at by packages this rename did not load. ")
+			TEXT("Pass redirectorPackages to asset(fixup_redirectors) to load exactly those referencers, rewrite them, and delete the stubs that come out unreferenced."),
+			RedirectorsLeft, Succeeded));
+	}
+
+	if (ReverseRenames.Num() > 0)
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetArrayField(TEXT("renames"), ReverseRenames);
+		MCPSetRollback(Result, TEXT("bulk_rename_assets"), Payload);
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetBoolField(TEXT("rollbackVerified"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("UNVERIFIED. The inverse renames every asset that landed back to the package path and name it came from, and ")
+			TEXT("redirectorsLeft on this result says how many of those old paths this call left an ObjectRedirector standing at. ")
+			TEXT("Whether IAssetTools::RenameAssets will rename over a destination package occupied by such a redirector is not ")
+			TEXT("stated in the shipped IAssetTools.h and FAssetRenameManager is not distributed, so it has not been established ")
+			TEXT("here. If it refuses, this rollback fails for the entries whose old path still carries a stub. Redirectors are ")
+			TEXT("not undone in any case: the stubs at the old paths stay, and the reverse rename leaves its own at the new paths. ")
+			TEXT("Run asset(fixup_redirectors) before a rollback to clear the old stubs, and again after it."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), TEXT("No rename landed, so there is nothing to undo."));
+	}
 	return MCPResult(Result);
 }
 
@@ -2177,13 +2567,22 @@ TSharedPtr<FJsonValue> FAssetHandlers::SaveAsset(const TSharedPtr<FJsonObject>& 
 		Result->SetStringField(TEXT("path"), AssetPath);
 		Result->SetBoolField(TEXT("force"), bForce);
 
+		// The dirty flag is the only honest answer to "did this call change
+		// anything", and it has to be read before the save, because afterwards
+		// every package is clean and a save that wrote nothing is
+		// indistinguishable from one that flushed an edit.
+		UObject* PreSaveAsset = MCPLoadAssetObject(AssetPath);
+		UPackage* PreSavePackage = PreSaveAsset ? PreSaveAsset->GetOutermost() : nullptr;
+		const bool bWasDirty = PreSavePackage && PreSavePackage->IsDirty();
+		Result->SetBoolField(TEXT("wasDirty"), bWasDirty);
+
 		bool bSuccess = false;
 		if (bForce)
 		{
 			UObject* Asset = LoadAssetByPath<UObject>(AssetPath);
 			if (!Asset)
 			{
-				return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
+				return MCPAssetNotFoundError(AssetPath);
 			}
 			UPackage* Package = Asset->GetOutermost();
 			if (!Package)
@@ -2198,7 +2597,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SaveAsset(const TSharedPtr<FJsonObject>& 
 		else
 		{
 			bSuccess = UEditorAssetLibrary::SaveAsset(AssetPath);
-			if (UObject* Asset = FindObject<UObject>(nullptr, *AssetPath))
+			if (UObject* Asset = MCPLoadAssetObject(AssetPath))
 			{
 				if (UPackage* Package = Asset->GetOutermost())
 				{
@@ -2209,6 +2608,39 @@ TSharedPtr<FJsonValue> FAssetHandlers::SaveAsset(const TSharedPtr<FJsonObject>& 
 			}
 		}
 		Result->SetBoolField(TEXT("success"), bSuccess);
+
+		// A clean package had nothing to flush. Without force the save was a
+		// no-op and says so; with force the file was rewritten anyway, which is
+		// a write to disk even though no edit was pending, so it does not claim
+		// to have changed nothing.
+		if (bWasDirty)
+		{
+			MCPSetUpdated(Result);
+		}
+		else if (bForce && bSuccess)
+		{
+			MCPSetUpdated(Result);
+			Result->SetStringField(TEXT("note"),
+				TEXT("The package was not dirty. force=true rewrote the file on disk anyway; without it this call would have written nothing."));
+		}
+		else
+		{
+			Result->SetBoolField(TEXT("updated"), false);
+			Result->SetBoolField(TEXT("unchanged"), true);
+			if (bSuccess)
+			{
+				// Only when the save itself reported success. A failed save
+				// wrote nothing either, and telling that caller the package was
+				// simply clean would hide the failure behind a no-op.
+				Result->SetStringField(TEXT("note"),
+					TEXT("The package was not dirty, so nothing was written. Pass force=true to write it regardless."));
+			}
+		}
+
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("A save overwrites the file on disk with what is in memory. The previous file contents are gone and the ")
+			TEXT("bridge holds no copy, so there is no un-save. There is no inverse action."));
 		return MCPResult(Result);
 	}
 	else
@@ -2220,10 +2652,40 @@ TSharedPtr<FJsonValue> FAssetHandlers::SaveAsset(const TSharedPtr<FJsonObject>& 
 		{
 			return MCPError(TEXT("'force' requires an assetPath - it forces one package to disk. To flush everything, use asset(save_all_dirty), which reports exactly which packages were written."));
 		}
+		// Counted before the sweep for the same reason as the single-asset
+		// branch: SaveDirectory is dirty-only, so with nothing dirty it writes
+		// nothing, and afterwards there is no way to tell that from a sweep
+		// that flushed a hundred packages.
+		TArray<UPackage*> DirtyBefore;
+		FEditorFileUtils::GetDirtyContentPackages(DirtyBefore);
+		FEditorFileUtils::GetDirtyWorldPackages(DirtyBefore);
+		int32 DirtyUnderGame = 0;
+		for (UPackage* Package : DirtyBefore)
+		{
+			if (Package && Package->IsDirty() && Package->GetName().StartsWith(TEXT("/Game/")))
+			{
+				++DirtyUnderGame;
+			}
+		}
+
 		UEditorAssetLibrary::SaveDirectory(TEXT("/Game"));
 		auto Result = MCPSuccess();
 		Result->SetBoolField(TEXT("success"), true);
 		Result->SetStringField(TEXT("message"), TEXT("All modified assets under /Game saved (dirty only). Use save_all_dirty for a per-package report."));
+		Result->SetNumberField(TEXT("dirtyPackagesBefore"), DirtyUnderGame);
+		if (DirtyUnderGame > 0)
+		{
+			MCPSetUpdated(Result);
+		}
+		else
+		{
+			Result->SetBoolField(TEXT("updated"), false);
+			Result->SetBoolField(TEXT("unchanged"), true);
+		}
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("A save overwrites the files on disk with what is in memory. The previous file contents are gone and the ")
+			TEXT("bridge holds no copy, so there is no un-save. There is no inverse action."));
 		return MCPResult(Result);
 	}
 }
@@ -2269,17 +2731,36 @@ TSharedPtr<FJsonValue> FAssetHandlers::SaveAllDirty(const TSharedPtr<FJsonObject
 	Result->SetNumberField(TEXT("attempted"), TargetNames.Num());
 	Result->SetArrayField(TEXT("saved"), Written);
 	Result->SetArrayField(TEXT("stillDirty"), StillDirty);
+	// Keyed off what reached disk, not off what was dirty going in: a run where
+	// every package failed to write attempted work and changed nothing.
+	Result->SetBoolField(TEXT("unchanged"), Written.Num() == 0);
 	if (StillDirty.Num() > 0)
 	{
 		Result->SetStringField(TEXT("note"), TEXT("Some packages are still dirty after the save. Retry those with asset(save, path=..., force=true)."));
 	}
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("A save overwrites the files on disk with what is in memory. The previous file contents are gone and the ")
+		TEXT("bridge holds no copy, so there is no un-save. There is no inverse action."));
 	return MCPResult(Result);
 }
 
 TSharedPtr<FJsonValue> FAssetHandlers::ListTextures(const TSharedPtr<FJsonObject>& Params)
 {
 	FString Directory = OptionalString(Params, TEXT("directory"), TEXT("/Game/"));
-	int32 MaxResults = OptionalInt(Params, TEXT("maxResults"), 50);
+
+	// T3: paged. This stopped at 50 textures and reported a count of 50, so a
+	// project with 4000 of them looked identical to one with 50. `maxResults`
+	// is mapped onto `limit` on the TypeScript side, so the old spelling still
+	// sizes a page.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("list_textures|directory=%s"), *Directory),
+			/*DefaultLimit*/ 50, /*MaxLimit*/ 2000, Page))
+	{
+		return Err;
+	}
 
 	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
 	IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
@@ -2287,22 +2768,29 @@ TSharedPtr<FJsonValue> FAssetHandlers::ListTextures(const TSharedPtr<FJsonObject
 	TArray<FAssetData> AssetDataList;
 	AssetRegistry.GetAssetsByClass(FTopLevelAssetPath(TEXT("/Script/Engine"), TEXT("Texture2D")), AssetDataList, true);
 
-	TArray<TSharedPtr<FJsonValue>> TexturesArray;
+	TArray<MCPPagination::FPageRow> Rows;
 	for (const FAssetData& AssetData : AssetDataList)
 	{
-		if (TexturesArray.Num() >= MaxResults) break;
 		FString AssetPath = AssetData.GetObjectPathString();
 		if (!AssetPath.StartsWith(Directory)) continue;
 
 		TSharedPtr<FJsonObject> TexObj = MakeShared<FJsonObject>();
 		TexObj->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
 		TexObj->SetStringField(TEXT("path"), AssetPath);
-		TexturesArray.Add(MakeShared<FJsonValueObject>(TexObj));
+		// The object path is the anchor: unique across the project and the same
+		// string on the next enumeration.
+		Rows.Add({ AssetPath, MakeShared<FJsonValueObject>(TexObj) });
 	}
 
+	// The asset registry does not promise an enumeration order, so the list is
+	// sorted before paging. A cursor over an unordered enumeration is not
+	// resumable: the anchor would move every call.
+	Rows.Sort([](const MCPPagination::FPageRow& A, const MCPPagination::FPageRow& B)
+		{ return A.Id < B.Id; });
+
 	auto Result = MCPSuccess();
-	Result->SetArrayField(TEXT("textures"), TexturesArray);
-	Result->SetNumberField(TEXT("count"), TexturesArray.Num());
+	Result->SetStringField(TEXT("directory"), Directory);
+	MCPPagination::EmitPage(Page, Rows, TEXT("textures"), Result);
 	return MCPResult(Result);
 }
 TSharedPtr<FJsonValue> FAssetHandlers::ReloadPackage(const TSharedPtr<FJsonObject>& Params)
@@ -2310,11 +2798,9 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReloadPackage(const TSharedPtr<FJsonObjec
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Asset not found: %s"), *AssetPath));
-	}
+	TSharedPtr<FJsonValue> LoadError;
+	UObject* Asset = MCPRequireAssetObject(AssetPath, LoadError);
+	if (!Asset) return LoadError;
 
 	UPackage* Package = Asset->GetOutermost();
 	if (!Package)
@@ -2326,8 +2812,14 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReloadPackage(const TSharedPtr<FJsonObjec
 	FString PackageName = Package->GetName();
 	FString PackageFileName;
 	bool bSuccess = false;
+	// Whether the reload machinery ran at all. Everything below sits inside
+	// this branch, so when the package is not on disk nothing is reset,
+	// collected or re-read and the call genuinely changed nothing.
+	bool bReloadRan = false;
 	if (FPackageName::DoesPackageExist(PackageName, &PackageFileName))
 	{
+		bReloadRan = true;
+
 		// Reset loaders so we can reload
 		ResetLoaders(Package);
 
@@ -2335,7 +2827,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReloadPackage(const TSharedPtr<FJsonObjec
 		CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 
 		// Reload
-		UObject* Reloaded = UEditorAssetLibrary::LoadAsset(AssetPath);
+		UObject* Reloaded = MCPLoadAssetObject(AssetPath);
 		bSuccess = (Reloaded != nullptr);
 	}
 
@@ -2347,6 +2839,28 @@ TSharedPtr<FJsonValue> FAssetHandlers::ReloadPackage(const TSharedPtr<FJsonObjec
 	{
 		Result->SetStringField(TEXT("error"), TEXT("Package reload failed"));
 	}
+	// Keyed off whether the reload block executed, not off whether it worked.
+	// Where it ran, ResetLoaders and a collection have already changed editor
+	// state, and a failed re-read left the package WORSE than it found it
+	// rather than unchanged. Where the package is not on disk that block is
+	// skipped whole and nothing happened, so an unconditional false would have
+	// been an inaccurate marker on exactly that path.
+	Result->SetBoolField(TEXT("unchanged"), !bReloadRan);
+	if (bReloadRan)
+	{
+		Result->SetStringField(TEXT("idempotencyNote"),
+			TEXT("A reload that runs is never a no-op: ResetLoaders and a garbage collection precede the re-read, so replaying ")
+			TEXT("this call discards and rebuilds the in-memory package again rather than recognising it has nothing to do."));
+	}
+	else
+	{
+		Result->SetStringField(TEXT("idempotencyNote"),
+			TEXT("The package is not on disk, so nothing was reset, collected or re-read and this call changed nothing."));
+	}
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("A reload throws the in-memory package away and re-reads the file. Whatever was in memory and not on disk is ")
+		TEXT("gone, and reloading again re-reads the same file rather than restoring it. There is no inverse action."));
 
 	return MCPResult(Result);
 }
@@ -2557,8 +3071,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::MoveFolder(const TSharedPtr<FJsonObject>&
 	SourcePath.RemoveFromEnd(TEXT("/"));
 	DestinationPath.RemoveFromEnd(TEXT("/"));
 
-	if (IsProtectedAssetPath(SourcePath))      return MakeProtectedPathError(SourcePath);
-	if (IsProtectedAssetPath(DestinationPath)) return MakeProtectedPathError(DestinationPath);
+	if (MCPIsProtectedAssetPath(SourcePath))      return MCPProtectedPathError(SourcePath);
+	if (MCPIsProtectedAssetPath(DestinationPath)) return MCPProtectedPathError(DestinationPath);
 
 	// Scan source path to discover all assets
 	IAssetRegistry& AR = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
@@ -2606,8 +3120,11 @@ TSharedPtr<FJsonValue> FAssetHandlers::MoveFolder(const TSharedPtr<FJsonObject>&
 
 	bool bOk = AssetTools.RenameAssets(BatchRenames);
 
-	// Count how many actually landed at the destination
+	// Count how many actually landed at the destination, and record the entry
+	// that puts each one back, so the inverse covers exactly the moves that
+	// happened rather than the ones that were asked for.
 	int32 Succeeded = 0;
+	TArray<TSharedPtr<FJsonValue>> ReverseRenames;
 	for (const FAssetRenameData& Data : BatchRenames)
 	{
 		const FString DestFullPath = FString::Printf(TEXT("%s/%s.%s"),
@@ -2615,6 +3132,17 @@ TSharedPtr<FJsonValue> FAssetHandlers::MoveFolder(const TSharedPtr<FJsonObject>&
 		if (UEditorAssetLibrary::DoesAssetExist(DestFullPath))
 		{
 			Succeeded++;
+
+			FString OriginalPackagePath = Data.NewPackagePath;
+			if (OriginalPackagePath.StartsWith(DestinationPath))
+			{
+				OriginalPackagePath = SourcePath + OriginalPackagePath.Mid(DestinationPath.Len());
+			}
+			TSharedPtr<FJsonObject> Reverse = MakeShared<FJsonObject>();
+			Reverse->SetStringField(TEXT("sourcePath"), DestFullPath);
+			Reverse->SetStringField(TEXT("newPackagePath"), OriginalPackagePath);
+			Reverse->SetStringField(TEXT("newName"), Data.NewName);
+			ReverseRenames.Add(MakeShared<FJsonValueObject>(Reverse));
 		}
 	}
 
@@ -2624,6 +3152,32 @@ TSharedPtr<FJsonValue> FAssetHandlers::MoveFolder(const TSharedPtr<FJsonObject>&
 	Result->SetNumberField(TEXT("totalAssets"), FoundAssets.Num());
 	Result->SetNumberField(TEXT("renamedCount"), Succeeded);
 	Result->SetBoolField(TEXT("allSucceeded"), bOk && Succeeded == BatchRenames.Num());
+	Result->SetBoolField(TEXT("unchanged"), Succeeded == 0);
+
+	// The inverse is per asset, not the mirrored move_folder call: reversing
+	// the folders would also drag anything that was already sitting under
+	// destinationPath before this ran, which this call never touched.
+	if (ReverseRenames.Num() > 0)
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetArrayField(TEXT("renames"), ReverseRenames);
+		MCPSetRollback(Result, TEXT("bulk_rename_assets"), Payload);
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetBoolField(TEXT("rollbackVerified"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("UNVERIFIED. The inverse moves each asset that landed back to the package path it came from, and this move left ")
+			TEXT("an ObjectRedirector at each of those old paths. Whether IAssetTools::RenameAssets will rename over a destination ")
+			TEXT("package occupied by such a redirector is not stated in the shipped IAssetTools.h and FAssetRenameManager is not ")
+			TEXT("distributed, so it has not been established here. If it refuses, this rollback fails. Two things do not come back ")
+			TEXT("in any case: bulk_rename_assets refuses World assets, so a level this move carried has to be returned with ")
+			TEXT("asset(rename); and the redirector stubs stay, as do the ones the reverse move leaves at the new paths. ")
+			TEXT("Run asset(fixup_redirectors) before a rollback to clear the old stubs, and again after it."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), TEXT("No asset landed at the destination, so there is nothing to undo."));
+	}
 	return MCPResult(Result);
 }
 
@@ -2653,6 +3207,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateFolder(const TSharedPtr<FJsonObject
 	}
 
 	TArray<TSharedPtr<FJsonValue>> Created, Existed, Failed;
+	// Every directory this call brought into being, leaves and intermediates
+	// alike. `Created` stays the leaf-only list the response has always
+	// reported; this is what the rollback has to remove.
+	TArray<FString> MadeDirectories;
 	for (const FString& P : Paths)
 	{
 		FString Norm = P;
@@ -2667,10 +3225,38 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateFolder(const TSharedPtr<FJsonObject
 			Existed.Add(MakeShared<FJsonValueString>(Norm));
 			continue;
 		}
+		// MakeDirectory builds the whole tree, so /Game/A/B/C can create A and B
+		// as well as C. Recording only the leaf left the intermediates behind
+		// on rollback. Walk up first and collect every segment that is missing.
+		TArray<FString> MissingChain;
+		{
+			// The mount root is the floor. Contains("/") is true of "/Game"
+			// because of the leading slash, so it never stopped the walk on its
+			// own: it only held because DoesDirectoryExist happens to answer
+			// true for a mount root. Ask the package system where the floor is
+			// instead of relying on that.
+			const FName MountPoint = FPackageName::GetPackageMountPoint(Norm);
+			const FString MountRoot = MountPoint.IsNone()
+				? FString()
+				: FString(TEXT("/")) + MountPoint.ToString();
+
+			FString Walk = Norm;
+			while (!Walk.IsEmpty() && Walk != TEXT("/"))
+			{
+				if (!MountRoot.IsEmpty() && Walk == MountRoot) break;
+				if (UEditorAssetLibrary::DoesDirectoryExist(Walk)) break;
+				MissingChain.Add(Walk);
+				const FString Parent = FPaths::GetPath(Walk);
+				if (Parent.IsEmpty() || Parent == Walk) break;
+				Walk = Parent;
+			}
+		}
+
 		const bool bOk = UEditorAssetLibrary::MakeDirectory(Norm);
 		if (bOk)
 		{
 			Created.Add(MakeShared<FJsonValueString>(Norm));
+			for (const FString& Made : MissingChain) MadeDirectories.AddUnique(Made);
 		}
 		else
 		{
@@ -2686,6 +3272,32 @@ TSharedPtr<FJsonValue> FAssetHandlers::CreateFolder(const TSharedPtr<FJsonObject
 	Result->SetNumberField(TEXT("existedCount"), Existed.Num());
 	Result->SetNumberField(TEXT("failedCount"), Failed.Num());
 	Result->SetBoolField(TEXT("allSucceeded"), Failed.Num() == 0);
+	Result->SetBoolField(TEXT("unchanged"), Created.Num() == 0);
+
+	// Only the directories this call made. A path that already existed is not
+	// this call's to delete. Deepest first, so delete_folder takes a child out
+	// before its parent: a parent still holding a child is not empty, and the
+	// default force=false leaves a non-empty directory alone.
+	if (MadeDirectories.Num() > 0)
+	{
+		MadeDirectories.Sort([](const FString& A, const FString& B) { return A.Len() > B.Len(); });
+		TArray<TSharedPtr<FJsonValue>> RollbackPaths;
+		for (const FString& Made : MadeDirectories) RollbackPaths.Add(MakeShared<FJsonValueString>(Made));
+
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetArrayField(TEXT("paths"), RollbackPaths);
+		MCPSetRollback(Result, TEXT("delete_folder"), Payload);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The inverse removes every directory this call brought into being, intermediates included, deepest first. It runs ")
+			TEXT("with the default force=false, so a directory that has since had assets put into it is reported not_empty and left ")
+			TEXT("standing rather than deleted out from under them."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), TEXT("No directory was created, so there is nothing to undo."));
+	}
 	return MCPResult(Result);
 }
 
@@ -2721,6 +3333,15 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteFolder(const TSharedPtr<FJsonObject
 
 	TArray<TSharedPtr<FJsonValue>> Entries;
 	int32 Deleted = 0, Absent = 0, Failed = 0;
+	// The directories this call actually removed, and whether any of them took
+	// assets with them. Both feed the rollback record below.
+	TArray<TSharedPtr<FJsonValue>> DeletedPaths;
+	int32 AssetsDeleted = 0;
+	// DeleteDirectory takes the whole subtree, so a folder with subdirectories
+	// loses more than the path that was named. create_folder can only put back
+	// the paths it is handed, and the empty subdirectories are not enumerable
+	// from the asset list, so this is counted and disclosed rather than claimed.
+	int32 SubdirectoriesDeleted = 0;
 
 	for (const FString& P : Paths)
 	{
@@ -2740,7 +3361,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteFolder(const TSharedPtr<FJsonObject
 			continue;
 		}
 
-		if (IsProtectedAssetPath(Norm))
+		if (MCPIsProtectedAssetPath(Norm))
 		{
 			Entry->SetStringField(TEXT("status"), TEXT("failed"));
 			Entry->SetStringField(TEXT("reason"), TEXT("protected_path"));
@@ -2778,6 +3399,19 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteFolder(const TSharedPtr<FJsonObject
 		{
 			Entry->SetStringField(TEXT("status"), TEXT("deleted"));
 			if (Contained.Num() > 0) Entry->SetNumberField(TEXT("assetsDeleted"), Contained.Num());
+			DeletedPaths.Add(MakeShared<FJsonValueString>(Norm));
+			AssetsDeleted += Contained.Num();
+			// Any contained asset sitting below Norm rather than directly in it
+			// proves there was a subdirectory that went with the delete.
+			{
+				TSet<FString> NestedDirs;
+				for (const FString& Held : Contained)
+				{
+					const FString HeldDir = FPaths::GetPath(Held);
+					if (HeldDir.Len() > Norm.Len() && HeldDir.StartsWith(Norm)) NestedDirs.Add(HeldDir);
+				}
+				SubdirectoriesDeleted += NestedDirs.Num();
+			}
 			Deleted++;
 		}
 		else
@@ -2795,6 +3429,30 @@ TSharedPtr<FJsonValue> FAssetHandlers::DeleteFolder(const TSharedPtr<FJsonObject
 	Result->SetNumberField(TEXT("absentCount"), Absent);
 	Result->SetNumberField(TEXT("failedCount"), Failed);
 	Result->SetBoolField(TEXT("allSucceeded"), Failed == 0);
+	Result->SetBoolField(TEXT("unchanged"), Deleted == 0);
+
+	if (DeletedPaths.Num() > 0)
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetArrayField(TEXT("paths"), DeletedPaths);
+		MCPSetRollback(Result, TEXT("create_folder"), Payload);
+		Result->SetNumberField(TEXT("subdirectoriesDeleted"), SubdirectoriesDeleted);
+		const bool bLossy = AssetsDeleted > 0 || SubdirectoriesDeleted > 0;
+		Result->SetBoolField(TEXT("rollbackLossy"), bLossy);
+		if (bLossy)
+		{
+			Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+				TEXT("The inverse recreates only the %d directory path(s) that were named, empty. It does not restore the tree ")
+				TEXT("beneath them: this delete also took %d subdirectory(ies), and force=true took %d asset(s) inside them, which ")
+				TEXT("no call brings back. Only a delete of empty, leaf directories is fully undone by this rollback."),
+				DeletedPaths.Num(), SubdirectoriesDeleted, AssetsDeleted));
+		}
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), TEXT("No directory was deleted, so there is nothing to undo."));
+	}
 	return MCPResult(Result);
 }
 
@@ -2833,7 +3491,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::HealthCheck(const TSharedPtr<FJsonObject>
 	bool bCanLoad = bIsLoaded;
 	if (!bIsLoaded)
 	{
-		UObject* Probe = UEditorAssetLibrary::LoadAsset(AssetPath);
+		UObject* Probe = MCPLoadAssetObject(AssetPath);
 		bCanLoad = Probe != nullptr;
 		if (Probe) InMemory = Probe;
 	}
@@ -2862,7 +3520,8 @@ TSharedPtr<FJsonValue> FAssetHandlers::ForceReload(const TSharedPtr<FJsonObject>
 	FString AssetPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("assetPath"), TEXT("path"), AssetPath)) return Err;
 
-	const FString PackageName = FPackageName::ObjectPathToPackageName(AssetPath);
+	const FMCPAssetPathForms Forms = MCPAssetPathForms(AssetPath);
+	const FString PackageName = Forms.PackagePath;
 	FString PackageFileName;
 	if (!FPackageName::DoesPackageExist(PackageName, &PackageFileName))
 	{
@@ -2875,7 +3534,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ForceReload(const TSharedPtr<FJsonObject>
 	{
 		if (UAssetEditorSubsystem* AES = GEditor->GetEditorSubsystem<UAssetEditorSubsystem>())
 		{
-			if (UObject* Existing = StaticFindObject(UObject::StaticClass(), nullptr, *AssetPath))
+			if (UObject* Existing = StaticFindObject(UObject::StaticClass(), nullptr, *Forms.ObjectPath))
 			{
 				if (AES->FindEditorsForAsset(Existing).Num() > 0)
 				{
@@ -2893,7 +3552,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ForceReload(const TSharedPtr<FJsonObject>
 	// package, recompiles the Blueprint and reinstances against the new class.
 	// A package the editor refuses to release is reported, not papered over.
 	UPackage* ExistingPkg = FindPackage(nullptr, *PackageName);
-	UObject* PreviousObject = StaticFindObject(UObject::StaticClass(), nullptr, *AssetPath);
+	UObject* PreviousObject = StaticFindObject(UObject::StaticClass(), nullptr, *Forms.ObjectPath);
 	const TWeakObjectPtr<UObject> PreviousWeak(PreviousObject);
 	const bool bWasDirty = ExistingPkg != nullptr && ExistingPkg->IsDirty();
 	const bool bDiscardUnsaved = OptionalBool(Params, TEXT("discardUnsaved"), false);
@@ -2937,7 +3596,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::ForceReload(const TSharedPtr<FJsonObject>
 		CollectGarbage(GARBAGE_COLLECTION_KEEPFLAGS);
 	}
 
-	UObject* Reloaded = LoadObject<UObject>(nullptr, *AssetPath, nullptr, LOAD_None);
+	UObject* Reloaded = LoadObject<UObject>(nullptr, *Forms.ObjectPath, nullptr, LOAD_None);
 	const bool bSuccess = Reloaded != nullptr;
 	// A package that was already in memory must come back as a new object for
 	// the read to be trustworthy. Same pointer means the editor kept its copy.
@@ -2950,6 +3609,27 @@ TSharedPtr<FJsonValue> FAssetHandlers::ForceReload(const TSharedPtr<FJsonObject>
 	Result->SetStringField(TEXT("method"), ReloadMethod);
 	Result->SetBoolField(TEXT("wasLoaded"), PreviousObject != nullptr);
 	Result->SetBoolField(TEXT("objectReplaced"), bReplaced);
+	// Never true, and answered the same way asset(reload_package) answers it.
+	// Every path that reaches here has already run ReloadPackages, or its
+	// fallback of ResetLoaders plus ClearFlags plus a collection, or at minimum
+	// a bare CollectGarbage, so editor state moved before this line.
+	//
+	// !bReplaced does NOT mean nothing happened. It means the editor refused to
+	// release the package, which is the same state the branch below reports as
+	// success:false with an error saying the object still holds its pre-reload
+	// contents. Keeping it in this term produced success:false, reloaded:false
+	// and unchanged:true on one result, and a dirty package whose unsaved edits
+	// had just been discarded could read unchanged:true as well.
+	Result->SetBoolField(TEXT("unchanged"), false);
+	Result->SetStringField(TEXT("idempotencyNote"),
+		TEXT("A forced reload is never a no-op: it releases and re-reads the package every time it is called rather than ")
+		TEXT("recognising it has nothing to do. wasLoaded, objectReplaced, closedOpenEditor and discardedUnsavedChanges on this ")
+		TEXT("result say what it actually moved."));
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("A forced reload throws the in-memory package away and re-reads the file. With discardUnsaved=true anything that ")
+		TEXT("was in memory and not on disk is gone, and reloading again re-reads the same file rather than restoring it. ")
+		TEXT("There is no inverse action."));
 	if (bWasDirty) Result->SetBoolField(TEXT("discardedUnsavedChanges"), true);
 	if (bClosedEditor) Result->SetBoolField(TEXT("closedOpenEditor"), true);
 	if (Reloaded) Result->SetStringField(TEXT("class"), Reloaded->GetClass()->GetName());
@@ -2992,12 +3672,15 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetAssetProperty(const TSharedPtr<FJsonOb
 		return MCPError(TEXT("Missing 'value' parameter"));
 	}
 
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
-	}
-	Asset = MCPResolveAssetToCDO(Asset); // #568 - author the generated-class CDO for Blueprint paths
+	// #931: default to persisting. A write that only marked the package dirty
+	// was the whole defect, so opting out has to be deliberate.
+	const bool bSave = OptionalBool(Params, TEXT("save"), true);
+
+	TSharedPtr<FJsonValue> LoadError;
+	UObject* Asset = MCPRequireAssetObject(AssetPath, LoadError);
+	if (!Asset) return LoadError;
+	UBlueprint* OwningBlueprint = nullptr;
+	Asset = MCPResolveAssetToCDO(Asset, &OwningBlueprint); // #568 - author the generated-class CDO for Blueprint paths
 
 	// Resolve the (possibly indexed, possibly subobject-descending) path.
 	// Supports "Config.Traits[1].Params.RepresentationActorManagementClass"
@@ -3034,9 +3717,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetAssetProperty(const TSharedPtr<FJsonOb
 	if (LeafOwner) LeafOwner->PostEditChange();
 	Asset->PostEditChange();
 	Asset->MarkPackageDirty();
+	MCPNoteBlueprintCDOWrite(OwningBlueprint, PropertyName);
 
 	FString NewValue;
 	FinalProp->ExportText_Direct(NewValue, ValuePtr, ValuePtr, nullptr, PPF_None);
+
+	FString PersistReason;
+	const bool bPersisted = MCPPersistAssetWrite(Asset, OwningBlueprint, bSave, PersistReason);
 
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
@@ -3044,6 +3731,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetAssetProperty(const TSharedPtr<FJsonOb
 	Result->SetStringField(TEXT("propertyName"), PropertyName);
 	Result->SetStringField(TEXT("previousValue"), PrevValue);
 	Result->SetStringField(TEXT("value"), NewValue);
+	MCPDescribePropertyWritePersistence(Result, Asset, PropertyName, bSave, bPersisted, PersistReason);
 	if (bMapBearing)
 	{
 		Result->SetNumberField(TEXT("mapPairCount"), MCPPropertyText::CountMapPairs(FinalProp, ValuePtr));
@@ -3085,12 +3773,13 @@ TSharedPtr<FJsonValue> FAssetHandlers::AppendAssetArrayElements(const TSharedPtr
 		return MCPError(TEXT("'elements' must contain at least one value"));
 	}
 
-	UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
-	if (!Asset)
-	{
-		return MCPError(FString::Printf(TEXT("Could not load asset '%s'"), *AssetPath));
-	}
-	Asset = MCPResolveAssetToCDO(Asset);
+	const bool bSave = OptionalBool(Params, TEXT("save"), true);
+
+	TSharedPtr<FJsonValue> LoadError;
+	UObject* Asset = MCPRequireAssetObject(AssetPath, LoadError);
+	if (!Asset) return LoadError;
+	UBlueprint* OwningBlueprint = nullptr;
+	Asset = MCPResolveAssetToCDO(Asset, &OwningBlueprint);
 
 	FProperty* FinalProp = nullptr;
 	void* ValuePtr = nullptr;
@@ -3163,6 +3852,10 @@ TSharedPtr<FJsonValue> FAssetHandlers::AppendAssetArrayElements(const TSharedPtr
 	if (LeafOwner && LeafOwner != Asset) LeafOwner->PostEditChange();
 	Asset->PostEditChange();
 	Asset->MarkPackageDirty();
+	MCPNoteBlueprintCDOWrite(OwningBlueprint, PropertyName);
+
+	FString PersistReason;
+	const bool bPersisted = MCPPersistAssetWrite(Asset, OwningBlueprint, bSave, PersistReason);
 
 	TArray<TSharedPtr<FJsonValue>> AppendedIndices;
 	AppendedIndices.Reserve(AppendedCount);
@@ -3181,7 +3874,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::AppendAssetArrayElements(const TSharedPtr
 	Result->SetNumberField(TEXT("newNum"), PreviousNum + AppendedCount);
 	Result->SetArrayField(TEXT("appendedIndices"), AppendedIndices);
 	Result->SetField(TEXT("previousValue"), PreviousValue);
-	Result->SetBoolField(TEXT("saved"), false);
+	MCPDescribePropertyWritePersistence(Result, Asset, PropertyName, bSave, bPersisted, PersistReason);
 
 	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("assetPath"), AssetPath);
@@ -3225,6 +3918,12 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetTextureSettingsByType(const TSharedPtr
 
 	TArray<TSharedPtr<FJsonValue>> Updated;
 	TArray<TSharedPtr<FJsonValue>> Failed;
+	// One rollback item per texture, carrying the three properties this action
+	// writes, as they stood before the first write to that texture. Keyed by
+	// path because a caller may list the same texture under two groups, and
+	// bulk_set_asset_properties rejects a duplicate assetPath.
+	TArray<TSharedPtr<FJsonValue>> RollbackItems;
+	TSet<FString> RollbackSeen;
 
 	for (const auto& Pair : (*GroupsObj)->Values)
 	{
@@ -3245,7 +3944,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetTextureSettingsByType(const TSharedPtr
 		{
 			FString TexPath;
 			if (!V->TryGetString(TexPath)) continue;
-			UTexture2D* Tex = LoadObject<UTexture2D>(nullptr, *TexPath);
+			UTexture2D* Tex = LoadAssetByPath<UTexture2D>(TexPath);
 			if (!Tex)
 			{
 				TSharedPtr<FJsonObject> F = MakeShared<FJsonObject>();
@@ -3254,6 +3953,24 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetTextureSettingsByType(const TSharedPtr
 				Failed.Add(MakeShared<FJsonValueObject>(F));
 				continue;
 			}
+			const FString TexObjectPath = Tex->GetPathName();
+			if (!RollbackSeen.Contains(TexObjectPath))
+			{
+				RollbackSeen.Add(TexObjectPath);
+				TSharedPtr<FJsonObject> Prev = MakeShared<FJsonObject>();
+				// UPROPERTY names, and the enumerator spellings the bulk
+				// property writer resolves by name.
+				Prev->SetStringField(TEXT("CompressionSettings"),
+					StaticEnum<TextureCompressionSettings>()->GetNameStringByValue((int64)Tex->CompressionSettings.GetValue()));
+				Prev->SetStringField(TEXT("LODGroup"),
+					StaticEnum<TextureGroup>()->GetNameStringByValue((int64)Tex->LODGroup.GetValue()));
+				Prev->SetBoolField(TEXT("SRGB"), Tex->SRGB != 0);
+				TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+				Item->SetStringField(TEXT("assetPath"), TexObjectPath);
+				Item->SetObjectField(TEXT("properties"), Prev);
+				RollbackItems.Add(MakeShared<FJsonValueObject>(Item));
+			}
+
 			Tex->Modify();
 			Tex->PreEditChange(nullptr);
 			Tex->CompressionSettings = Profile->Compression;
@@ -3269,12 +3986,48 @@ TSharedPtr<FJsonValue> FAssetHandlers::SetTextureSettingsByType(const TSharedPtr
 	}
 
 	auto Result = MCPSuccess();
+	// Not MCPSetUpdated: it writes a bool named "updated", which is the name
+	// this result already uses for the per-texture array.
+	Result->SetBoolField(TEXT("unchanged"), Updated.Num() == 0);
 	Result->SetArrayField(TEXT("updated"), Updated);
 	Result->SetNumberField(TEXT("updatedCount"), Updated.Num());
 	if (Failed.Num() > 0)
 	{
 		Result->SetArrayField(TEXT("failed"), Failed);
 		Result->SetNumberField(TEXT("failedCount"), Failed.Num());
+	}
+
+	// bulk_set_asset_properties rejects a batch over this size outright, so past
+	// it the inverse is a call that cannot execute. Kept in step with
+	// MaxBulkPropertyAssets in AssetHandlers_BulkProperties.cpp; that constant
+	// is file-local to its own translation unit and cannot be shared without
+	// moving it to a header, so the number is asserted here rather than copied
+	// silently.
+	const int32 MaxBulkRollbackItems = 500;
+	if (RollbackItems.Num() > 0 && RollbackItems.Num() <= MaxBulkRollbackItems)
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetArrayField(TEXT("items"), RollbackItems);
+		// Without this, bulk_set_asset_properties stops at the first item it
+		// cannot apply and restores nothing. A rollback should put back
+		// everything it still can and report the rest.
+		Payload->SetBoolField(TEXT("continueOnError"), true);
+		MCPSetRollback(Result, TEXT("bulk_set_asset_properties"), Payload);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+	}
+	else if (RollbackItems.Num() > MaxBulkRollbackItems)
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+			TEXT("This call wrote %d textures. The inverse is one bulk_set_asset_properties call and that action refuses a batch ")
+			TEXT("larger than %d, so emitting one here would hand the flow engine a rollback that cannot run. Split the call into ")
+			TEXT("batches of %d or fewer to get a working inverse for each."),
+			RollbackItems.Num(), MaxBulkRollbackItems, MaxBulkRollbackItems));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), TEXT("No texture was written, so there is nothing to undo."));
 	}
 	return MCPResult(Result);
 }
@@ -3478,11 +4231,9 @@ TSharedPtr<FJsonValue> FAssetHandlers::MigrateAssets(const TSharedPtr<FJsonObjec
 	TArray<TSharedPtr<FJsonValue>> Resolved;
 	for (const FString& Path : AssetPaths)
 	{
-		UObject* Asset = UEditorAssetLibrary::LoadAsset(Path);
-		if (!Asset)
-		{
-			return MCPError(FString::Printf(TEXT("Asset not found: %s"), *Path));
-		}
+		TSharedPtr<FJsonValue> LoadError;
+		UObject* Asset = MCPRequireAssetObject(Path, LoadError);
+		if (!Asset) return LoadError;
 		UPackage* Package = Asset->GetOutermost();
 		const FName PackageName(*Package->GetName());
 

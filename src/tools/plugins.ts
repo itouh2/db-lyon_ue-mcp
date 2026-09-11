@@ -1,12 +1,15 @@
 import { z } from "zod";
 import { categoryTool, type ToolDef, type PluginInfo } from "../types.js";
+import { actions as epicActions, schema as epicSchema } from "./epic/plugins.generated.js";
 
 export const pluginsTool: ToolDef = categoryTool(
   "plugins",
   "Introspect npm-distributed plugins that contribute actions into other categories. Read-only.",
   {
     list: {
-      description: "Every plugin loaded from ue-mcp.yml: name, version, prefix, status, and injected actions",
+      kind: "handler",
+      effect: "read",
+      description: "Every plugin loaded from ue-mcp.yml: name, version, prefix, status, and injected actions. Params: none",
       handler: async (ctx) => {
         const all = ctx.getPlugins?.() ?? [];
         return {
@@ -17,6 +20,8 @@ export const pluginsTool: ToolDef = categoryTool(
       },
     },
     describe: {
+      kind: "handler",
+      effect: "read",
       description: "Full detail for one plugin including knowledge files and flows. Params: name",
       handler: async (ctx, p) => {
         const target = p.name as string;
@@ -31,9 +36,11 @@ export const pluginsTool: ToolDef = categoryTool(
         return detail(found);
       },
     },
+    ...epicActions,
   },
   undefined,
   {
+    ...epicSchema,
     name: z.string().optional().describe("Plugin npm package name (describe action)"),
   },
 );
@@ -45,6 +52,7 @@ function summarise(p: PluginInfo): Record<string, unknown> {
     actionPrefix: p.actionPrefix,
     status: p.status,
     statusReason: p.statusReason,
+    degraded: p.degraded.length > 0 ? p.degraded : undefined,
     categories: Object.keys(p.injected),
     injectedActions: Object.values(p.injected).reduce((acc, arr) => acc + arr.length, 0),
     providedCategories: Object.keys(p.provided),
@@ -62,6 +70,7 @@ function detail(p: PluginInfo): Record<string, unknown> {
     actionPrefix: p.actionPrefix,
     status: p.status,
     statusReason: p.statusReason,
+    degraded: p.degraded,
     minServerVersion: p.minServerVersion,
     uePluginDependency: p.uePluginDependency,
     uePluginPresent: p.uePluginPresent,

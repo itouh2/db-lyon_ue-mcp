@@ -50,24 +50,6 @@ struct FPreparedUpsertItem
 	TArray<FPreparedProperty> Properties;
 };
 
-// [CCB-PATCH] upstream v1.2.0 は本ファイルと AssetHandlers.cpp の両方で、無名 namespace に
-// IsProtectedAssetPath(const FString&) を定義している。unity build では両ファイルが同一 TU へ
-// 結合されるため C2084 (関数は既に本体を持っています) になる。ここだけ改名して衝突を避ける。
-bool IsProtectedUpsertPath(const FString& Path)
-{
-	FString Normalized = Path;
-	Normalized.TrimStartAndEndInline();
-	if (!Normalized.StartsWith(TEXT("/")))
-	{
-		Normalized = TEXT("/") + Normalized;
-	}
-	const FString Lower = Normalized.ToLower();
-	return Lower.StartsWith(TEXT("/engine/"))
-		|| Lower.StartsWith(TEXT("/script/"))
-		|| Lower.StartsWith(TEXT("/memory/"))
-		|| Lower.StartsWith(TEXT("/temp/"));
-}
-
 UClass* ResolveDataAssetClass(const FString& ClassName)
 {
 	UClass* DataClass = nullptr;
@@ -147,7 +129,7 @@ bool ParseAssetIdentity(
 	}
 
 	const FString LongPackageName = OutItem.PackagePath + TEXT("/") + OutItem.Name;
-	if (IsProtectedUpsertPath(LongPackageName))
+	if (MCPIsProtectedAssetPath(LongPackageName))
 	{
 		OutError = FString::Printf(TEXT("Refusing to mutate protected package '%s'"), *LongPackageName);
 		return false;
@@ -360,7 +342,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRestoreDataAssets(const TSharedPtr<FJ
 			FString AssetPath;
 			const TSharedPtr<FJsonObject>* Properties = nullptr;
 			if (!(*Item)->TryGetStringField(TEXT("assetPath"), AssetPath)
-				|| IsProtectedUpsertPath(AssetPath)
+				|| MCPIsProtectedAssetPath(AssetPath)
 				|| !(*Item)->TryGetObjectField(TEXT("properties"), Properties)
 				|| !Properties
 				|| !Properties->IsValid())
@@ -369,7 +351,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRestoreDataAssets(const TSharedPtr<FJ
 				continue;
 			}
 
-			UObject* Asset = LoadObject<UObject>(nullptr, *AssetPath);
+			UObject* Asset = MCPLoadAssetObject(AssetPath);
 			if (!Asset)
 			{
 				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("Unable to load '%s' for rollback"), *AssetPath)));
@@ -417,7 +399,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkRestoreDataAssets(const TSharedPtr<FJ
 			FString AssetPath;
 			if (!(*CreatedAssetPaths)[PathIndex].IsValid()
 				|| !(*CreatedAssetPaths)[PathIndex]->TryGetString(AssetPath)
-				|| IsProtectedUpsertPath(AssetPath))
+				|| MCPIsProtectedAssetPath(AssetPath))
 			{
 				Errors.Add(MakeShared<FJsonValueString>(FString::Printf(TEXT("createdAssetPaths[%d] is invalid"), PathIndex)));
 				continue;
@@ -528,7 +510,7 @@ TSharedPtr<FJsonValue> FAssetHandlers::BulkUpsertDataAssets(const TSharedPtr<FJs
 				*Prepared.DataClass->GetPathName()));
 		}
 
-		Prepared.ExistingAsset = LoadObject<UObject>(nullptr, *Prepared.AssetPath);
+		Prepared.ExistingAsset = MCPLoadAssetObject(Prepared.AssetPath);
 		if (Prepared.ExistingAsset)
 		{
 			if (OnConflict == TEXT("error"))

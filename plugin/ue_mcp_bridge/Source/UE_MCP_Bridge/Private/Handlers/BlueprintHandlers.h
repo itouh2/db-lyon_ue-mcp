@@ -15,6 +15,17 @@ public:
 	// of "bool"/"int"/"Vector"/"Actor*"/etc. serves every authoring surface.
 	static struct FEdGraphPinType MakePinType(const FString& TypeStr);
 
+	// The container layer over MakePinType, and its inverse. ParsePinTypeSpec
+	// accepts everything MakePinType does plus "int[]", "array<int>",
+	// "set<Name>" and "map<Name,int>"; PinTypeSpec reports a pin type in
+	// exactly that vocabulary, so a read can be handed straight back as a
+	// write. Both live here rather than in a file-local helper because the
+	// user-type and depth handlers need the identical spelling, and the module
+	// is a unity build where a copied helper is a redefinition (C2084).
+	// Defined in BlueprintHandlers_UserTypes.cpp.
+	static bool ParsePinTypeSpec(const FString& TypeStr, struct FEdGraphPinType& OutType, FString& OutError);
+	static FString PinTypeSpec(const struct FEdGraphPinType& PinType, bool& bOutRoundTrips);
+
 private:
 	// Handler implementations
 	static TSharedPtr<FJsonValue> CreateBlueprint(const TSharedPtr<FJsonObject>& Params);
@@ -54,6 +65,10 @@ private:
 	static TSharedPtr<FJsonValue> DeleteVariable(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AddFunctionParameter(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetVariableDefault(const TSharedPtr<FJsonObject>& Params);
+	// #902: read the RESOLVED default off the generated class CDO, so a
+	// write-compile-readback loop can verify itself. Reports whether that value
+	// has reached the package as well as what it is (#931).
+	static TSharedPtr<FJsonValue> GetVariableDefault(const TSharedPtr<FJsonObject>& Params);
 
 	// v0.7.8 - agent-ergonomics additions (stubs)
 	static TSharedPtr<FJsonValue> ReadBlueprintGraphSummary(const TSharedPtr<FJsonObject>& Params);
@@ -83,6 +98,7 @@ private:
 	static TSharedPtr<FJsonValue> ReparentBlueprint(const TSharedPtr<FJsonObject>& Params);
 	// #580 flush orphaned InheritableComponentHandler override records
 	static TSharedPtr<FJsonValue> FlushInheritableComponentHandler(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> FlushComponentTemplates(const TSharedPtr<FJsonObject>& Params);
 
 	// issues #182/#183: C++ class CDO property access
 	static TSharedPtr<FJsonValue> SetCdoProperty(const TSharedPtr<FJsonObject>& Params);
@@ -97,9 +113,49 @@ private:
 	static TSharedPtr<FJsonValue> ConnectPinsBatch(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SetNodePosition(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> AutoLayoutGraph(const TSharedPtr<FJsonObject>& Params);
+	// #945: project-wide search for authored function call sites, narrowed by
+	// the Asset Registry before any package is loaded. Defined in
+	// BlueprintHandlers_Search.cpp.
+	static TSharedPtr<FJsonValue> SearchCallSites(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SearchNodes(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GetConnections(const TSharedPtr<FJsonObject>& Params);
+
 	// #419: SetCapsuleSize on CapsuleComponent BP templates (UFUNCTION setter
 	// path; raw property writes leave the visualizer stale)
 	static TSharedPtr<FJsonValue> SetCapsuleSize(const TSharedPtr<FJsonObject>& Params);
+
+	// V9 Blueprint depth. Defined in BlueprintHandlers_Depth.cpp. Each of these
+	// closes a hole the shipping source already documented, or authors graph
+	// state that no UPROPERTY write can reach; see that file's header comment
+	// for the audit that decided the list.
+	static TSharedPtr<FJsonValue> ListBlueprintInterfaces(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RemoveBlueprintInterface(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetFunctionProperties(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListGraphParameters(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> EditGraphParameters(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RenameBlueprintVariable(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GetBlueprintVariableMetadata(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetBlueprintVariableMetadata(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> EditLocalVariable(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ListEventDispatchers(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RemoveEventDispatcher(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> AddCustomEvent(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> CreateMacro(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> DeleteMacro(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> DeleteGraph(const TSharedPtr<FJsonObject>& Params);
+
+	// V14 user-type authoring. Defined in BlueprintHandlers_UserTypes.cpp.
+	// Creation and the coarse entry CRUD stay in the asset category; these are
+	// the parts of a UserDefinedEnum or UserDefinedStruct that only
+	// FEnumEditorUtils / FStructureEditorUtils can author, plus the whole-
+	// definition read-back.
+	static TSharedPtr<FJsonValue> ReadUserDefinedEnum(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReorderEnumValues(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetEnumMetadata(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReadUserDefinedStruct(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetStructFieldDefault(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ReorderStructFields(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> EditStructMetadata(const TSharedPtr<FJsonObject>& Params);
 
 	// Helper functions
 	static class UBlueprint* LoadBlueprint(const FString& AssetPath);

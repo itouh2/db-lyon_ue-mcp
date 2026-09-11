@@ -3,7 +3,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import yaml from "js-yaml";
-import { ProjectContext } from "../../src/project.js";
+import {
+  ProjectContext,
+  partitionUeMcpConfig,
+  ueMcpConfigRejections,
+  describeConfigRejections,
+} from "../../src/project.js";
 
 function makeTempProject(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ue-mcp-project-test-"));
@@ -131,17 +136,81 @@ describe("ProjectContext config loading", () => {
     }
   });
 
-  it("rejects a ue-mcp.yml with wrong types in the ue-mcp: block", () => {
+  /**
+   * D3: one malformed key is dropped, and every other key still applies.
+   *
+   * The whole-block safeParse this replaced was all-or-nothing, so `disable:
+   * gas` (a scalar where a list is required) took `bridge.port` down with it.
+   * The client then used the derived hash port, syncRequestedPort DELETED
+   * requested.json, and the editor plugin - which reads bridge.port out of the
+   * same yaml - bound the pinned one. Client and editor on different ports,
+   * from a typo, with the only signal a warn() on stderr.
+   */
+  it("keeps the keys that parse when one key in the ue-mcp: block does not", () => {
     const uproject = makeTempProject();
     const projectDir = path.dirname(uproject);
     fs.writeFileSync(
       path.join(projectDir, "ue-mcp.yml"),
-      yaml.dump({ "ue-mcp": { version: 1, disable: "gas" } }),
+      yaml.dump({ "ue-mcp": { bridge: { port: 49999 }, disable: "gas", contentRoots: ["/Game/"] } }),
     );
 
     const ctx = new ProjectContext();
     ctx.setProject(uproject);
-    expect(ctx.config).toEqual({});
+    expect(ctx.config.bridge?.port).toBe(49999);
+    expect(ctx.config.contentRoots).toEqual(["/Game/"]);
+    // The malformed key itself is gone, never coerced into a list.
+    expect(ctx.config.disable).toBeUndefined();
+
+    const rejected = ueMcpConfigRejections(projectDir);
+    expect(rejected.map((r) => r.key)).toEqual(["disable"]);
+    expect(describeConfigRejections(rejected)[0]).toContain("'disable'");
+    expect(describeConfigRejections(rejected)[0]).toContain("Every other key in the block still applies");
+  });
+
+  it("drops a malformed nested key without dropping its siblings", () => {
+    const uproject = makeTempProject();
+    const projectDir = path.dirname(uproject);
+    fs.writeFileSync(
+      path.join(projectDir, "ue-mcp.yml"),
+      // bridge.port out of range: the whole `bridge` key goes, because its own
+      // schema is what failed, and nothing inside it is trusted piecemeal.
+      yaml.dump({ "ue-mcp": { bridge: { port: 99999 }, disable: ["gas"] } }),
+    );
+
+    const ctx = new ProjectContext();
+    ctx.setProject(uproject);
+    expect(ctx.config.bridge).toBeUndefined();
+    expect(ctx.config.disable).toEqual(["gas"]);
+    expect(ueMcpConfigRejections(projectDir).map((r) => r.key)).toEqual(["bridge"]);
+  });
+
+  // The partition must not become a way to smuggle a value past the schema:
+  // every declared key is parsed against its OWN schema, so a bad value is
+  // dropped rather than coerced or passed through.
+  it("never lets a rejected value through in another shape", () => {
+    const { config, rejected } = partitionUeMcpConfig({
+      contentRoots: "/Game/",
+      disable: [1, 2],
+      locking: { enabled: "yes" },
+      nativeTools: { enabled: 1 },
+      context: { strategy: "enormous" },
+      http: { port: -1 },
+    });
+    expect(config.contentRoots).toBeUndefined();
+    expect(config.disable).toBeUndefined();
+    expect(config.locking).toBeUndefined();
+    expect(config.nativeTools).toBeUndefined();
+    expect(config.context).toBeUndefined();
+    expect(config.http).toBeUndefined();
+    expect(rejected.map((r) => r.key).sort()).toEqual(
+      ["contentRoots", "context", "disable", "http", "locking", "nativeTools"],
+    );
+  });
+
+  it("refuses a ue-mcp: block that is not a mapping at all", () => {
+    expect(partitionUeMcpConfig("nope").config).toEqual({});
+    expect(partitionUeMcpConfig(["a"]).rejected).toHaveLength(1);
+    expect(partitionUeMcpConfig(null).config).toEqual({});
   });
 
   it("migrates a pre-1.0.29 .ue-mcp.json into ue-mcp.yml + ~/.ue-mcp/state.json", () => {
@@ -289,7 +358,6 @@ describe("ProjectContext plugin discovery across a switch", () => {
   function makeProjectWithPlugin(pluginName: string): string {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ue-mcp-plugin-cache-"));
     const uproject = path.join(dir, "Test.uproject");
-    // No EngineAssociation: keeps discoverPlugins off any real engine install.
     fs.writeFileSync(uproject, JSON.stringify({ FileVersion: 3 }));
     const pluginDir = path.join(dir, "Plugins", pluginName);
     fs.mkdirSync(path.join(pluginDir, "Content"), { recursive: true });
@@ -297,13 +365,19 @@ describe("ProjectContext plugin discovery across a switch", () => {
     return uproject;
   }
 
+  // A project with no EngineAssociation still resolves to an engine now (the
+  // one beside it, the one it was last opened with, or the default install), so
+  // the discovered set can carry that engine's plugins as well. What matters
+  // here is that the project's own plugins move with the loaded project.
   it("rediscovers plugins after the loaded project changes", () => {
     const ctx = new ProjectContext();
     ctx.setProject(makeProjectWithPlugin("AlphaPlugin"));
-    expect(ctx.discoverPlugins().map((p) => p.name)).toEqual(["AlphaPlugin"]);
+    expect(ctx.discoverPlugins().map((p) => p.name)).toContain("AlphaPlugin");
 
     ctx.setProject(makeProjectWithPlugin("BetaPlugin"));
-    expect(ctx.discoverPlugins().map((p) => p.name)).toEqual(["BetaPlugin"]);
+    const names = ctx.discoverPlugins().map((p) => p.name);
+    expect(names).toContain("BetaPlugin");
+    expect(names).not.toContain("AlphaPlugin");
     // The stale cache used to keep resolving the previous project's mounts.
     expect(ctx.resolvePluginPath("/AlphaPlugin/Thing")).toBeNull();
     expect(ctx.resolvePluginPath("/BetaPlugin/Thing")).not.toBeNull();

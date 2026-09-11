@@ -1,6 +1,7 @@
 #include "AnimationHandlers.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+#include "HandlerPagination.h"
 #include "HandlerAssetCreate.h"
 #include "HandlerJsonProperty.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -20,6 +21,7 @@
 #include "PoseSearch/PoseSearchDerivedData.h"
 #include "Animation/AnimBlueprintGeneratedClass.h"
 #include "Animation/AnimNotifies/AnimNotify.h"
+#include "Animation/AnimNotifies/AnimNotifyState.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "Engine/SkeletalMeshSocket.h"
 // PhysicsEngine/SkeletalBodySetup.h is unavailable as a public include on
@@ -31,8 +33,12 @@
 #include "Factories/AnimBlueprintFactory.h"
 #include "Factories/AnimMontageFactory.h"
 #include "Factories/BlendSpaceFactoryNew.h"
+#include "Factories/SkeletonFactory.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/Package.h"
+// FArrayProperty / FScriptArrayHelper: the #880 readback of the montage's
+// private BranchingPointMarkers cache goes through its UPROPERTY.
+#include "UObject/UnrealType.h"
 #include "Misc/PackageName.h"
 #include "UObject/SavePackage.h"
 #include "Dom/JsonObject.h"
@@ -65,10 +71,20 @@
 // Curve identifiers for UE5 animation data controller
 #include "Animation/AnimCurveTypes.h"
 #include "Animation/Skeleton.h"
+#include "ReferenceSkeleton.h"
 
 void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 {
 	Registry.RegisterHandler(TEXT("list_anim_assets"), &ListAnimAssets);
+	Registry.RegisterHandler(TEXT("create_skeleton"), &CreateSkeleton);
+	Registry.RegisterHandler(TEXT("begin_skeleton_edit"), &BeginSkeletonEdit);
+	Registry.RegisterHandler(TEXT("edit_skeleton_bones"), &EditSkeletonBones);
+	Registry.RegisterHandler(TEXT("commit_skeleton_edit"), &CommitSkeletonEdit);
+	Registry.RegisterHandler(TEXT("cancel_skeleton_edit"), &CancelSkeletonEdit);
+	Registry.RegisterHandler(TEXT("set_bone_retargeting"), &SetBoneRetargeting);
+	Registry.RegisterHandler(TEXT("author_blend_profile"), &AuthorBlendProfile);
+	Registry.RegisterHandler(TEXT("edit_curve_metadata"), &EditCurveMetadata);
+	Registry.RegisterHandler(TEXT("register_compatible_skeleton"), &RegisterCompatibleSkeleton);
 	Registry.RegisterHandler(TEXT("list_skeletal_meshes"), &ListSkeletalMeshes);
 	Registry.RegisterHandler(TEXT("get_skeleton_info"), &GetSkeletonInfo);
 	Registry.RegisterHandler(TEXT("list_animation_sockets"), &ListSockets);
@@ -131,6 +147,7 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// IK Rig (#93)
 	Registry.RegisterHandler(TEXT("create_ik_rig"), &CreateIKRig);
 	Registry.RegisterHandler(TEXT("read_ik_rig"), &ReadIKRig);
+	Registry.RegisterHandler(TEXT("configure_ik_rig"), &ConfigureIKRig);
 	// #701/#703: IK authoring tail + batch retarget.
 	Registry.RegisterHandler(TEXT("set_ik_rig_mesh"), &SetIKRigMesh);
 	Registry.RegisterHandler(TEXT("set_ik_retargeter_rig"), &SetIKRetargeterRig);
@@ -142,6 +159,12 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("list_control_rig_variables"), &ListControlRigVariables);
 	Registry.RegisterHandler(TEXT("read_control_rig_graph"), &ReadControlRigGraph);
 	Registry.RegisterHandler(TEXT("read_control_rig_hierarchy"), &ReadControlRigHierarchy);
+	Registry.RegisterHandler(TEXT("begin_control_rig_edit"), &BeginControlRigEdit);
+	Registry.RegisterHandler(TEXT("read_control_rig_edit"), &ReadControlRigEdit);
+	Registry.RegisterHandler(TEXT("capture_control_rig_pose"), &CaptureControlRigPose);
+	Registry.RegisterHandler(TEXT("apply_control_rig_edits"), &ApplyControlRigEdits);
+	Registry.RegisterHandler(TEXT("bake_control_rig_edit"), &BakeControlRigEdit);
+	Registry.RegisterHandler(TEXT("analyze_animation"), &AnalyzeAnimation);
 
 	// v0.7.11 - depth
 	Registry.RegisterHandler(TEXT("set_root_motion_settings"), &SetRootMotionSettings);
@@ -153,6 +176,7 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	// v0.7.11 - issue fixes
 	Registry.RegisterHandler(TEXT("create_ik_retargeter"), &CreateIKRetargeter);
 	Registry.RegisterHandler(TEXT("read_ik_retargeter"), &ReadIKRetargeter);
+	Registry.RegisterHandler(TEXT("configure_ik_retargeter"), &ConfigureIKRetargeter);
 	Registry.RegisterHandler(TEXT("set_anim_blueprint_skeleton"), &SetAnimBlueprintSkeleton);
 	Registry.RegisterHandler(TEXT("read_bone_track"), &ReadBoneTrack);
 
@@ -190,6 +214,25 @@ void FAnimationHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("list_bones"), &ListBones);
 	Registry.RegisterHandler(TEXT("rebind_leader_pose"), &RebindLeaderPose);
 	Registry.RegisterHandler(TEXT("preview_animation"), &PreviewAnimation);
+	Registry.RegisterHandler(TEXT("set_live_post_process_anim_blueprint"), &SetLivePostProcessAnimBlueprint);
+
+	// #922/#923/#926 - evaluated pose reads (live component, and asset sampling)
+	Registry.RegisterHandler(TEXT("get_live_bone_transforms"), &GetLiveBoneTransforms);
+	Registry.RegisterHandler(TEXT("sample_pose"), &SamplePose);
+	Registry.RegisterHandler(TEXT("measure_natural_speed"), &MeasureNaturalSpeed);
+
+	// Authoring depth (AnimationHandlers_Depth.cpp): the entry wiring that made
+	// state machines run, the five removals whose adds documented their own
+	// missing inverse, windowed notifies, and sync markers.
+	Registry.RegisterHandler(TEXT("set_state_machine_entry"), &SetStateMachineEntry);
+	Registry.RegisterHandler(TEXT("remove_state"), &RemoveState);
+	Registry.RegisterHandler(TEXT("remove_transition"), &RemoveTransition);
+	Registry.RegisterHandler(TEXT("remove_state_machine"), &RemoveStateMachine);
+	Registry.RegisterHandler(TEXT("remove_montage_section"), &RemoveMontageSection);
+	Registry.RegisterHandler(TEXT("remove_anim_curve"), &RemoveAnimCurve);
+	Registry.RegisterHandler(TEXT("add_anim_notify_state"), &AddNotifyState);
+	Registry.RegisterHandler(TEXT("remove_anim_notify_state"), &RemoveNotifyState);
+	Registry.RegisterHandler(TEXT("set_sync_markers"), &SetSyncMarkers);
 }
 
 TSharedPtr<FJsonValue> FAnimationHandlers::ListAnimAssets(const TSharedPtr<FJsonObject>& Params)
@@ -197,6 +240,19 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ListAnimAssets(const TSharedPtr<FJson
 	auto Result = MCPSuccess();
 
 	bool bRecursive = OptionalBool(Params, TEXT("recursive"), true);
+	const FString Directory = OptionalString(Params, TEXT("directory"));
+
+	// T3: paged. Four class queries concatenated is the largest read on this
+	// category, and it had no cap at all: a project with a few thousand
+	// sequences answered every one of them in a single response.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("list_anim_assets|directory=%s|recursive=%d"), *Directory, bRecursive ? 1 : 0),
+			/*DefaultLimit*/ 200, /*MaxLimit*/ 5000, Page))
+	{
+		return Err;
+	}
 
 	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
 
@@ -207,7 +263,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ListAnimAssets(const TSharedPtr<FJson
 	ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine"), TEXT("AnimBlueprint")));
 	ClassPaths.Add(FTopLevelAssetPath(TEXT("/Script/Engine"), TEXT("BlendSpace")));
 
-	TArray<TSharedPtr<FJsonValue>> AssetsArray;
+	TArray<MCPPagination::FPageRow> Rows;
 
 	for (const FTopLevelAssetPath& ClassPath : ClassPaths)
 	{
@@ -216,17 +272,32 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ListAnimAssets(const TSharedPtr<FJson
 
 		for (const FAssetData& AssetData : AssetDataList)
 		{
+			const FString ObjectPath = AssetData.GetObjectPathString();
+			// `directory` has been advertised on this action all along and was
+			// never read, so a caller scoping to one folder got the whole
+			// project back and no sign that the scope had been dropped.
+			if (!Directory.IsEmpty() && !ObjectPath.StartsWith(Directory)) continue;
+
 			TSharedPtr<FJsonObject> AssetObj = MakeShared<FJsonObject>();
 			AssetObj->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
-			AssetObj->SetStringField(TEXT("path"), AssetData.GetObjectPathString());
+			AssetObj->SetStringField(TEXT("path"), ObjectPath);
 			AssetObj->SetStringField(TEXT("class"), AssetData.AssetClassPath.GetAssetName().ToString());
 			AssetObj->SetStringField(TEXT("packagePath"), AssetData.PackagePath.ToString());
-			AssetsArray.Add(MakeShared<FJsonValueObject>(AssetObj));
+			// The object path is the anchor: unique across the project, and the
+			// one string that names this asset on a second enumeration.
+			Rows.Add({ ObjectPath, MakeShared<FJsonValueObject>(AssetObj) });
 		}
 	}
 
-	Result->SetArrayField(TEXT("assets"), AssetsArray);
-	Result->SetNumberField(TEXT("count"), AssetsArray.Num());
+	// Four separate registry queries concatenated, none of which promises an
+	// order, so the whole set is sorted before paging. Without it the same page
+	// can come back in a different order between two calls and the anchor would
+	// report a change that is only the registry reshuffling.
+	Rows.Sort([](const MCPPagination::FPageRow& A, const MCPPagination::FPageRow& B)
+		{ return A.Id < B.Id; });
+
+	if (!Directory.IsEmpty()) Result->SetStringField(TEXT("directory"), Directory);
+	MCPPagination::EmitPage(Page, Rows, TEXT("assets"), Result);
 
 	return MCPResult(Result);
 }
@@ -236,24 +307,51 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ListSkeletalMeshes(const TSharedPtr<F
 	auto Result = MCPSuccess();
 
 	bool bRecursive = OptionalBool(Params, TEXT("recursive"), true);
+	const FString Directory = OptionalString(Params, TEXT("directory"));
+
+	// T3: paged. This is the action every animation workflow starts with, so
+	// the uncapped list was answered on a project with a full character library
+	// as one response holding every mesh in it.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("list_skeletal_meshes|directory=%s|recursive=%d"), *Directory, bRecursive ? 1 : 0),
+			/*DefaultLimit*/ 200, /*MaxLimit*/ 5000, Page))
+	{
+		return Err;
+	}
 
 	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
 
 	TArray<FAssetData> AssetDataList;
 	AssetRegistry.GetAssetsByClass(FTopLevelAssetPath(TEXT("/Script/Engine"), TEXT("SkeletalMesh")), AssetDataList, bRecursive);
 
-	TArray<TSharedPtr<FJsonValue>> AssetsArray;
+	TArray<MCPPagination::FPageRow> Rows;
 	for (const FAssetData& AssetData : AssetDataList)
 	{
+		const FString ObjectPath = AssetData.GetObjectPathString();
+		// `directory` has been advertised on this action all along and was
+		// never read, so a caller scoping to one folder got the whole project
+		// back and no sign that the scope had been dropped.
+		if (!Directory.IsEmpty() && !ObjectPath.StartsWith(Directory)) continue;
+
 		TSharedPtr<FJsonObject> AssetObj = MakeShared<FJsonObject>();
 		AssetObj->SetStringField(TEXT("name"), AssetData.AssetName.ToString());
-		AssetObj->SetStringField(TEXT("path"), AssetData.GetObjectPathString());
+		AssetObj->SetStringField(TEXT("path"), ObjectPath);
 		AssetObj->SetStringField(TEXT("packagePath"), AssetData.PackagePath.ToString());
-		AssetsArray.Add(MakeShared<FJsonValueObject>(AssetObj));
+		// The object path is the anchor: unique, and the same string on a
+		// second enumeration.
+		Rows.Add({ ObjectPath, MakeShared<FJsonValueObject>(AssetObj) });
 	}
 
-	Result->SetArrayField(TEXT("assets"), AssetsArray);
-	Result->SetNumberField(TEXT("count"), AssetsArray.Num());
+	// The asset registry does not promise an enumeration order, so the rows are
+	// sorted before paging. A cursor over an unordered enumeration is not
+	// resumable: its anchor would land somewhere different every call.
+	Rows.Sort([](const MCPPagination::FPageRow& A, const MCPPagination::FPageRow& B)
+		{ return A.Id < B.Id; });
+
+	if (!Directory.IsEmpty()) Result->SetStringField(TEXT("directory"), Directory);
+	MCPPagination::EmitPage(Page, Rows, TEXT("assets"), Result);
 
 	return MCPResult(Result);
 }
@@ -293,6 +391,227 @@ TSharedPtr<FJsonValue> FAnimationHandlers::GetSkeletonInfo(const TSharedPtr<FJso
 	Result->SetArrayField(TEXT("bones"), BonesArray);
 	Result->SetNumberField(TEXT("boneCount"), BonesArray.Num());
 
+	return MCPResult(Result);
+}
+
+namespace
+{
+// Factory idempotency must be stronger than USkeleton::IsCompatibleMesh. That
+// API accepts compatible/additive skeletons, whereas replaying this create
+// action is safe only when the factory output is exactly the mesh hierarchy.
+bool HasExactReferenceSkeletonHierarchy(const USkeleton* Skeleton, const USkeletalMesh* SkeletalMesh)
+{
+	if (!Skeleton || !SkeletalMesh) return false;
+
+	const FReferenceSkeleton& SkeletonReference = Skeleton->GetReferenceSkeleton();
+	const FReferenceSkeleton& MeshReference = SkeletalMesh->GetRefSkeleton();
+	if (SkeletonReference.GetNum() != MeshReference.GetNum()) return false;
+
+	for (int32 BoneIndex = 0; BoneIndex < SkeletonReference.GetNum(); ++BoneIndex)
+	{
+		if (SkeletonReference.GetBoneName(BoneIndex) != MeshReference.GetBoneName(BoneIndex)
+			|| SkeletonReference.GetParentIndex(BoneIndex) != MeshReference.GetParentIndex(BoneIndex))
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+}
+
+// create_skeleton - create an initialized USkeleton from a SkeletalMesh.
+// USkeletonFactory is the engine's Create Skeleton asset implementation. Its
+// factory path deliberately assigns the new skeleton to its target mesh, so
+// this handler saves and reads back both assets rather than pretending this is
+// an isolated create.
+TSharedPtr<FJsonValue> FAnimationHandlers::CreateSkeleton(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Name;
+	if (auto Err = RequireString(Params, TEXT("name"), Name)) return Err;
+	Name.TrimStartAndEndInline();
+	FText InvalidNameReason;
+	const FName AssetName(*Name);
+	if (AssetName.IsNone() || !AssetName.IsValidObjectName(InvalidNameReason))
+	{
+		return MCPError(FString::Printf(TEXT("Invalid skeleton name '%s': %s"), *Name, *InvalidNameReason.ToString()));
+	}
+
+	FString SkeletalMeshPath;
+	if (auto Err = RequireString(Params, TEXT("skeletalMeshPath"), SkeletalMeshPath)) return Err;
+	USkeletalMesh* SkeletalMesh = LoadObject<USkeletalMesh>(nullptr, *SkeletalMeshPath);
+	if (!SkeletalMesh)
+	{
+		return MCPError(FString::Printf(TEXT("Failed to load SkeletalMesh at '%s'"), *SkeletalMeshPath));
+	}
+
+	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game"));
+	PackagePath.TrimStartAndEndInline();
+	while (PackagePath.EndsWith(TEXT("/"))) PackagePath.LeftChopInline(1);
+	FText InvalidPackageReason;
+	if (!FPackageName::IsValidLongPackageName(PackagePath, true, &InvalidPackageReason))
+	{
+		return MCPError(FString::Printf(TEXT("Invalid packagePath '%s': %s"), *PackagePath, *InvalidPackageReason.ToString()));
+	}
+	if (MCPIsProtectedAssetPath(PackagePath)) return MCPProtectedPathError(PackagePath);
+	if (!FPackageName::IsValidLongPackageName(PackagePath + TEXT("/") + Name, true, &InvalidPackageReason))
+	{
+		return MCPError(FString::Printf(TEXT("Invalid skeleton destination '%s/%s': %s"), *PackagePath, *Name, *InvalidPackageReason.ToString()));
+	}
+
+	FString OnConflict = OptionalString(Params, TEXT("onConflict"), TEXT("skip"));
+	OnConflict.ToLowerInline();
+	if (OnConflict != TEXT("skip") && OnConflict != TEXT("error"))
+	{
+		return MCPError(TEXT("onConflict must be 'skip' or 'error'"));
+	}
+
+	const FString DestinationPath = PackagePath + TEXT("/") + Name + TEXT(".") + Name;
+	if (UObject* ExistingObject = LoadObject<UObject>(nullptr, *DestinationPath))
+	{
+		USkeleton* ExistingSkeleton = Cast<USkeleton>(ExistingObject);
+		if (!ExistingSkeleton)
+		{
+			return MCPError(FString::Printf(TEXT("Skeleton destination '%s' is occupied by %s"), *DestinationPath, *ExistingObject->GetClass()->GetName()));
+		}
+		if (OnConflict == TEXT("error"))
+		{
+			return MCPError(FString::Printf(TEXT("Skeleton '%s' already exists"), *DestinationPath));
+		}
+
+		const bool bMeshAlreadyAssigned = SkeletalMesh->GetSkeleton() == ExistingSkeleton;
+		const bool bExactReferenceHierarchy = HasExactReferenceSkeletonHierarchy(ExistingSkeleton, SkeletalMesh);
+		if (!bMeshAlreadyAssigned || !bExactReferenceHierarchy)
+		{
+			return MCPError(FString::Printf(
+				TEXT("Skeleton destination '%s' already exists but is not an idempotent result for mesh '%s' (meshAlreadyAssigned=%s, exactReferenceHierarchy=%s). Choose another destination or resolve the existing asset deliberately."),
+				*DestinationPath,
+				*SkeletalMesh->GetPathName(),
+				bMeshAlreadyAssigned ? TEXT("true") : TEXT("false"),
+				bExactReferenceHierarchy ? TEXT("true") : TEXT("false")));
+		}
+
+		auto Result = MCPSuccess();
+		MCPSetExisted(Result);
+		Result->SetStringField(TEXT("path"), ExistingSkeleton->GetPathName());
+		Result->SetStringField(TEXT("sourceSkeletalMeshPath"), SkeletalMesh->GetPathName());
+		Result->SetBoolField(TEXT("meshAssigned"), true);
+		Result->SetBoolField(TEXT("exactReferenceHierarchy"), true);
+		Result->SetNumberField(TEXT("boneCount"), ExistingSkeleton->GetReferenceSkeleton().GetNum());
+		return MCPResult(Result);
+	}
+
+	if (auto Blocked = MCPAssetWriteBlockedError(SkeletalMesh, SkeletalMesh->GetPathName(), TEXT("create a skeleton from this skeletal mesh"))) return Blocked;
+
+	// USkeletonFactory can mutate TargetSkeletalMesh before CreateAsset reports
+	// an error, so capture this before constructing or invoking the factory.
+	USkeleton* PreviousSkeleton = SkeletalMesh->GetSkeleton();
+	auto RestoreMeshAndDeleteCreatedSkeleton = [&](USkeleton* CreatedSkeleton, const FString& FailureMessage) -> TSharedPtr<FJsonValue>
+	{
+		SkeletalMesh->SetSkeleton(PreviousSkeleton);
+		SkeletalMesh->MarkPackageDirty();
+
+		FString RestoreError;
+		const bool bSourceRestored = SaveAssetPackageChecked(SkeletalMesh, RestoreError);
+		const bool bSkeletonCleanupAttempted = bSourceRestored && CreatedSkeleton != nullptr;
+		const bool bSkeletonDeleted = bSkeletonCleanupAttempted
+			&& UEditorAssetLibrary::DeleteAsset(CreatedSkeleton->GetPathName());
+
+		if (bSourceRestored && (!CreatedSkeleton || bSkeletonDeleted))
+		{
+			return MCPError(FString::Printf(
+				TEXT("%s The source SkeletalMesh was restored and saved%s."),
+				*FailureMessage,
+				CreatedSkeleton ? TEXT("; the newly created Skeleton was deleted") : TEXT("")));
+		}
+
+		// A failed restore means the created skeleton might still be referenced by
+		// the mesh, so never delete it speculatively. Expose enough state for a
+		// caller to recover deterministically instead.
+		auto Error = MakeShared<FJsonObject>();
+		Error->SetBoolField(TEXT("success"), false);
+		Error->SetStringField(TEXT("error"), FailureMessage);
+		auto Recovery = MakeShared<FJsonObject>();
+		Recovery->SetStringField(TEXT("sourceSkeletalMeshPath"), SkeletalMesh->GetPathName());
+		if (PreviousSkeleton) Recovery->SetStringField(TEXT("previousSkeletonPath"), PreviousSkeleton->GetPathName());
+		else Recovery->SetField(TEXT("previousSkeletonPath"), MakeShared<FJsonValueNull>());
+		if (CreatedSkeleton) Recovery->SetStringField(TEXT("createdSkeletonPath"), CreatedSkeleton->GetPathName());
+		else Recovery->SetField(TEXT("createdSkeletonPath"), MakeShared<FJsonValueNull>());
+		Recovery->SetBoolField(TEXT("sourceSkeletalMeshRestored"), bSourceRestored);
+		Recovery->SetStringField(TEXT("sourceSkeletalMeshRestoreError"), RestoreError);
+		Recovery->SetBoolField(TEXT("skeletonCleanupAttempted"), bSkeletonCleanupAttempted);
+		Recovery->SetBoolField(TEXT("skeletonDeleted"), bSkeletonDeleted);
+		Recovery->SetStringField(TEXT("restoreMethod"), TEXT("set_asset_property"));
+		Recovery->SetBoolField(TEXT("requiresManualRecovery"), true);
+		Error->SetObjectField(TEXT("recovery"), Recovery);
+		return MCPResult(Error);
+	};
+
+	USkeletonFactory* Factory = NewObject<USkeletonFactory>(GetTransientPackage());
+	if (!Factory) return MCPError(TEXT("Failed to create USkeletonFactory"));
+	Factory->TargetSkeletalMesh = SkeletalMesh;
+
+	auto Created = MCPCreateAssetIdempotent<USkeleton>(Name, PackagePath, OnConflict, TEXT("USkeleton"), Factory);
+	if (Created.EarlyReturn)
+	{
+		const TSharedPtr<FJsonObject> EarlyResult = Created.EarlyReturn->Type == EJson::Object
+			? Created.EarlyReturn->AsObject()
+			: nullptr;
+		if (EarlyResult.IsValid() && EarlyResult->HasTypedField<EJson::Boolean>(TEXT("success"))
+			&& EarlyResult->GetBoolField(TEXT("success")))
+		{
+			// A late idempotency probe can still race the first probe. AssetTools
+			// was not invoked in this branch, so it cannot have changed the mesh.
+			return Created.EarlyReturn;
+		}
+
+		// FactoryCreateNew may have cleared/changed the target mesh even if the
+		// asset-tools wrapper reports a failure. The recovery helper restores the
+		// mesh before it attempts to clean up a partial destination asset.
+		USkeleton* PartialSkeleton = LoadObject<USkeleton>(nullptr, *DestinationPath);
+		return RestoreMeshAndDeleteCreatedSkeleton(PartialSkeleton, TEXT("USkeletonFactory failed to create the Skeleton"));
+	}
+	USkeleton* Skeleton = Created.Asset;
+	if (SkeletalMesh->GetSkeleton() != Skeleton)
+	{
+		return RestoreMeshAndDeleteCreatedSkeleton(Skeleton, TEXT("USkeletonFactory created a skeleton but did not assign it to the source SkeletalMesh"));
+	}
+
+	FString SaveError;
+	if (!SaveAssetPackageChecked(Skeleton, SaveError))
+	{
+		return RestoreMeshAndDeleteCreatedSkeleton(Skeleton,
+			FString::Printf(TEXT("Created skeleton '%s' but could not save it: %s."), *Skeleton->GetPathName(), *SaveError));
+	}
+	if (!SaveAssetPackageChecked(SkeletalMesh, SaveError))
+	{
+		return RestoreMeshAndDeleteCreatedSkeleton(Skeleton,
+			FString::Printf(TEXT("Created skeleton '%s' but could not save source SkeletalMesh '%s': %s."),
+				*Skeleton->GetPathName(), *SkeletalMesh->GetPathName(), *SaveError));
+	}
+
+	auto Result = MCPSuccess();
+	MCPSetCreated(Result);
+	Result->SetStringField(TEXT("path"), Skeleton->GetPathName());
+	Result->SetStringField(TEXT("sourceSkeletalMeshPath"), SkeletalMesh->GetPathName());
+	if (PreviousSkeleton) Result->SetStringField(TEXT("previousSkeletonPath"), PreviousSkeleton->GetPathName());
+	else Result->SetField(TEXT("previousSkeletonPath"), MakeShared<FJsonValueNull>());
+	Result->SetBoolField(TEXT("meshAssigned"), SkeletalMesh->GetSkeleton() == Skeleton);
+	Result->SetBoolField(TEXT("exactReferenceHierarchy"), HasExactReferenceSkeletonHierarchy(Skeleton, SkeletalMesh));
+	Result->SetNumberField(TEXT("boneCount"), Skeleton->GetReferenceSkeleton().GetNum());
+	Result->SetNumberField(TEXT("sourceMeshBoneCount"), SkeletalMesh->GetRefSkeleton().GetNum());
+	Result->SetBoolField(TEXT("skeletonSaved"), true);
+	Result->SetBoolField(TEXT("sourceSkeletalMeshSaved"), true);
+
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), SkeletalMesh->GetPathName());
+	Rollback->SetStringField(TEXT("propertyName"), TEXT("Skeleton"));
+	if (PreviousSkeleton) Rollback->SetStringField(TEXT("value"), PreviousSkeleton->GetPathName());
+	else Rollback->SetField(TEXT("value"), MakeShared<FJsonValueNull>());
+	Rollback->SetBoolField(TEXT("save"), true);
+	MCPSetRollback(Result, TEXT("set_asset_property"), Rollback);
+	Result->SetBoolField(TEXT("rollbackLossy"), true);
+	Result->SetStringField(TEXT("rollbackNote"), TEXT("The rollback restores the source mesh's previous Skeleton reference but intentionally does not delete the newly created Skeleton. Delete that asset only after confirming no other asset references it."));
 	return MCPResult(Result);
 }
 
@@ -1124,11 +1443,52 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 		}
 	}
 
+	// #880: a notify only becomes a branching point when its event says so.
+	// FAnimNotifyEvent::MontageTickType defaults to Queued, and
+	// UAnimMontage::RefreshBranchingPointMarkers only records the events whose
+	// tick type is BranchingPoint - so a PlayMontageNotify added with the
+	// default left BranchingPointMarkers empty and
+	// UAnimNotify_PlayMontageNotify::BranchingPointNotify, the only thing that
+	// broadcasts OnPlayMontageNotifyBegin, was never reached. #528 set the name
+	// the delegate carries; this sets the tick type that gets it called.
+	//
+	// Montage notifies whose class is one of the PlayMontageNotify pair default
+	// to BranchingPoint because that is the only tick type at which they do
+	// anything. Everything else keeps the engine's Queued default, which is the
+	// cheaper tick. `branchingPoint` overrides either way.
+	const bool bIsMontage = AnimAsset->IsA<UAnimMontage>();
+	bool bWantBranchingPoint = false;
+	if (bIsMontage && NewNotify)
+	{
+		for (const UClass* NotifyClass = NewNotify->GetClass(); NotifyClass; NotifyClass = NotifyClass->GetSuperClass())
+		{
+			const FString ClassName = NotifyClass->GetName();
+			if (ClassName == TEXT("AnimNotify_PlayMontageNotify") ||
+				ClassName == TEXT("AnimNotify_PlayMontageNotifyWindow"))
+			{
+				bWantBranchingPoint = true;
+				break;
+			}
+		}
+	}
+	bool bExplicitBranchingPoint = false;
+	if (Params->TryGetBoolField(TEXT("branchingPoint"), bExplicitBranchingPoint))
+	{
+		bWantBranchingPoint = bExplicitBranchingPoint;
+	}
+	if (bWantBranchingPoint)
+	{
+		NewEvent.MontageTickType = EMontageNotifyTickType::BranchingPoint;
+	}
+
 	AnimAsset->SortNotifies();
 
-	// #528: PostEditChange + save rebuilds the montage's branching-point markers
-	// from the notifies (RefreshBranchingPointMarkers itself is private), so the
-	// notify fires as a branching point with the name just written.
+	// RefreshBranchingPointMarkers itself is private; RefreshCacheData is the
+	// public entry that calls it, and it also rebuilds the notify tracks and
+	// sync markers the editor caches. PostEditChange alone dispatches a
+	// property-changed event with no property attached, which is not the path
+	// that rebuilds the cache.
+	AnimAsset->RefreshCacheData();
 	AnimAsset->PostEditChange();
 	AnimAsset->MarkPackageDirty();
 
@@ -1143,6 +1503,26 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddAnimNotify(const TSharedPtr<FJsonO
 	if (NewNotify)
 	{
 		Result->SetStringField(TEXT("notifyClass"), NewNotify->GetClass()->GetName());
+	}
+	if (bIsMontage)
+	{
+		// #880 read back what the refresh produced rather than asserting it
+		// happened. BranchingPointMarkers is private, so this goes through the
+		// UPROPERTY, which is what the runtime reads too.
+		Result->SetBoolField(TEXT("branchingPoint"), bWantBranchingPoint);
+		int32 MarkerCount = INDEX_NONE;
+		if (const FArrayProperty* MarkersProperty =
+			CastField<FArrayProperty>(AnimAsset->GetClass()->FindPropertyByName(TEXT("BranchingPointMarkers"))))
+		{
+			FScriptArrayHelper Helper(MarkersProperty, MarkersProperty->ContainerPtrToValuePtr<void>(AnimAsset));
+			MarkerCount = Helper.Num();
+		}
+		Result->SetNumberField(TEXT("branchingPointMarkerCount"), MarkerCount);
+		if (bWantBranchingPoint && MarkerCount == 0)
+		{
+			Result->SetStringField(TEXT("branchingPointWarning"),
+				TEXT("The notify was added as a branching point but the montage's BranchingPointMarkers cache is empty, so OnPlayMontageNotifyBegin will not broadcast until the montage is reloaded."));
+		}
 	}
 	// #471: paired remove handler now exists.
 	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
@@ -1189,6 +1569,21 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveAnimNotify(const TSharedPtr<FJs
 
 	const FName NotifyFName(*NotifyName);
 	TArray<TSharedPtr<FJsonValue>> RemovedTimes;
+	// Everything the paired add action needs to put one of these back, recorded
+	// as it is removed. The filter keys on the notify NAME, and Notifies holds
+	// notify STATES as well as instant notifies, so the two kinds are recorded
+	// apart: a state carries its own class and a duration and comes back through
+	// add_anim_notify_state, while add_anim_notify would replace it with a
+	// zero-length plain notify.
+	TArray<TSharedPtr<FJsonValue>> RemovedNotifies;
+	int32 RemovedStateCount = 0;
+	bool bFirstIsState = false;
+	bool bFirstBranchingPoint = false;
+	FString FirstName;
+	FString FirstNotifyClass;
+	FString FirstStateClass;
+	double FirstTime = 0.0;
+	double FirstDuration = 0.0;
 	for (int32 i = AnimAsset->Notifies.Num() - 1; i >= 0; --i)
 	{
 		const FAnimNotifyEvent& E = AnimAsset->Notifies[i];
@@ -1198,6 +1593,44 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveAnimNotify(const TSharedPtr<FJs
 		if (bNameMatches && bClassMatches)
 		{
 			RemovedTimes.Add(MakeShared<FJsonValueNumber>(E.GetTime()));
+
+			const bool bIsState = E.NotifyStateClass != nullptr;
+			const bool bIsBranchingPoint = E.MontageTickType == EMontageNotifyTickType::BranchingPoint;
+			if (bIsState) ++RemovedStateCount;
+
+			TSharedPtr<FJsonObject> Removed = MakeShared<FJsonObject>();
+			Removed->SetStringField(TEXT("kind"), bIsState ? TEXT("notifyState") : TEXT("notify"));
+			Removed->SetStringField(TEXT("notifyName"), E.NotifyName.ToString());
+			Removed->SetNumberField(TEXT("triggerTime"), E.GetTime());
+			if (bIsState)
+			{
+				Removed->SetStringField(TEXT("notifyStateClass"), E.NotifyStateClass->GetClass()->GetName());
+				Removed->SetNumberField(TEXT("duration"), E.GetDuration());
+			}
+			else if (E.Notify)
+			{
+				Removed->SetStringField(TEXT("notifyClass"), E.Notify->GetClass()->GetName());
+			}
+			Removed->SetBoolField(TEXT("branchingPoint"), bIsBranchingPoint);
+
+			if (RemovedNotifies.Num() == 0)
+			{
+				bFirstIsState = bIsState;
+				bFirstBranchingPoint = bIsBranchingPoint;
+				FirstName = E.NotifyName.ToString();
+				FirstTime = E.GetTime();
+				if (bIsState)
+				{
+					FirstStateClass = E.NotifyStateClass->GetClass()->GetName();
+					FirstDuration = E.GetDuration();
+				}
+				else if (E.Notify)
+				{
+					FirstNotifyClass = E.Notify->GetClass()->GetName();
+				}
+			}
+			RemovedNotifies.Add(MakeShared<FJsonValueObject>(Removed));
+
 			AnimAsset->Notifies.RemoveAt(i);
 		}
 	}
@@ -1224,6 +1657,49 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveAnimNotify(const TSharedPtr<FJs
 	Result->SetStringField(TEXT("notifyClass"), NotifyClassName);
 	Result->SetNumberField(TEXT("removedCount"), RemovedTimes.Num());
 	Result->SetArrayField(TEXT("removedTimes"), RemovedTimes);
+	Result->SetArrayField(TEXT("removedNotifies"), RemovedNotifies);
+	Result->SetNumberField(TEXT("removedNotifyStateCount"), RemovedStateCount);
+
+	// Each add action puts back ONE entry, so the rollback replays the first
+	// removed one and removedNotifies carries the rest, each tagged with the kind
+	// that says which add action it needs. The kind decides the method here too:
+	// replaying a removed notify STATE through add_anim_notify would swap a
+	// windowed state for an instantaneous notify.
+	if (bFirstIsState && FirstDuration <= 0.0)
+	{
+		// add_anim_notify_state refuses a duration of zero or less, so naming it
+		// would hand the flow engine a step that errors.
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The first removed entry is a notify state whose duration is not greater than zero, which add_anim_notify_state refuses, so no inverse call can be named for it. ")
+			TEXT("removedNotifies lists every removed entry with its kind, class and duration."));
+	}
+	else
+	{
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+		Rollback->SetStringField(TEXT("notifyName"), FirstName);
+		Rollback->SetNumberField(TEXT("triggerTime"), FirstTime);
+		Rollback->SetBoolField(TEXT("branchingPoint"), bFirstBranchingPoint);
+		if (bFirstIsState)
+		{
+			Rollback->SetStringField(TEXT("notifyStateClass"), FirstStateClass);
+			Rollback->SetNumberField(TEXT("duration"), FirstDuration);
+			MCPSetRollback(Result, TEXT("add_anim_notify_state"), Rollback);
+		}
+		else
+		{
+			if (!FirstNotifyClass.IsEmpty()) Rollback->SetStringField(TEXT("notifyClass"), FirstNotifyClass);
+			MCPSetRollback(Result, TEXT("add_anim_notify"), Rollback);
+		}
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+			TEXT("The add action re-creates the entry of the same class at the same time (and, for a notify state, over the same duration) with DEFAULT property values, ")
+			TEXT("so anything configured on the notify or notify-state object itself is not restored. ")
+			TEXT("This call removed %d entr(ies), %d of them notify states, and the rollback replays only the first. ")
+			TEXT("The rest are listed in removedNotifies, each with a 'kind' saying which action puts it back: animation(add_anim_notify) for 'notify', animation(add_anim_notify_state) for 'notifyState'."),
+			RemovedTimes.Num(), RemovedStateCount));
+	}
 	return MCPResult(Result);
 }
 
@@ -1342,6 +1818,78 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateBlendspace1D(const TSharedPtr<F
 // Params: assetPath, axis (object: { name?, min?, max?, gridNum? }) OR
 //         axisHorizontal/axisVertical with min/max/gridNum (2D-only),
 //         samples: [{ animationPath, x, y? }], clearExisting? (default true).
+// The blendspace's sample list as it stands, in the shape populate_blendspace
+// accepts for `samples`. A sample write is reversible because populate_blendspace
+// clears and rebuilds the list, so the inverse is that action replaying what was
+// captured here.
+static TArray<TSharedPtr<FJsonValue>> CaptureBlendSpaceSamples(const UBlendSpace* BS, int32& OutDroppedSampleCount)
+{
+	OutDroppedSampleCount = 0;
+	TArray<TSharedPtr<FJsonValue>> Samples;
+	for (const FBlendSample& S : BS->GetBlendSamples())
+	{
+		// A sample with no animation cannot be described to populate_blendspace,
+		// which needs an animationPath, so it is counted rather than silently lost.
+		if (!S.Animation) { ++OutDroppedSampleCount; continue; }
+		TSharedPtr<FJsonObject> Sample = MakeShared<FJsonObject>();
+		Sample->SetStringField(TEXT("animationPath"), S.Animation->GetPathName());
+		Sample->SetNumberField(TEXT("x"), S.SampleValue.X);
+		Sample->SetNumberField(TEXT("y"), S.SampleValue.Y);
+		Samples.Add(MakeShared<FJsonValueObject>(Sample));
+	}
+	return Samples;
+}
+
+// The blendspace's axis parameters, in the shape populate_blendspace accepts for
+// `axes`. A 1D blendspace only has axis 0, and its GetBlendParameter(1) is a stub
+// the replay must not write through, so the array is sized to the asset.
+static TArray<TSharedPtr<FJsonValue>> CaptureBlendSpaceAxes(const UBlendSpace* BS)
+{
+	TArray<TSharedPtr<FJsonValue>> Axes;
+	const int32 AxisCount = BS->IsA<UBlendSpace1D>() ? 1 : 2;
+	for (int32 i = 0; i < AxisCount; ++i)
+	{
+		const FBlendParameter& BP = BS->GetBlendParameter(i);
+		TSharedPtr<FJsonObject> Axis = MakeShared<FJsonObject>();
+		Axis->SetStringField(TEXT("name"), BP.DisplayName);
+		Axis->SetNumberField(TEXT("min"), BP.Min);
+		Axis->SetNumberField(TEXT("max"), BP.Max);
+		Axis->SetNumberField(TEXT("gridNum"), BP.GridNum);
+		Axes.Add(MakeShared<FJsonValueObject>(Axis));
+	}
+	return Axes;
+}
+
+// The rollback every blendspace sample write shares: populate_blendspace with the
+// captured samples and axes and clearExisting, which rebuilds the list exactly.
+// What it cannot carry is per-sample RateScale and single-frame blending, which
+// populate_blendspace has no parameter for, so the record says so.
+static void SetBlendSpaceRestoreRollback(
+	TSharedPtr<FJsonObject> Result,
+	const FString& AssetPath,
+	TArray<TSharedPtr<FJsonValue>> PrevSamples,
+	TArray<TSharedPtr<FJsonValue>> PrevAxes,
+	int32 DroppedSampleCount)
+{
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetArrayField(TEXT("samples"), PrevSamples);
+	Rollback->SetArrayField(TEXT("axes"), PrevAxes);
+	Rollback->SetBoolField(TEXT("clearExisting"), true);
+	MCPSetRollback(Result, TEXT("populate_blendspace"), Rollback);
+	Result->SetNumberField(TEXT("rollbackDroppedSampleCount"), DroppedSampleCount);
+	Result->SetBoolField(TEXT("rollbackLossy"), true);
+	Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+		TEXT("The replay clears the sample list and re-adds every captured sample at its captured position, and restores each axis name, min, max and grid divisions. ")
+#if UE_MCP_HAS_5_8_API
+		TEXT("Per-sample rateScale, single-frame blending and mirroring are not carried, because populate_blendspace has no parameter for them, so every restored sample comes back with the engine defaults for those. ")
+#else
+		TEXT("Per-sample rateScale and single-frame blending are not carried, because populate_blendspace has no parameter for them, so every restored sample comes back with the engine defaults for those. ")
+#endif
+		TEXT("%d sample(s) held no animation and cannot be described to populate_blendspace, so the replay does not bring them back."),
+		DroppedSampleCount));
+}
+
 TSharedPtr<FJsonValue> FAnimationHandlers::PopulateBlendspace(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
@@ -1349,6 +1897,12 @@ TSharedPtr<FJsonValue> FAnimationHandlers::PopulateBlendspace(const TSharedPtr<F
 
 	UBlendSpace* BS = LoadAssetByPath<UBlendSpace>(AssetPath);
 	if (!BS) return MCPError(FString::Printf(TEXT("BlendSpace not found at '%s'"), *AssetPath));
+
+	// Captured before any axis or sample is touched: this action's inverse is
+	// itself, replaying the list and axes that were there.
+	int32 DroppedSampleCount = 0;
+	TArray<TSharedPtr<FJsonValue>> PrevSamples = CaptureBlendSpaceSamples(BS, DroppedSampleCount);
+	TArray<TSharedPtr<FJsonValue>> PrevAxes = CaptureBlendSpaceAxes(BS);
 
 	BS->Modify();
 
@@ -1468,6 +2022,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::PopulateBlendspace(const TSharedPtr<F
 	Result->SetArrayField(TEXT("sampleIndices"), AddedIndices);
 	Result->SetNumberField(TEXT("sampleCount"), BS->GetNumberOfBlendSamples());
 	if (Failed.Num() > 0) Result->SetArrayField(TEXT("failed"), Failed);
+	SetBlendSpaceRestoreRollback(Result, BS->GetPathName(), PrevSamples, PrevAxes, DroppedSampleCount);
 	return MCPResult(Result);
 }
 
@@ -1508,6 +2063,12 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddBlendSample(const TSharedPtr<FJson
 		Params->TryGetNumberField(TEXT("y"), PosY);
 	}
 
+	// Captured before the append. There is no remove-by-index action, so the
+	// inverse of "append one sample" is "put the whole list back".
+	int32 DroppedSampleCount = 0;
+	TArray<TSharedPtr<FJsonValue>> PrevSamples = CaptureBlendSpaceSamples(BlendSpace, DroppedSampleCount);
+	TArray<TSharedPtr<FJsonValue>> PrevAxes = CaptureBlendSpaceAxes(BlendSpace);
+
 	BlendSpace->Modify();
 	const int32 NewSampleIndex = BlendSpace->AddSample(Anim, FVector(PosX, PosY, 0.0));
 	if (NewSampleIndex < 0)
@@ -1529,6 +2090,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddBlendSample(const TSharedPtr<FJson
 	Result->SetNumberField(TEXT("sampleIndex"), NewSampleIndex);
 	Result->SetNumberField(TEXT("x"), PosX);
 	Result->SetNumberField(TEXT("y"), PosY);
+	SetBlendSpaceRestoreRollback(Result, BlendSpace->GetPathName(), PrevSamples, PrevAxes, DroppedSampleCount);
 	return MCPResult(Result);
 }
 
@@ -1563,6 +2125,11 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetBlendSample(const TSharedPtr<FJson
 
 	const FBlendSample& Existing = BlendSpace->GetBlendSample(SampleIndex);
 	FVector NewPos = Existing.SampleValue;
+	// Copied by value, not held by reference: EditSampleValue rewrites the array
+	// this reference points into. These two are exactly what the inverse call
+	// needs, and this action is its own inverse.
+	const FVector PrevPos = Existing.SampleValue;
+	const FString PrevAnimPath = Existing.Animation ? Existing.Animation->GetPathName() : FString();
 
 	const TSharedPtr<FJsonObject>* PosObj = nullptr;
 	bool bHasPos = false;
@@ -1627,6 +2194,35 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetBlendSample(const TSharedPtr<FJson
 	if (Updated.Animation)
 	{
 		Result->SetStringField(TEXT("animation"), Updated.Animation->GetPathName());
+	}
+	Result->SetNumberField(TEXT("previousX"), PrevPos.X);
+	Result->SetNumberField(TEXT("previousY"), PrevPos.Y);
+	Result->SetStringField(TEXT("previousAnimation"), PrevAnimPath);
+
+	// This action is its own inverse: the same sampleIndex with the position and
+	// animation it held. The index is stable because nothing here adds or removes
+	// a sample.
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), BlendSpace->GetPathName());
+	Rollback->SetNumberField(TEXT("sampleIndex"), SampleIndex);
+	Rollback->SetNumberField(TEXT("x"), PrevPos.X);
+	Rollback->SetNumberField(TEXT("y"), PrevPos.Y);
+	if (!PrevAnimPath.IsEmpty())
+	{
+		Rollback->SetStringField(TEXT("animation"), PrevAnimPath);
+	}
+	MCPSetRollback(Result, TEXT("set_blend_sample"), Rollback);
+
+	// The one thing the replay cannot express: a sample that held NO animation.
+	// set_blend_sample needs an animation path and has no form that clears one,
+	// so omitting the field leaves whatever this call assigned in place.
+	const bool bAssignedToEmptySample = PrevAnimPath.IsEmpty() && Updated.Animation != nullptr;
+	Result->SetBoolField(TEXT("rollbackLossy"), bAssignedToEmptySample);
+	if (bAssignedToEmptySample)
+	{
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The sample held no animation before this call. The replay restores its position, but set_blend_sample requires an animation path and cannot clear one, ")
+			TEXT("so the animation this call assigned stays on the sample."));
 	}
 	return MCPResult(Result);
 }
@@ -1716,15 +2312,51 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageSequence(const TSharedPtr<F
 
 	// Replace the animation in the target segment(s) of this track
 	int32 SegmentsUpdated = 0;
+	// What the affected segments held, recorded as each is overwritten. The
+	// inverse can only name ONE animSequencePath, so a slot whose segments
+	// referenced different sequences has no single call that restores it.
+	TArray<TSharedPtr<FJsonValue>> PreviousSegments;
+	FString PrevSharedAnimPath;
+	bool bPrevPathsAgree = true;
+	bool bPrevTrimmed = false;
+	bool bChanged = false;
 	for (int32 SegIdx = 0; SegIdx < SlotTrack.AnimTrack.AnimSegments.Num(); ++SegIdx)
 	{
 		if (bHasSegmentIndex && SegIdx != SegmentIndex) continue;
 		FAnimSegment& Segment = SlotTrack.AnimTrack.AnimSegments[SegIdx];
+
+		const UAnimSequenceBase* PrevAnim = Segment.GetAnimReference().Get();
+		const FString PrevPath = PrevAnim ? PrevAnim->GetPathName() : FString();
+		const float PrevStart = Segment.AnimStartTime;
+		const float PrevEnd = Segment.AnimEndTime;
+
+		TSharedPtr<FJsonObject> Prev = MakeShared<FJsonObject>();
+		Prev->SetNumberField(TEXT("segmentIndex"), SegIdx);
+		Prev->SetStringField(TEXT("animSequencePath"), PrevPath);
+		Prev->SetNumberField(TEXT("animStartTime"), PrevStart);
+		Prev->SetNumberField(TEXT("animEndTime"), PrevEnd);
+		PreviousSegments.Add(MakeShared<FJsonValueObject>(Prev));
+
+		if (SegmentsUpdated == 0) PrevSharedAnimPath = PrevPath;
+		else if (PrevPath != PrevSharedAnimPath) bPrevPathsAgree = false;
+		if (PrevAnim && (!FMath::IsNearlyZero(PrevStart) || !FMath::IsNearlyEqual(PrevEnd, PrevAnim->GetPlayLength())))
+		{
+			bPrevTrimmed = true;
+		}
+		if (PrevAnim != NewSequence || !FMath::IsNearlyZero(PrevStart)
+			|| !FMath::IsNearlyEqual(PrevEnd, NewSequence->GetPlayLength()))
+		{
+			bChanged = true;
+		}
+
 		Segment.SetAnimReference(NewSequence);
 		Segment.AnimStartTime = 0.0f;
 		Segment.AnimEndTime = NewSequence->GetPlayLength();
 		SegmentsUpdated++;
 	}
+	// True when the slot had no segments at all and this call authored one, which
+	// is the only branch whose inverse is a removal rather than a replacement.
+	const bool bCreatedSegment = (SegmentsUpdated == 0 && !bHasSegmentIndex);
 
 	// If no segments exist, add one (only in whole-slot mode).
 	if (SegmentsUpdated == 0 && !bHasSegmentIndex)
@@ -1758,6 +2390,8 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageSequence(const TSharedPtr<F
 	UEditorAssetLibrary::SaveAsset(AssetPath);
 
 	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("unchanged"), !bChanged && !bCreatedSegment);
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("animSequencePath"), AnimSequencePath);
 	Result->SetStringField(TEXT("slotName"), SlotTrack.SlotName.ToString());
@@ -1765,6 +2399,48 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetMontageSequence(const TSharedPtr<F
 	if (bHasSegmentIndex) Result->SetNumberField(TEXT("segmentIndex"), SegmentIndex);
 	Result->SetNumberField(TEXT("sequenceLength"), NewSequence->GetPlayLength());
 	Result->SetNumberField(TEXT("montageLength"), NewTotalLength);
+	Result->SetArrayField(TEXT("previousSegments"), PreviousSegments);
+
+	if (bCreatedSegment)
+	{
+		// The slot was empty, so the inverse is removing the segment this call
+		// authored, and it is the only one in the slot. Addressed by slotIndex,
+		// because the forward call selected the track by index and slot NAMES are
+		// not unique: remove_montage_segment prefers slotName and takes the FIRST
+		// track carrying it, which is a different track whenever a montage repeats
+		// a slot name.
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+		Rollback->SetNumberField(TEXT("slotIndex"), TrackIdx);
+		Rollback->SetNumberField(TEXT("segmentIndex"), 0);
+		MCPSetRollback(Result, TEXT("remove_montage_segment"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+	}
+	else if (bPrevPathsAgree && !PrevSharedAnimPath.IsEmpty())
+	{
+		// This action is its own inverse when every segment it touched held the
+		// same sequence: replay it with that path and the same selector.
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+		Rollback->SetStringField(TEXT("animSequencePath"), PrevSharedAnimPath);
+		Rollback->SetNumberField(TEXT("slotIndex"), TrackIdx);
+		if (bHasSegmentIndex) Rollback->SetNumberField(TEXT("segmentIndex"), SegmentIndex);
+		MCPSetRollback(Result, TEXT("set_montage_sequence"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), bPrevTrimmed);
+		if (bPrevTrimmed)
+		{
+			Result->SetStringField(TEXT("rollbackNote"),
+				TEXT("The replay puts the previous sequence back but re-opens each segment to the sequence's full length, because set_montage_sequence always writes animStartTime 0 and animEndTime = play length. ")
+				TEXT("The trim points the segments carried are listed in previousSegments; restore them with asset(set_property) on the slot's AnimSegments."));
+		}
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), PrevSharedAnimPath.IsEmpty() && bPrevPathsAgree
+			? TEXT("The affected segment carried no animation reference, and set_montage_sequence requires an animSequencePath and cannot clear one, so there is no call that restores an empty segment.")
+			: TEXT("The slot's segments referenced different sequences and this whole-slot write pointed them all at one. set_montage_sequence names a single animSequencePath, so no one call restores them; previousSegments lists what each segment held, replayable one at a time with segmentIndex."));
+	}
 
 	return MCPResult(Result);
 }
@@ -2185,7 +2861,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddMontageSection(const TSharedPtr<FJ
 		Result->SetStringField(TEXT("slotName"), SlotNameUsed);
 	}
 	Result->SetNumberField(TEXT("totalSections"), Montage->CompositeSections.Num());
-	// No rollback: no paired remove_montage_section handler.
+	// This branch only runs when the section did not exist, and the section is
+	// appended without touching any other section's next-section link, so
+	// removing it by name puts the montage back.
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetStringField(TEXT("sectionName"), SectionName);
+	MCPSetRollback(Result, TEXT("remove_montage_section"), Rollback);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
 
 	return MCPResult(Result);
 }
@@ -2632,6 +3315,17 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetRootMotionSettings(const TSharedPt
 	UAnimSequence* Seq = LoadAssetByPath<UAnimSequence>(AssetPath);
 	if (!Seq) return MCPError(FString::Printf(TEXT("AnimSequence not found: %s"), *AssetPath));
 
+	// Every field this action can write, read before any of them is touched.
+	// The action is its own inverse, so the rollback carries all four whether or
+	// not the caller passed them.
+	const bool bPrevEnableRootMotion = Seq->bEnableRootMotion;
+	const bool bPrevForceRootLock = Seq->bForceRootLock;
+	const bool bPrevUseNormalizedRootMotionScale = Seq->bUseNormalizedRootMotionScale;
+	const ERootMotionRootLock::Type PrevRootLock = Seq->RootMotionRootLock;
+	const FString PrevRootLockName =
+		PrevRootLock == ERootMotionRootLock::RefPose ? TEXT("RefPose")
+		: (PrevRootLock == ERootMotionRootLock::AnimFirstFrame ? TEXT("AnimFirstFrame") : TEXT("Zero"));
+
 	Seq->Modify();
 	bool EnableRootMotion;
 	if (Params->TryGetBoolField(TEXT("enableRootMotion"), EnableRootMotion))
@@ -2661,9 +3355,27 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetRootMotionSettings(const TSharedPt
 
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
 	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("unchanged"),
+		bPrevEnableRootMotion == Seq->bEnableRootMotion
+		&& bPrevForceRootLock == Seq->bForceRootLock
+		&& bPrevUseNormalizedRootMotionScale == Seq->bUseNormalizedRootMotionScale
+		&& PrevRootLock == Seq->RootMotionRootLock);
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetBoolField(TEXT("enableRootMotion"), Seq->bEnableRootMotion);
 	Result->SetBoolField(TEXT("forceRootLock"), Seq->bForceRootLock);
+	Result->SetBoolField(TEXT("previousEnableRootMotion"), bPrevEnableRootMotion);
+	Result->SetBoolField(TEXT("previousForceRootLock"), bPrevForceRootLock);
+	Result->SetBoolField(TEXT("previousUseNormalizedRootMotionScale"), bPrevUseNormalizedRootMotionScale);
+	Result->SetStringField(TEXT("previousRootMotionRootLock"), PrevRootLockName);
+
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetBoolField(TEXT("enableRootMotion"), bPrevEnableRootMotion);
+	Rollback->SetBoolField(TEXT("forceRootLock"), bPrevForceRootLock);
+	Rollback->SetBoolField(TEXT("useNormalizedRootMotionScale"), bPrevUseNormalizedRootMotionScale);
+	Rollback->SetStringField(TEXT("rootMotionRootLock"), PrevRootLockName);
+	MCPSetRollback(Result, TEXT("set_root_motion_settings"), Rollback);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
 	return MCPResult(Result);
 }
 
@@ -2714,9 +3426,18 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveVirtualBone(const TSharedPtr<FJ
 	// Idempotency: check if virtual bone exists
 	const FName BoneFName(*BoneName);
 	bool bFound = false;
+	// The two bones the virtual bone spans. Captured here because the removal
+	// destroys them, and they are what add_virtual_bone needs to re-create it.
+	FString SourceBone, TargetBone;
 	for (const FVirtualBone& VB : Skeleton->GetVirtualBones())
 	{
-		if (VB.VirtualBoneName == BoneFName) { bFound = true; break; }
+		if (VB.VirtualBoneName == BoneFName)
+		{
+			bFound = true;
+			SourceBone = VB.SourceBoneName.ToString();
+			TargetBone = VB.TargetBoneName.ToString();
+			break;
+		}
 	}
 	if (!bFound)
 	{
@@ -2734,10 +3455,23 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RemoveVirtualBone(const TSharedPtr<FJ
 	UEditorAssetLibrary::SaveLoadedAsset(Skeleton);
 
 	TSharedPtr<FJsonObject> Result = MCPSuccess();
+	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("skeletonPath"), SkeletonPath);
 	Result->SetStringField(TEXT("removed"), BoneName);
 	Result->SetBoolField(TEXT("deleted"), true);
-	// No rollback: removal of a virtual bone is not reversible without source/target capture.
+	Result->SetBoolField(TEXT("alreadyDeleted"), false);
+	Result->SetStringField(TEXT("sourceBone"), SourceBone);
+	Result->SetStringField(TEXT("targetBone"), TargetBone);
+
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("skeletonPath"), SkeletonPath);
+	Rollback->SetStringField(TEXT("sourceBone"), SourceBone);
+	Rollback->SetStringField(TEXT("targetBone"), TargetBone);
+	MCPSetRollback(Result, TEXT("add_virtual_bone"), Rollback);
+	Result->SetBoolField(TEXT("rollbackLossy"), true);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("add_virtual_bone re-creates the bone from its source and target, and Unreal mints the name, so a virtual bone that had been renamed comes back under the generated name. ")
+		TEXT("Anything that referenced the old name (sockets, curves, animation node bone references) still points at the name that was removed."));
 	return MCPResult(Result);
 }
 TSharedPtr<FJsonValue> FAnimationHandlers::SetAnimBlueprintSkeleton(const TSharedPtr<FJsonObject>& Params)
@@ -2752,6 +3486,11 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetAnimBlueprintSkeleton(const TShare
 	USkeleton* Skeleton = LoadObject<USkeleton>(nullptr, *SkeletonPath);
 	if (!Skeleton) return MCPError(FString::Printf(TEXT("Skeleton not found: %s"), *SkeletonPath));
 
+	// The skeleton the Blueprint targeted, read before the assignment: it is the
+	// one value an inverse call can put back.
+	const USkeleton* PrevSkeleton = AnimBP->TargetSkeleton;
+	const FString PrevSkeletonPath = PrevSkeleton ? PrevSkeleton->GetPathName() : FString();
+
 	AnimBP->TargetSkeleton = Skeleton;
 	AnimBP->MarkPackageDirty();
 	FKismetEditorUtilities::CompileBlueprint(AnimBP);
@@ -2759,7 +3498,24 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetAnimBlueprintSkeleton(const TShare
 
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("unchanged"), PrevSkeleton == Skeleton);
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("skeletonPath"), SkeletonPath);
+	Result->SetStringField(TEXT("previousSkeletonPath"), PrevSkeletonPath);
+
+	if (!PrevSkeletonPath.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+		Rollback->SetStringField(TEXT("skeletonPath"), PrevSkeletonPath);
+		MCPSetRollback(Result, TEXT("set_anim_blueprint_skeleton"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The Blueprint had no target skeleton before this call. set_anim_blueprint_skeleton requires a skeletonPath and cannot clear the assignment, so there is no call that returns it to having none."));
+	}
 	return MCPResult(Result);
 }

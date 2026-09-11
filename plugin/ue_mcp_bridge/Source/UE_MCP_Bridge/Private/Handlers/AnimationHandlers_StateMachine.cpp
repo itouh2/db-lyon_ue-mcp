@@ -36,15 +36,23 @@
 #include "AnimGraphNode_BlendSpacePlayer.h"
 #include "Rig/IKRigDefinition.h"
 #include "RigEditor/IKRigController.h"
+#if UE_MCP_HAS_5_8_API
+#include "Rig/Solvers/IKRigFullBodyIK.h"
+#include "Retargeter/IKRetargetChainMapping.h"
+#include "Retargeter/IKRetargetOps.h"
+#include "JsonObjectConverter.h"
+#include "Retargeter/IKRetargetProcessor.h"
+#endif
 #include "PoseSearch/PoseSearchDatabase.h"
 #include "PoseSearch/PoseSearchSchema.h"
+#include "HandlerPoseSearchSchema.h"
 #include "PoseSearch/PoseSearchDerivedData.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Animation/AnimComposite.h"
 #include "Animation/AnimSequenceBase.h"
 #include "Animation/BlendSpace.h"
 #include "Animation/Skeleton.h"
-#include "StructUtils/InstancedStruct.h"
+#include "MCPEngineCompat.h"
 #include "UObject/Package.h"
 #include "Misc/PackageName.h"
 #include "Runtime/Launch/Resources/Version.h"
@@ -53,11 +61,85 @@
 #include "UObject/UObjectGlobals.h"
 #include "EditorAssetLibrary.h"
 #include "Editor.h"
+#include "ScopedTransaction.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 
 
-#define UE_MCP_HAS_POSESEARCH_DATABASE_ASSET_API (ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 4))
+// UPoseSearchDatabase's GetNumAnimationAssets / GetDatabaseAnimationAsset pair
+// is 5.5 and newer. 5.4 exposes the clip list as the AnimationAssets array of
+// FInstancedStruct with GetAnimationAssetBase, which is what the #else arms
+// below are written against.
+#define UE_MCP_HAS_POSESEARCH_DATABASE_ASSET_API (ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 5))
+
+#if UE_MCP_HAS_5_8_API
+static TSharedPtr<FJsonObject> AnimationVectorToJson(const FVector& Value)
+{
+	TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+	Json->SetNumberField(TEXT("x"), Value.X);
+	Json->SetNumberField(TEXT("y"), Value.Y);
+	Json->SetNumberField(TEXT("z"), Value.Z);
+	return Json;
+}
+
+static TSharedPtr<FJsonObject> AnimationQuaternionToJson(const FQuat& Value)
+{
+	TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+	Json->SetNumberField(TEXT("x"), Value.X);
+	Json->SetNumberField(TEXT("y"), Value.Y);
+	Json->SetNumberField(TEXT("z"), Value.Z);
+	Json->SetNumberField(TEXT("w"), Value.W);
+	return Json;
+}
+
+static TSharedPtr<FJsonObject> AnimationTransformToJson(const FTransform& Value)
+{
+	TSharedPtr<FJsonObject> Json = MakeShared<FJsonObject>();
+	Json->SetObjectField(TEXT("translation"), AnimationVectorToJson(Value.GetTranslation()));
+	Json->SetObjectField(TEXT("rotationQuaternion"), AnimationQuaternionToJson(Value.GetRotation()));
+	Json->SetObjectField(TEXT("scale"), AnimationVectorToJson(Value.GetScale3D()));
+	return Json;
+}
+
+// Processor initialization temporarily redirects editor-instance pointers on
+// the serialized op stack. Restore them after validation and batch execution.
+class FScopedBatchRetargetEditorInstanceRestore
+{
+	struct FState
+	{
+		FIKRetargetOpBase* Op = nullptr;
+		FIKRetargetOpBase* OpEditorInstance = nullptr;
+		FIKRetargetOpSettingsBase* Settings = nullptr;
+		FIKRetargetOpSettingsBase* SettingsEditorInstance = nullptr;
+	};
+
+public:
+	explicit FScopedBatchRetargetEditorInstanceRestore(UIKRetargeter* Retargeter)
+	{
+		if (!Retargeter) return;
+		States.Reserve(Retargeter->GetRetargetOps().Num());
+		for (const FInstancedStruct& OpStruct : Retargeter->GetRetargetOps())
+		{
+			FIKRetargetOpBase* Op = const_cast<FIKRetargetOpBase*>(OpStruct.GetPtr<FIKRetargetOpBase>());
+			if (!Op) continue;
+			FIKRetargetOpSettingsBase* Settings = Op->GetSettings();
+			States.Add({Op, Op->EditorInstance, Settings, Settings ? Settings->EditorInstance : nullptr});
+		}
+	}
+
+	~FScopedBatchRetargetEditorInstanceRestore()
+	{
+		for (const FState& State : States)
+		{
+			State.Op->EditorInstance = State.OpEditorInstance;
+			if (State.Settings) State.Settings->EditorInstance = State.SettingsEditorInstance;
+		}
+	}
+
+private:
+	TArray<FState> States;
+};
+#endif
 
 static int32 GetPoseSearchAnimationAssetCount(const UPoseSearchDatabase* Database)
 {
@@ -66,6 +148,56 @@ static int32 GetPoseSearchAnimationAssetCount(const UPoseSearchDatabase* Databas
 #else
 	return Database->AnimationAssets.Num();
 #endif
+}
+
+// The database's clip list as it stands, in the exact shape set_pose_search_clips
+// accepts. This is what makes a clip-list write reversible: the inverse is that
+// same bulk setter replaying the captured list with clearExisting, so the payload
+// has to carry every per-clip flag the setter can author, not just the paths.
+static TArray<TSharedPtr<FJsonValue>> CapturePoseSearchClips(UPoseSearchDatabase* Database, int32& OutDroppedClipCount)
+{
+	OutDroppedClipCount = 0;
+	TArray<TSharedPtr<FJsonValue>> Clips;
+	const int32 Count = GetPoseSearchAnimationAssetCount(Database);
+	for (int32 i = 0; i < Count; ++i)
+	{
+#if UE_MCP_HAS_POSESEARCH_DATABASE_ASSET_API
+	#if UE_MCP_HAS_5_7_API
+		const FPoseSearchDatabaseAnimationAssetBase* Entry = Database->GetDatabaseAnimationAsset(i);
+	#else
+		const FPoseSearchDatabaseAnimationAssetBase* Entry = Database->GetDatabaseAnimationAsset<FPoseSearchDatabaseAnimationAssetBase>(i);
+	#endif
+#else
+		const FPoseSearchDatabaseAnimationAssetBase* Entry = Database->GetAnimationAssetBase(i);
+#endif
+		// An entry with no asset cannot be described to set_pose_search_clips,
+		// which needs a sequencePath, so it is counted rather than silently lost.
+		if (!Entry) { ++OutDroppedClipCount; continue; }
+		const UObject* AnimAsset = Entry->GetAnimationAsset();
+		if (!AnimAsset) { ++OutDroppedClipCount; continue; }
+
+		TSharedPtr<FJsonObject> Clip = MakeShared<FJsonObject>();
+		Clip->SetStringField(TEXT("sequencePath"), AnimAsset->GetPathName());
+		Clip->SetBoolField(TEXT("enabled"), Entry->IsEnabled());
+		Clip->SetBoolField(TEXT("disableReselection"), Entry->IsDisableReselection());
+		switch (Entry->GetMirrorOption())
+		{
+		case EPoseSearchMirrorOption::MirroredOnly:
+			Clip->SetStringField(TEXT("mirror"), TEXT("mirrored"));
+			break;
+		case EPoseSearchMirrorOption::UnmirroredAndMirrored:
+			Clip->SetStringField(TEXT("mirror"), TEXT("both"));
+			break;
+		default:
+			Clip->SetStringField(TEXT("mirror"), TEXT("original"));
+			break;
+		}
+		const FFloatInterval Range = Entry->GetSamplingRange();
+		Clip->SetNumberField(TEXT("sampleStart"), Range.Min);
+		Clip->SetNumberField(TEXT("sampleEnd"), Range.Max);
+		Clips.Add(MakeShared<FJsonValueObject>(Clip));
+	}
+	return Clips;
 }
 
 // Optional per-clip authoring flags (#684). Each is only applied when set, so a
@@ -300,7 +432,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateStateMachine(const TSharedPtr<F
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("name"), Name);
 	Result->SetStringField(TEXT("graphName"), GraphName);
-	// No rollback: no paired remove_state_machine handler.
+	// The machine is created empty, so removing it puts the AnimGraph back
+	// exactly as it was. remove_state_machine addresses it by the same name
+	// this call reports.
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetStringField(TEXT("stateMachineName"), Name);
+	MCPSetRollback(Result, TEXT("remove_state_machine"), Rollback);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
 
 	return MCPResult(Result);
 }
@@ -423,7 +562,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddState(const TSharedPtr<FJsonObject
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("stateMachineName"), SMName);
 	Result->SetStringField(TEXT("stateName"), StateName);
-	// No rollback: no paired remove_state handler.
+	// The state is created empty and this branch only runs when it did not
+	// exist, so remove_state returns the machine to its prior shape.
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetStringField(TEXT("stateMachineName"), SMName);
+	Rollback->SetStringField(TEXT("stateName"), StateName);
+	MCPSetRollback(Result, TEXT("remove_state"), Rollback);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
 
 	return MCPResult(Result);
 }
@@ -540,7 +686,16 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddTransition(const TSharedPtr<FJsonO
 	{
 		Result->SetStringField(TEXT("boundGraph"), TransNode->BoundGraph->GetName());
 	}
-	// No rollback: no paired remove_transition handler.
+	// remove_transition addresses a transition by transitionGuid, which is the
+	// GUID this call just minted, so the rollback removes THIS transition and
+	// not a sibling that happens to share the same endpoints. The transition is
+	// created with an empty rule graph, so nothing authored is lost.
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetStringField(TEXT("stateMachineName"), SMName);
+	Rollback->SetStringField(TEXT("transitionGuid"), TransNode->NodeGuid.ToString());
+	MCPSetRollback(Result, TEXT("remove_transition"), Rollback);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
 
 	return MCPResult(Result);
 }
@@ -602,6 +757,36 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetStateAnimation(const TSharedPtr<FJ
 		if (!BSPlayer) BSPlayer = Cast<UAnimGraphNode_BlendSpacePlayer>(Node);
 	}
 
+	// Capture what the state plays right now. The write lands on the player node
+	// matching the NEW asset's type, which is not necessarily the node that held
+	// the old one: a state driven by a BlendSpacePlayer and then written with a
+	// sequence gets a second, freshly created SequencePlayer. So look at the node
+	// this write targets first, and fall back to the other one, which is what
+	// keeps the "no player node" branch from claiming an empty state that was not.
+	const bool bWritesSequencePlayer = AnimAsset->IsA<UAnimSequence>();
+	UAnimGraphNode_Base* TargetPlayer = bWritesSequencePlayer
+		? static_cast<UAnimGraphNode_Base*>(SeqPlayer) : static_cast<UAnimGraphNode_Base*>(BSPlayer);
+	UAnimGraphNode_Base* OtherPlayer = bWritesSequencePlayer
+		? static_cast<UAnimGraphNode_Base*>(BSPlayer) : static_cast<UAnimGraphNode_Base*>(SeqPlayer);
+
+	FString PrevAnimAssetPath;
+	bool bPrevOnOtherPlayer = false;
+	if (TargetPlayer)
+	{
+		if (UAnimationAsset* Prev = TargetPlayer->GetAnimationAsset()) PrevAnimAssetPath = Prev->GetPathName();
+	}
+	if (PrevAnimAssetPath.IsEmpty() && OtherPlayer)
+	{
+		if (UAnimationAsset* Prev = OtherPlayer->GetAnimationAsset())
+		{
+			PrevAnimAssetPath = Prev->GetPathName();
+			bPrevOnOtherPlayer = true;
+		}
+	}
+	const bool bUnchanged = !bPrevOnOtherPlayer
+		&& !PrevAnimAssetPath.IsEmpty()
+		&& PrevAnimAssetPath == AnimAsset->GetPathName();
+
 	if (UAnimSequence* Seq = Cast<UAnimSequence>(AnimAsset))
 	{
 		if (!SeqPlayer)
@@ -634,9 +819,37 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetStateAnimation(const TSharedPtr<FJ
 	CompileAndSave(AnimBP);
 
 	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("unchanged"), bUnchanged);
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("stateName"), StateName);
 	Result->SetStringField(TEXT("animAssetPath"), AnimAssetPath);
+	Result->SetStringField(TEXT("previousAnimAssetPath"), PrevAnimAssetPath);
+	Result->SetBoolField(TEXT("previousOnOtherPlayerNode"), bPrevOnOtherPlayer);
+
+	if (!PrevAnimAssetPath.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+		Rollback->SetStringField(TEXT("stateMachineName"), SMName);
+		Rollback->SetStringField(TEXT("stateName"), StateName);
+		Rollback->SetStringField(TEXT("animAssetPath"), PrevAnimAssetPath);
+		MCPSetRollback(Result, TEXT("set_state_animation"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), bPrevOnOtherPlayer);
+		if (bPrevOnOtherPlayer)
+		{
+			Result->SetStringField(TEXT("rollbackNote"),
+				TEXT("The animation this state played lived on a player node of the other kind, so this call created a second player node rather than overwriting it. ")
+				TEXT("The replay points the state back at the previous asset on its original node, but the node this call added stays in the state's inner graph and no action deletes it."));
+		}
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("No player node in this state held an animation before the call, so this write created the node or filled an empty one. ")
+			TEXT("set_state_animation requires an animAssetPath and cannot clear one, and no action deletes a player node from a state's inner graph."));
+	}
 
 	return MCPResult(Result);
 }
@@ -690,16 +903,24 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetTransitionBlend(const TSharedPtr<F
 		return MCPError(FString::Printf(TEXT("No transition from '%s' to '%s'"), *FromState, *ToState));
 	}
 
+	// Capture what the transition held, so the write can name the call that puts
+	// it back. Both fields are read before either is touched.
+	const float PrevCrossfade = TransNode->CrossfadeDuration;
+	const ETransitionLogicType::Type PrevLogicType = TransNode->LogicType;
+	const EAlphaBlendOption PrevBlendMode = TransNode->BlendMode;
+
 	// Set blend duration
 	double BlendDuration = 0.2;
-	if (Params->TryGetNumberField(TEXT("blendDuration"), BlendDuration))
+	const bool bWroteDuration = Params->TryGetNumberField(TEXT("blendDuration"), BlendDuration);
+	if (bWroteDuration)
 	{
 		TransNode->CrossfadeDuration = static_cast<float>(BlendDuration);
 	}
 
 	// Set blend logic (Standard vs Inertialization)
 	FString BlendLogic;
-	if (Params->TryGetStringField(TEXT("blendLogic"), BlendLogic))
+	const bool bWroteLogic = Params->TryGetStringField(TEXT("blendLogic"), BlendLogic);
+	if (bWroteLogic)
 	{
 		if (BlendLogic.Equals(TEXT("Inertialization"), ESearchCase::IgnoreCase))
 		{
@@ -712,13 +933,54 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetTransitionBlend(const TSharedPtr<F
 		}
 	}
 
+	const bool bChanged =
+		(bWroteDuration && !FMath::IsNearlyEqual(PrevCrossfade, TransNode->CrossfadeDuration))
+		|| (bWroteLogic && (PrevLogicType != TransNode->LogicType || PrevBlendMode != TransNode->BlendMode));
+
 	CompileAndSave(AnimBP);
 
 	auto Result = MCPSuccess();
+	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("unchanged"), !bChanged);
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("fromState"), FromState);
 	Result->SetStringField(TEXT("toState"), ToState);
 	Result->SetNumberField(TEXT("blendDuration"), BlendDuration);
+	Result->SetNumberField(TEXT("previousBlendDuration"), PrevCrossfade);
+
+	// Replay through this same action with the captured values. blendLogic is
+	// only carried when the previous logic was one of the two this action can
+	// author: a transition that used a Custom blend graph is named in the note
+	// rather than silently downgraded to Standard by the rollback.
+	const bool bPrevLogicExpressible = PrevLogicType != ETransitionLogicType::TLT_Custom;
+	Result->SetStringField(TEXT("previousBlendLogic"),
+		PrevLogicType == ETransitionLogicType::TLT_Inertialization ? TEXT("Inertialization")
+		: (PrevLogicType == ETransitionLogicType::TLT_Custom ? TEXT("Custom") : TEXT("Standard")));
+
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetStringField(TEXT("stateMachineName"), SMName);
+	Rollback->SetStringField(TEXT("fromState"), FromState);
+	Rollback->SetStringField(TEXT("toState"), ToState);
+	Rollback->SetNumberField(TEXT("blendDuration"), PrevCrossfade);
+	if (bWroteLogic && bPrevLogicExpressible)
+	{
+		Rollback->SetStringField(TEXT("blendLogic"),
+			PrevLogicType == ETransitionLogicType::TLT_Inertialization ? TEXT("Inertialization") : TEXT("Standard"));
+	}
+	MCPSetRollback(Result, TEXT("set_transition_blend"), Rollback);
+
+	// Two things the replay cannot put back. Writing "Inertialization" also
+	// stomps BlendMode to Linear, and this action has no parameter for it; and
+	// a Custom blend graph is not one of the two logic types it can author.
+	const bool bLossy = bWroteLogic && (!bPrevLogicExpressible || PrevBlendMode != TransNode->BlendMode);
+	Result->SetBoolField(TEXT("rollbackLossy"), bLossy);
+	if (bLossy)
+	{
+		Result->SetStringField(TEXT("rollbackNote"), !bPrevLogicExpressible
+			? TEXT("The transition used a Custom blend graph, which set_transition_blend cannot author, so the rollback restores only blendDuration and leaves the logic type as this call set it.")
+			: TEXT("Selecting Inertialization also sets the transition's BlendMode to Linear, and set_transition_blend has no parameter for BlendMode, so the previous blend curve is not restored."));
+	}
 
 	return MCPResult(Result);
 }
@@ -841,6 +1103,45 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetTransitionCondition(const TSharedP
 		return MCPError(TEXT("Could not find the bCanEnterTransition pin on the transition result node."));
 	}
 
+	// Capture the condition this call is about to replace, so the write can name
+	// the call that puts it back. A rollback can only name what this action can
+	// author: one bool VariableGet, optionally through a NOT. The node count has
+	// to match too, because a graph carrying anything else holds a condition
+	// this action cannot express and the wipe below destroys it.
+	FString PrevVariableName;
+	bool bPrevNegate = false;
+	int32 PrevAuthoredNodeCount = 0;
+	for (UEdGraphNode* Node : TransGraph->Nodes)
+	{
+		if (Node && Node != ResultNode) ++PrevAuthoredNodeCount;
+	}
+	if (ResultPin->LinkedTo.Num() == 1 && ResultPin->LinkedTo[0])
+	{
+		UEdGraphNode* SourceNode = ResultPin->LinkedTo[0]->GetOwningNode();
+		if (UK2Node_VariableGet* PrevGet = Cast<UK2Node_VariableGet>(SourceNode))
+		{
+			PrevVariableName = PrevGet->VariableReference.GetMemberName().ToString();
+		}
+		else if (UK2Node_CallFunction* PrevNot = Cast<UK2Node_CallFunction>(SourceNode))
+		{
+			if (PrevNot->FunctionReference.GetMemberName() == FName(TEXT("Not_PreBool")))
+			{
+				for (UEdGraphPin* Pin : PrevNot->Pins)
+				{
+					if (!Pin || Pin->Direction != EGPD_Input || Pin->LinkedTo.Num() != 1 || !Pin->LinkedTo[0]) continue;
+					if (UK2Node_VariableGet* NegatedGet = Cast<UK2Node_VariableGet>(Pin->LinkedTo[0]->GetOwningNode()))
+					{
+						PrevVariableName = NegatedGet->VariableReference.GetMemberName().ToString();
+						bPrevNegate = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+	const bool bPrevExpressible = !PrevVariableName.IsEmpty()
+		&& PrevAuthoredNodeCount == (bPrevNegate ? 2 : 1);
+
 	// Idempotency: wipe any previously authored condition nodes so re-running
 	// replaces the condition instead of stacking orphan nodes. The default rule
 	// graph contains only the result node; anything else was authored by us.
@@ -930,6 +1231,26 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetTransitionCondition(const TSharedP
 		Result->SetStringField(TEXT("toState"), Next->GetStateName());
 	Result->SetStringField(TEXT("variableName"), VariableName);
 	Result->SetBoolField(TEXT("negate"), bNegate);
+	Result->SetStringField(TEXT("previousVariableName"), PrevVariableName);
+
+	if (bPrevExpressible)
+	{
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+		Rollback->SetStringField(TEXT("stateMachineName"), SMName);
+		Rollback->SetStringField(TEXT("transitionGuid"), TransNode->NodeGuid.ToString());
+		Rollback->SetStringField(TEXT("variableName"), PrevVariableName);
+		Rollback->SetBoolField(TEXT("negate"), bPrevNegate);
+		MCPSetRollback(Result, TEXT("set_transition_condition"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), PrevAuthoredNodeCount == 0
+			? TEXT("The transition carried no condition before this call: its rule graph held only the result node. set_transition_condition always writes a condition and has no form that clears one, so there is no inverse call.")
+			: TEXT("The transition's rule graph held a condition this action cannot express (it authors one bool variable, optionally negated) and the nodes were deleted. Rebuild it with the blueprint graph tools against the rule graph of the transition named by transitionGuid."));
+	}
 	return MCPResult(Result);
 }
 
@@ -1230,6 +1551,31 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateIKRig(const TSharedPtr<FJsonObj
 
 // ─── #93  read_ik_rig ───────────────────────────────────────────────
 
+// The IK rig's retarget root bone, whatever the accessor is called.
+//
+// 5.4 spells it GetRetargetRoot(); later engines renamed the same accessor over
+// the same FName to GetPelvis(). Which engine did the rename is not something
+// this file has to know: the first overload drops out of the overload set when
+// GetPelvis does not exist, and the second when GetRetargetRoot does not, so
+// whichever the engine has is the one that gets called.
+template <typename RigType>
+static auto MCPIKRigRetargetRootBoneImpl(const RigType* Rig, int) -> decltype(Rig->GetPelvis())
+{
+	return Rig->GetPelvis();
+}
+
+template <typename RigType>
+static auto MCPIKRigRetargetRootBoneImpl(const RigType* Rig, long) -> decltype(Rig->GetRetargetRoot())
+{
+	return Rig->GetRetargetRoot();
+}
+
+template <typename RigType>
+static FName MCPIKRigRetargetRootBone(const RigType* Rig)
+{
+	return Rig ? MCPIKRigRetargetRootBoneImpl(Rig, 0) : NAME_None;
+}
+
 TSharedPtr<FJsonValue> FAnimationHandlers::ReadIKRig(const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
@@ -1279,6 +1625,9 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadIKRig(const TSharedPtr<FJsonObjec
 		ChainObj->SetStringField(TEXT("name"), Chain.ChainName.ToString());
 		ChainObj->SetStringField(TEXT("startBone"), Chain.StartBone.BoneName.ToString());
 		ChainObj->SetStringField(TEXT("endBone"), Chain.EndBone.BoneName.ToString());
+#if UE_MCP_HAS_5_8_API
+		ChainObj->SetStringField(TEXT("goal"), Chain.IKGoalName.ToString());
+#endif
 		ChainsArray.Add(MakeShared<FJsonValueObject>(ChainObj));
 	}
 	Result->SetArrayField(TEXT("retargetChains"), ChainsArray);
@@ -1287,14 +1636,101 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadIKRig(const TSharedPtr<FJsonObjec
 	// moves the whole character. Omitting them meant a caller inspecting a rig
 	// could not tell whether the root was set at all, and had to open the
 	// editor to find out.
-	Result->SetStringField(TEXT("retargetRoot"), IKRig->GetPelvis().ToString());
+	Result->SetStringField(TEXT("retargetRoot"), MCPIKRigRetargetRootBone(IKRig).ToString());
 	if (RigSkeleton.BoneNames.Num() > 0)
 	{
 		Result->SetStringField(TEXT("rootBone"), RigSkeleton.BoneNames[0].ToString());
 	}
 
-	// Solvers - enumerate via reflection since GetSolverArray not available in all UE versions
+	// UE 5.8 replaced the legacy UObject solver array with typed instanced
+	// structs. Keep the reflection fallback for older supported engines.
 	TArray<TSharedPtr<FJsonValue>> SolversArray;
+#if UE_MCP_HAS_5_8_API
+	UIKRigController* Controller = UIKRigController::GetController(IKRig);
+	if (!Controller)
+	{
+		return MCPError(TEXT("IKRigController unavailable"));
+	}
+
+	Result->SetStringField(TEXT("retargetRoot"), Controller->GetRetargetRoot().ToString());
+	Result->SetStringField(TEXT("rootMotionBone"), Controller->GetRootMotionBone().ToString());
+	Result->SetStringField(
+		TEXT("skeletonRootBone"),
+		RigSkeleton.BoneNames.IsEmpty() ? TEXT("") : RigSkeleton.BoneNames[0].ToString());
+
+	TArray<TSharedPtr<FJsonValue>> GoalsArray;
+	for (UIKRigEffectorGoal* Goal : Controller->GetAllGoals())
+	{
+		if (!Goal) continue;
+		TSharedPtr<FJsonObject> GoalObj = MakeShared<FJsonObject>();
+		GoalObj->SetStringField(TEXT("name"), Goal->GoalName.ToString());
+		GoalObj->SetStringField(TEXT("bone"), Goal->BoneName.ToString());
+		GoalObj->SetNumberField(TEXT("positionAlpha"), Goal->PositionAlpha);
+		GoalObj->SetNumberField(TEXT("rotationAlpha"), Goal->RotationAlpha);
+		GoalObj->SetObjectField(TEXT("currentTransform"), AnimationTransformToJson(Goal->CurrentTransform));
+		GoalObj->SetObjectField(TEXT("initialTransform"), AnimationTransformToJson(Goal->InitialTransform));
+
+		TArray<TSharedPtr<FJsonValue>> ConnectedSolvers;
+		for (int32 SolverIndex = 0; SolverIndex < Controller->GetNumSolvers(); ++SolverIndex)
+		{
+			if (Controller->IsGoalConnectedToSolver(Goal->GoalName, SolverIndex))
+			{
+				ConnectedSolvers.Add(MakeShared<FJsonValueNumber>(SolverIndex));
+			}
+		}
+		GoalObj->SetArrayField(TEXT("connectedSolverIndices"), ConnectedSolvers);
+		GoalsArray.Add(MakeShared<FJsonValueObject>(GoalObj));
+	}
+	Result->SetArrayField(TEXT("goals"), GoalsArray);
+
+	TArray<TSharedPtr<FJsonValue>> ExcludedBones;
+	for (const FName BoneName : RigSkeleton.BoneNames)
+	{
+		if (Controller->GetBoneExcluded(BoneName))
+		{
+			ExcludedBones.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+		}
+	}
+	Result->SetArrayField(TEXT("excludedBones"), ExcludedBones);
+
+	for (int32 SolverIndex = 0; SolverIndex < Controller->GetNumSolvers(); ++SolverIndex)
+	{
+		FInstancedStruct* SolverStruct = Controller->GetSolverStructAtIndex(SolverIndex);
+		const UScriptStruct* SolverType = SolverStruct ? SolverStruct->GetScriptStruct() : nullptr;
+		TSharedPtr<FJsonObject> SolverObj = MakeShared<FJsonObject>();
+		SolverObj->SetNumberField(TEXT("index"), SolverIndex);
+		SolverObj->SetStringField(TEXT("name"), Controller->GetSolverUniqueName(SolverIndex));
+		SolverObj->SetStringField(TEXT("type"), SolverType ? SolverType->GetPathName() : TEXT(""));
+		SolverObj->SetBoolField(TEXT("enabled"), Controller->GetSolverEnabled(SolverIndex));
+		SolverObj->SetStringField(TEXT("startBone"), Controller->GetStartBone(SolverIndex).ToString());
+		SolverObj->SetStringField(TEXT("endBone"), Controller->GetEndBone(SolverIndex).ToString());
+
+		TArray<TSharedPtr<FJsonValue>> Effectors;
+		if (UIKRigFBIKController* FBIKController = Cast<UIKRigFBIKController>(Controller->GetSolverController(SolverIndex)))
+		{
+			SolverObj->SetBoolField(TEXT("fullBodyIK"), true);
+			for (UIKRigEffectorGoal* Goal : Controller->GetAllGoals())
+			{
+				if (!Goal || !Controller->IsGoalConnectedToSolver(Goal->GoalName, SolverIndex)) continue;
+				const FIKRigFBIKGoalSettings Settings = FBIKController->GetGoalSettings(Goal->GoalName);
+				TSharedPtr<FJsonObject> EffectorObj = MakeShared<FJsonObject>();
+				EffectorObj->SetStringField(TEXT("goal"), Goal->GoalName.ToString());
+				EffectorObj->SetStringField(TEXT("bone"), Settings.BoneName.ToString());
+				EffectorObj->SetNumberField(TEXT("chainDepth"), Settings.ChainDepth);
+				EffectorObj->SetNumberField(TEXT("strengthAlpha"), Settings.StrengthAlpha);
+				EffectorObj->SetNumberField(TEXT("pullChainAlpha"), Settings.PullChainAlpha);
+				EffectorObj->SetNumberField(TEXT("pinRotation"), Settings.PinRotation);
+				Effectors.Add(MakeShared<FJsonValueObject>(EffectorObj));
+			}
+		}
+		else
+		{
+			SolverObj->SetBoolField(TEXT("fullBodyIK"), false);
+		}
+		SolverObj->SetArrayField(TEXT("effectors"), Effectors);
+		SolversArray.Add(MakeShared<FJsonValueObject>(SolverObj));
+	}
+#else
 	FProperty* SolversProp = IKRig->GetClass()->FindPropertyByName(TEXT("Solvers"));
 	if (SolversProp)
 	{
@@ -1308,6 +1744,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadIKRig(const TSharedPtr<FJsonObjec
 			SolversArray.Add(MakeShared<FJsonValueObject>(SolverInfo));
 		}
 	}
+#endif
 	Result->SetArrayField(TEXT("solvers"), SolversArray);
 
 	return MCPResult(Result);
@@ -1342,7 +1779,78 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateIKRetargeter(const TSharedPtr<F
 	auto Created = MCPCreateAssetIdempotent<UObject>(Name, PackagePath, OnConflict, TEXT("IKRetargeter"), RetargeterClass, Factory);
 	if (Created.EarlyReturn) return Created.EarlyReturn;
 	UObject* NewAsset = Created.Asset;
+	const bool bAutoMap = OptionalBool(Params, TEXT("autoMapChains"), true);
+	int32 ChainsMapped = 0;
+	FString SrcErr;
+	FString TgtErr;
+	FString OpsWarning;
 
+#if UE_MCP_HAS_5_8_API
+	UIKRetargeter* Retargeter = Cast<UIKRetargeter>(NewAsset);
+	if (!Retargeter)
+	{
+		UEditorAssetLibrary::DeleteAsset(NewAsset->GetPathName());
+		return MCPError(TEXT("Created asset is not an IKRetargeter"));
+	}
+
+	UIKRigDefinition* SourceRig = SourceRigPath.IsEmpty()
+		? nullptr
+		: LoadObject<UIKRigDefinition>(nullptr, *SourceRigPath);
+	UIKRigDefinition* TargetRig = TargetRigPath.IsEmpty()
+		? nullptr
+		: LoadObject<UIKRigDefinition>(nullptr, *TargetRigPath);
+	if (!SourceRigPath.IsEmpty() && !SourceRig)
+	{
+		UEditorAssetLibrary::DeleteAsset(NewAsset->GetPathName());
+		return MCPError(FString::Printf(TEXT("IKRig not found: %s"), *SourceRigPath));
+	}
+	if (!TargetRigPath.IsEmpty() && !TargetRig)
+	{
+		UEditorAssetLibrary::DeleteAsset(NewAsset->GetPathName());
+		return MCPError(FString::Printf(TEXT("IKRig not found: %s"), *TargetRigPath));
+	}
+
+	UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter);
+	if (!Controller)
+	{
+		UEditorAssetLibrary::DeleteAsset(NewAsset->GetPathName());
+		return MCPError(TEXT("IKRetargeterController unavailable"));
+	}
+
+	// The factory does not install the operational stack. AddDefaultOps is
+	// idempotent and must precede per-op rig assignment and chain mapping.
+	Controller->AddDefaultOps();
+	if (SourceRig)
+	{
+		Controller->SetIKRig(ERetargetSourceOrTarget::Source, SourceRig);
+		Controller->AssignIKRigToAllOps(ERetargetSourceOrTarget::Source, SourceRig);
+	}
+	if (TargetRig)
+	{
+		Controller->SetIKRig(ERetargetSourceOrTarget::Target, TargetRig);
+		Controller->AssignIKRigToAllOps(ERetargetSourceOrTarget::Target, TargetRig);
+	}
+	if (bAutoMap)
+	{
+		Controller->AutoMapChains(EAutoMapChainType::Exact, true);
+	}
+	Controller->CleanAsset();
+
+	if ((SourceRig && Controller->GetIKRig(ERetargetSourceOrTarget::Source) != SourceRig)
+		|| (TargetRig && Controller->GetIKRig(ERetargetSourceOrTarget::Target) != TargetRig))
+	{
+		UEditorAssetLibrary::DeleteAsset(NewAsset->GetPathName());
+		return MCPError(TEXT("IK Retargeter rig assignment failed readback validation"));
+	}
+
+	if (TargetRig)
+	{
+		for (const FBoneChain& Chain : TargetRig->GetRetargetChains())
+		{
+			if (!Controller->GetSourceChain(Chain.ChainName).IsNone()) ++ChainsMapped;
+		}
+	}
+#else
 	// Optionally set source / target IK Rigs via reflection
 	auto SetRigProperty = [&](const FString& PropName, const FString& Path) -> FString
 	{
@@ -1356,16 +1864,13 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateIKRetargeter(const TSharedPtr<F
 		return Prop->ImportText_Direct(*Export, Addr, NewAsset, PPF_None) ? TEXT("") : FString::Printf(TEXT("Failed to set %s"), *PropName);
 	};
 
-	FString SrcErr = SetRigProperty(TEXT("SourceIKRigAsset"), SourceRigPath);
-	FString TgtErr = SetRigProperty(TEXT("TargetIKRigAsset"), TargetRigPath);
+	SrcErr = SetRigProperty(TEXT("SourceIKRigAsset"), SourceRigPath);
+	TgtErr = SetRigProperty(TEXT("TargetIKRigAsset"), TargetRigPath);
 
 	// UE 5.7+ ops-stack initialization (#246). After CreateAsset the per-op
 	// IK Rig refs and chain mappings are unset, so the retargeter cannot be
 	// driven by an Anim Graph. Mirror what the Python workaround does:
 	// AssignIKRigToAllOps(SOURCE/TARGET) + AutoMapChains.
-	bool bAutoMap = OptionalBool(Params, TEXT("autoMapChains"), true);
-	int32 ChainsMapped = 0;
-	FString OpsWarning;
 	if (bAutoMap)
 	{
 		UIKRetargeter* Retargeter = Cast<UIKRetargeter>(NewAsset);
@@ -1433,9 +1938,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreateIKRetargeter(const TSharedPtr<F
 			}
 		}
 	}
+#endif
 
-	NewAsset->MarkPackageDirty();
-	UEditorAssetLibrary::SaveAsset(NewAsset->GetPathName());
+	if (!SaveAssetPackage(NewAsset))
+	{
+		const FString FailedPackage = NewAsset->GetOutermost()->GetName();
+		UEditorAssetLibrary::DeleteAsset(NewAsset->GetPathName());
+		return MCPError(FString::Printf(TEXT("Failed to save IKRetargeter package '%s'"), *FailedPackage));
+	}
 
 	auto Result = MCPSuccess();
 	MCPSetCreated(Result);
@@ -1479,6 +1989,114 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ReadIKRetargeter(const TSharedPtr<FJs
 	Result->SetStringField(TEXT("sourceRig"), SrcRig ? SrcRig->GetPathName() : TEXT(""));
 	Result->SetStringField(TEXT("targetRig"), TgtRig ? TgtRig->GetPathName() : TEXT(""));
 
+#if UE_MCP_HAS_5_8_API
+	USkeletalMesh* SourcePreviewMesh = Controller->GetPreviewMesh(ERetargetSourceOrTarget::Source);
+	USkeletalMesh* TargetPreviewMesh = Controller->GetPreviewMesh(ERetargetSourceOrTarget::Target);
+	Result->SetStringField(TEXT("sourcePreviewMesh"), SourcePreviewMesh ? SourcePreviewMesh->GetPathName() : TEXT(""));
+	Result->SetStringField(TEXT("targetPreviewMesh"), TargetPreviewMesh ? TargetPreviewMesh->GetPathName() : TEXT(""));
+
+	auto WritePoses = [&](const ERetargetSourceOrTarget Side, const TCHAR* CurrentField, const TCHAR* PosesField)
+	{
+		const FName CurrentPoseName = Controller->GetCurrentRetargetPoseName(Side);
+		Result->SetStringField(CurrentField, CurrentPoseName.ToString());
+
+		TMap<FName, FIKRetargetPose>& Poses = Controller->GetRetargetPoses(Side);
+		TArray<FName> PoseNames;
+		Poses.GetKeys(PoseNames);
+		PoseNames.Sort([](const FName& A, const FName& B)
+		{
+			return A.ToString() < B.ToString();
+		});
+
+		TArray<TSharedPtr<FJsonValue>> PosesArray;
+		for (const FName PoseName : PoseNames)
+		{
+			const FIKRetargetPose* Pose = Poses.Find(PoseName);
+			if (!Pose) continue;
+			TSharedPtr<FJsonObject> PoseObj = MakeShared<FJsonObject>();
+			PoseObj->SetStringField(TEXT("name"), PoseName.ToString());
+			PoseObj->SetBoolField(TEXT("current"), PoseName == CurrentPoseName);
+			PoseObj->SetObjectField(TEXT("rootTranslationOffset"), AnimationVectorToJson(Pose->GetRootTranslationDelta()));
+
+			TArray<FName> OffsetBones;
+			Pose->GetAllDeltaRotations().GetKeys(OffsetBones);
+			OffsetBones.Sort([](const FName& A, const FName& B)
+			{
+				return A.ToString() < B.ToString();
+			});
+
+			TArray<TSharedPtr<FJsonValue>> RotationOffsets;
+			for (const FName BoneName : OffsetBones)
+			{
+				const FQuat* Rotation = Pose->GetAllDeltaRotations().Find(BoneName);
+				if (!Rotation) continue;
+				TSharedPtr<FJsonObject> OffsetObj = MakeShared<FJsonObject>();
+				OffsetObj->SetStringField(TEXT("bone"), BoneName.ToString());
+				OffsetObj->SetObjectField(TEXT("rotationQuaternion"), AnimationQuaternionToJson(*Rotation));
+				RotationOffsets.Add(MakeShared<FJsonValueObject>(OffsetObj));
+			}
+			PoseObj->SetArrayField(TEXT("rotationOffsets"), RotationOffsets);
+			PosesArray.Add(MakeShared<FJsonValueObject>(PoseObj));
+		}
+		Result->SetArrayField(PosesField, PosesArray);
+	};
+
+	WritePoses(ERetargetSourceOrTarget::Source, TEXT("currentSourcePose"), TEXT("sourcePoses"));
+	WritePoses(ERetargetSourceOrTarget::Target, TEXT("currentTargetPose"), TEXT("targetPoses"));
+
+	TArray<TSharedPtr<FJsonValue>> RetargetOps;
+	for (int32 OpIndex = 0; OpIndex < Controller->GetNumRetargetOps(); ++OpIndex)
+	{
+		const FName OpName = Controller->GetOpName(OpIndex);
+		FInstancedStruct* OpStruct = Controller->GetRetargetOpStructAtIndex(OpIndex);
+		const UScriptStruct* OpType = OpStruct ? OpStruct->GetScriptStruct() : nullptr;
+		TSharedPtr<FJsonObject> OpObj = MakeShared<FJsonObject>();
+		OpObj->SetNumberField(TEXT("index"), OpIndex);
+		OpObj->SetStringField(TEXT("name"), OpName.ToString());
+		OpObj->SetStringField(TEXT("type"), OpType ? OpType->GetPathName() : TEXT(""));
+		OpObj->SetBoolField(TEXT("enabled"), Controller->GetRetargetOpEnabled(OpIndex));
+		OpObj->SetStringField(TEXT("parentOp"), Controller->GetParentOpByName(OpName).ToString());
+		const UIKRigDefinition* OpTargetRig = Controller->GetTargetIKRigForOp(OpName);
+		OpObj->SetStringField(TEXT("targetRig"), OpTargetRig ? OpTargetRig->GetPathName() : TEXT(""));
+
+		TArray<TSharedPtr<FJsonValue>> OpMappings;
+		if (const FRetargetChainMapping* ChainMapping = Controller->GetChainMapping(OpName))
+		{
+			for (const FRetargetChainPair& Pair : ChainMapping->GetChainPairs())
+			{
+				TSharedPtr<FJsonObject> MappingObj = MakeShared<FJsonObject>();
+				MappingObj->SetStringField(TEXT("targetChain"), Pair.TargetChainName.ToString());
+				MappingObj->SetStringField(TEXT("sourceChain"), Pair.SourceChainName.ToString());
+				OpMappings.Add(MakeShared<FJsonValueObject>(MappingObj));
+			}
+		}
+		OpObj->SetArrayField(TEXT("chainMappings"), OpMappings);
+
+		// #1000: the settings struct is what decides what an op does - the root
+		// motion source, the pelvis alphas, the per-chain FK modes - and this
+		// readout reported everything about an op except that. It is reflected,
+		// so it serialises whole and a later engine adding a field needs no
+		// change here.
+		if (const FIKRetargetOpBase* const Op = OpStruct ? OpStruct->GetPtr<FIKRetargetOpBase>() : nullptr)
+		{
+			if (const UScriptStruct* const SettingsType = Op->GetSettingsType())
+			{
+				OpObj->SetStringField(TEXT("settingsType"), SettingsType->GetPathName());
+				if (const FIKRetargetOpSettingsBase* const Settings = Op->GetSettingsConst())
+				{
+					const TSharedRef<FJsonObject> SettingsJson = MakeShared<FJsonObject>();
+					if (FJsonObjectConverter::UStructToJsonObject(SettingsType, Settings, SettingsJson, 0, 0))
+					{
+						OpObj->SetObjectField(TEXT("settings"), SettingsJson);
+					}
+				}
+			}
+		}
+		RetargetOps.Add(MakeShared<FJsonValueObject>(OpObj));
+	}
+	Result->SetArrayField(TEXT("retargetOps"), RetargetOps);
+#endif
+
 	// Chain mappings: for each target chain, report the source chain it's mapped to.
 	TArray<TSharedPtr<FJsonValue>> Mappings;
 	if (TgtRig)
@@ -1511,15 +2129,61 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreatePoseSearchDatabase(const TShare
 	FString PackagePath = OptionalString(Params, TEXT("packagePath"), TEXT("/Game/MotionMatching"));
 	if (auto Err = MCPNormalizePackagePath(PackagePath)) return Err;
 	const FString SchemaPath = OptionalString(Params, TEXT("schemaPath"), TEXT(""));
+	// #833: a database indexes THROUGH its schema, so a database whose schema
+	// is missing or unsamplable fails BuildIndex and the editor reports the
+	// database as the invalid asset. Naming a skeleton is enough to author the
+	// schema here, so the one call produces something that can actually index.
+	const FString SkeletonPath = OptionalString(Params, TEXT("skeletonPath"), TEXT(""));
+
+	// Resolve (or author) the schema BEFORE the database exists, so a bad
+	// schema argument leaves no half-built database behind.
+	UPoseSearchSchema* Schema = nullptr;
+	FString ResolvedSchemaPath = SchemaPath;
+	bool bSchemaCreated = false;
+	if (!SchemaPath.IsEmpty())
+	{
+		Schema = Cast<UPoseSearchSchema>(UEditorAssetLibrary::LoadAsset(SchemaPath));
+		if (!Schema) return MCPError(FString::Printf(TEXT("Schema not found: %s"), *SchemaPath));
+	}
+	else if (!SkeletonPath.IsEmpty())
+	{
+		ResolvedSchemaPath = PackagePath + TEXT("/") + Name + TEXT("_Schema");
+		Schema = Cast<UPoseSearchSchema>(UEditorAssetLibrary::LoadAsset(ResolvedSchemaPath));
+		if (!Schema)
+		{
+			// Same authoring routine animation(create_pose_search_schema) runs,
+			// called rather than reimplemented, so the schema this makes is the
+			// schema that action makes.
+			TSharedPtr<FJsonObject> SchemaParams = MakeShared<FJsonObject>();
+			SchemaParams->SetStringField(TEXT("name"), Name + TEXT("_Schema"));
+			SchemaParams->SetStringField(TEXT("packagePath"), PackagePath);
+			SchemaParams->SetStringField(TEXT("skeletonPath"), SkeletonPath);
+			SchemaParams->SetStringField(TEXT("onConflict"), TEXT("skip"));
+			TSharedPtr<FJsonValue> SchemaResult = CreatePoseSearchSchema(SchemaParams);
+			Schema = Cast<UPoseSearchSchema>(UEditorAssetLibrary::LoadAsset(ResolvedSchemaPath));
+			if (!Schema) return SchemaResult;
+			bSchemaCreated = true;
+		}
+	}
+
+	if (Schema)
+	{
+		const FString Problems = MCPPoseSearch::DescribeProblems(Schema);
+		if (!Problems.IsEmpty())
+		{
+			return MCPError(FString::Printf(
+				TEXT("Schema '%s' cannot index because %s. A database pointed at it fails BuildIndex and the editor ")
+				TEXT("reports the database as invalid, so no database was created."),
+				*Schema->GetPathName(), *Problems));
+		}
+	}
 
 	auto Created = MCPCreateAssetIdempotentNewObject<UPoseSearchDatabase>(Name, PackagePath, OptionalString(Params, TEXT("onConflict"), TEXT("skip")), TEXT("PoseSearchDatabase"));
 	if (Created.EarlyReturn) return Created.EarlyReturn;
 	UPoseSearchDatabase* Database = Created.Asset;
 
-	if (!SchemaPath.IsEmpty())
+	if (Schema)
 	{
-		UPoseSearchSchema* Schema = Cast<UPoseSearchSchema>(UEditorAssetLibrary::LoadAsset(SchemaPath));
-		if (!Schema) return MCPError(FString::Printf(TEXT("Schema not found: %s"), *SchemaPath));
 		Database->Schema = Schema;
 	}
 
@@ -1530,7 +2194,16 @@ TSharedPtr<FJsonValue> FAnimationHandlers::CreatePoseSearchDatabase(const TShare
 	Res->SetStringField(TEXT("path"), Database->GetPathName());
 	Res->SetStringField(TEXT("name"), Name);
 	Res->SetStringField(TEXT("packagePath"), PackagePath);
-	Res->SetStringField(TEXT("schemaPath"), SchemaPath);
+	Res->SetStringField(TEXT("schemaPath"), Schema ? Schema->GetPathName() : ResolvedSchemaPath);
+	Res->SetBoolField(TEXT("schemaCreated"), bSchemaCreated);
+	Res->SetBoolField(TEXT("indexable"), Schema != nullptr);
+	if (!Schema)
+	{
+		Res->SetStringField(TEXT("note"),
+			TEXT("This database has no schema, so it cannot be indexed and animation(add_pose_search_sequence) will ")
+			TEXT("refuse to add clips to it. Give it one with animation(set_pose_search_schema), or pass skeletonPath ")
+			TEXT("to this action and it authors the schema alongside the database."));
+	}
 	MCPSetDeleteAssetRollback(Res, Database->GetPathName());
 	return MCPResult(Res);
 }
@@ -1548,6 +2221,16 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetPoseSearchSchema(const TSharedPtr<
 
 	UPoseSearchSchema* Schema = Cast<UPoseSearchSchema>(UEditorAssetLibrary::LoadAsset(SchemaPath));
 	if (!Schema) return MCPError(FString::Printf(TEXT("Schema not found: %s"), *SchemaPath));
+	// #833: assigning a schema that cannot index converts a database that was
+	// merely empty into one the editor reports as invalid.
+	const FString SchemaProblems = MCPPoseSearch::DescribeProblems(Schema);
+	if (!SchemaProblems.IsEmpty())
+	{
+		return MCPError(FString::Printf(
+			TEXT("Schema '%s' cannot index because %s. It was not assigned, because a database using it fails ")
+			TEXT("BuildIndex and the editor then reports the database as the invalid asset."),
+			*SchemaPath, *SchemaProblems));
+	}
 
 	const FString PrevSchemaPath = Database->Schema ? Database->Schema->GetPathName() : FString();
 	Database->Modify();
@@ -1588,10 +2271,22 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddPoseSearchSequence(const TSharedPt
 		return MCPError(FString::Printf(TEXT("Animation asset type not supported by PoseSearch: %s"), *AnimAsset->GetClass()->GetName()));
 	}
 
+	// #833: clips are only meaningful once the database can index them. A
+	// database that carries clips with no usable schema is the exact asset the
+	// editor rejects, so the clip write is refused rather than saved.
+	{
+		const FString Refusal = MCPPoseSearch::DescribeClipRefusal(Database->Schema, AssetPath);
+		if (!Refusal.IsEmpty()) return MCPError(Refusal);
+	}
+
 	// #684: optional per-clip flags (mirror / disableReselection / samplingRange / enabled).
 	const FPoseSearchClipFlags Flags = ParsePoseSearchClipFlags(Params);
 
 	const int32 PrevCount = GetPoseSearchAnimationAssetCount(Database);
+	// Captured before the append, because the inverse of "append one clip" is
+	// "put the whole list back": there is no remove-by-index action.
+	int32 DroppedClipCount = 0;
+	TArray<TSharedPtr<FJsonValue>> PrevClips = CapturePoseSearchClips(Database, DroppedClipCount);
 	Database->Modify();
 	FString AddError;
 	if (!AddPoseSearchAnimationAsset(Database, AnimAsset, Flags, AddError))
@@ -1610,6 +2305,22 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AddPoseSearchSequence(const TSharedPt
 	Res->SetNumberField(TEXT("previousCount"), PrevCount);
 	Res->SetNumberField(TEXT("newCount"), NewCount);
 	Res->SetNumberField(TEXT("addedIndex"), NewCount - 1);
+
+	// set_pose_search_clips with clearExisting replaces the whole list, so
+	// replaying the captured list drops the clip this call appended and leaves
+	// every other clip with the flags it had.
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetArrayField(TEXT("clips"), PrevClips);
+	Rollback->SetBoolField(TEXT("clearExisting"), true);
+	MCPSetRollback(Res, TEXT("set_pose_search_clips"), Rollback);
+	Res->SetNumberField(TEXT("rollbackDroppedClipCount"), DroppedClipCount);
+	Res->SetBoolField(TEXT("rollbackLossy"), true);
+	Res->SetStringField(TEXT("rollbackNote"), FString::Printf(
+		TEXT("The replay rebuilds the clip list from scratch, so every clip is re-added in the captured order with the captured enabled / disableReselection / mirror / sampling-range flags. ")
+		TEXT("%d entr(ies) held no animation asset and cannot be described to set_pose_search_clips, so the replay does not bring them back. ")
+		TEXT("A database index built over the old list is not restored: run animation(build_pose_search_index) after the rollback."),
+		DroppedClipCount));
 	return MCPResult(Res);
 }
 
@@ -1633,8 +2344,20 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetPoseSearchClips(const TSharedPtr<F
 		return MCPError(TEXT("Missing required parameter 'clips' (array of {sequencePath, mirror?, disableReselection?, sampleStart?, sampleEnd?, enabled?})"));
 	}
 
+	// #833: clips are only meaningful once the database can index them. A
+	// database that carries clips with no usable schema is the exact asset the
+	// editor rejects, so the clip write is refused rather than saved.
+	{
+		const FString Refusal = MCPPoseSearch::DescribeClipRefusal(Database->Schema, AssetPath);
+		if (!Refusal.IsEmpty()) return MCPError(Refusal);
+	}
+
 	const bool bClearExisting = OptionalBool(Params, TEXT("clearExisting"), true);
 	const int32 PrevCount = GetPoseSearchAnimationAssetCount(Database);
+	// Captured before anything is cleared or appended: this action's own inverse
+	// is itself, replaying the list that was there.
+	int32 DroppedClipCount = 0;
+	TArray<TSharedPtr<FJsonValue>> PrevClips = CapturePoseSearchClips(Database, DroppedClipCount);
 
 	// Resolve every clip up front so a bad path fails the whole call before mutating.
 	struct FResolvedClip { UObject* Asset; FPoseSearchClipFlags Flags; FString Path; };
@@ -1709,6 +2432,19 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetPoseSearchClips(const TSharedPtr<F
 	Res->SetNumberField(TEXT("addedCount"), Added.Num());
 	Res->SetNumberField(TEXT("newCount"), GetPoseSearchAnimationAssetCount(Database));
 	Res->SetArrayField(TEXT("addedAssets"), Added);
+
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("assetPath"), AssetPath);
+	Rollback->SetArrayField(TEXT("clips"), PrevClips);
+	Rollback->SetBoolField(TEXT("clearExisting"), true);
+	MCPSetRollback(Res, TEXT("set_pose_search_clips"), Rollback);
+	Res->SetNumberField(TEXT("rollbackDroppedClipCount"), DroppedClipCount);
+	Res->SetBoolField(TEXT("rollbackLossy"), true);
+	Res->SetStringField(TEXT("rollbackNote"), FString::Printf(
+		TEXT("The replay rebuilds the clip list from scratch with the captured enabled / disableReselection / mirror / sampling-range flags per clip. ")
+		TEXT("%d entr(ies) held no animation asset and cannot be described to set_pose_search_clips, so the replay does not bring them back. ")
+		TEXT("A database index built over the old list is not restored: run animation(build_pose_search_index) after the rollback."),
+		DroppedClipCount));
 	return MCPResult(Res);
 }
 
@@ -1728,7 +2464,8 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BuildPoseSearchIndex(const TSharedPtr
 	const ERequestAsyncBuildFlag Flag = bWait
 		? (ERequestAsyncBuildFlag::NewRequest | ERequestAsyncBuildFlag::WaitForCompletion)
 		: ERequestAsyncBuildFlag::NewRequest;
-#if UE_MCP_HAS_POSESEARCH_DATABASE_ASSET_API
+	// RequestAsyncBuildIndex returns EAsyncBuildIndexResult on 5.4 through 5.8
+	// alike; only the clip-list accessors moved, and they are gated separately.
 	const EAsyncBuildIndexResult Result = FAsyncPoseSearchDatabasesManagement::RequestAsyncBuildIndex(Database, Flag);
 
 	FString ResultStr;
@@ -1739,10 +2476,6 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BuildPoseSearchIndex(const TSharedPtr
 		case EAsyncBuildIndexResult::InProgress: ResultStr = TEXT("InProgress"); bSuccess = true; break;
 		case EAsyncBuildIndexResult::Failed:     ResultStr = TEXT("Failed"); break;
 	}
-#else
-	const bool bSuccess = FAsyncPoseSearchDatabasesManagement::RequestAsyncBuildIndex(Database, Flag);
-	const FString ResultStr = bSuccess ? TEXT("Success") : TEXT("Failed");
-#endif
 
 	UEditorAssetLibrary::SaveLoadedAsset(Database);
 
@@ -1753,6 +2486,10 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BuildPoseSearchIndex(const TSharedPtr
 	Res->SetStringField(TEXT("result"), ResultStr);
 	Res->SetBoolField(TEXT("waitedForCompletion"), bWait);
 	Res->SetNumberField(TEXT("animationAssetCount"), GetPoseSearchAnimationAssetCount(Database));
+	Res->SetBoolField(TEXT("rollbackPossible"), false);
+	Res->SetStringField(TEXT("rollbackNote"),
+		TEXT("Building the index writes derived data computed from the schema and the clip list. There is no inverse action: nothing unbuilds an index, ")
+		TEXT("and the index it replaced was derived data too, so it is not addressable to put back. Rebuilding from the restored inputs is the recovery."));
 	return MCPResult(Res);
 }
 
@@ -1844,6 +2581,10 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetIKRigMesh(const TSharedPtr<FJsonOb
 {
 	FString RigPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("rigPath"), TEXT("assetPath"), RigPath)) return Err;
+	if (MCPIsProtectedAssetPath(RigPath))
+	{
+		return MCPError(FString::Printf(TEXT("Protected asset cannot be modified: %s"), *RigPath));
+	}
 	FString MeshPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("meshPath"), TEXT("skeletalMesh"), MeshPath)) return Err;
 
@@ -1854,14 +2595,33 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetIKRigMesh(const TSharedPtr<FJsonOb
 
 	UIKRigController* Controller = UIKRigController::GetController(IKRig);
 	if (!Controller) return MCPError(TEXT("IKRigController unavailable"));
+	USkeletalMesh* PrevMesh = Controller->GetSkeletalMesh();
+	const FString PrevMeshPath = PrevMesh ? PrevMesh->GetPathName() : FString();
 	const bool bOk = Controller->SetSkeletalMesh(Mesh);
 	SaveAssetPackage(IKRig);
 
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("unchanged"), PrevMesh == Mesh);
 	Result->SetStringField(TEXT("rigPath"), IKRig->GetPathName());
 	Result->SetStringField(TEXT("skeletalMesh"), Mesh->GetPathName());
+	Result->SetStringField(TEXT("previousSkeletalMesh"), PrevMeshPath);
 	Result->SetBoolField(TEXT("applied"), bOk);
+
+	if (!PrevMeshPath.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("rigPath"), IKRig->GetPathName());
+		Rollback->SetStringField(TEXT("meshPath"), PrevMeshPath);
+		MCPSetRollback(Result, TEXT("set_ik_rig_mesh"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The rig had no skeletal mesh before this call. set_ik_rig_mesh requires a meshPath and cannot clear one, so there is no call that returns the rig to having none."));
+	}
 	return MCPResult(Result);
 }
 
@@ -1880,9 +2640,18 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetIKRetargeterRig(const TSharedPtr<F
 {
 	FString RetargeterPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("retargeterPath"), TEXT("assetPath"), RetargeterPath)) return Err;
+	if (MCPIsProtectedAssetPath(RetargeterPath))
+	{
+		return MCPError(FString::Printf(TEXT("Protected asset cannot be modified: %s"), *RetargeterPath));
+	}
 	FString RigPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("rigPath"), TEXT("ikRig"), RigPath)) return Err;
 	const FString Side = OptionalString(Params, TEXT("side"), TEXT("target"));
+	if (!Side.Equals(TEXT("source"), ESearchCase::IgnoreCase)
+		&& !Side.Equals(TEXT("target"), ESearchCase::IgnoreCase))
+	{
+		return MCPError(TEXT("'side' must be 'source' or 'target'"));
+	}
 
 	UIKRetargeter* Retargeter = LoadObject<UIKRetargeter>(nullptr, *RetargeterPath);
 	if (!Retargeter) return MCPError(FString::Printf(TEXT("IKRetargeter not found: %s"), *RetargeterPath));
@@ -1891,30 +2660,145 @@ TSharedPtr<FJsonValue> FAnimationHandlers::SetIKRetargeterRig(const TSharedPtr<F
 
 	UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter);
 	if (!Controller) return MCPError(TEXT("IKRetargeterController unavailable"));
-	Controller->SetIKRig(ParseSourceOrTarget(Side), IKRig);
-	SaveAssetPackage(Retargeter);
+	const ERetargetSourceOrTarget SourceOrTarget = ParseSourceOrTarget(Side);
+	// Read the rig this side already carries before the transaction opens: it is
+	// the only value an inverse call can put back.
+	const UIKRigDefinition* PrevRig = Controller->GetIKRig(SourceOrTarget);
+	const FString PrevRigPath = PrevRig ? PrevRig->GetPathName() : FString();
+	bool bAssignmentFailed = false;
+	{
+		const FScopedTransaction Transaction(NSLOCTEXT("UE_MCP", "SetIKRetargeterRig", "Set IK Retargeter Rig"));
+		Retargeter->Modify();
+#if UE_MCP_HAS_5_8_API
+		if (Controller->GetNumRetargetOps() == 0)
+		{
+			Controller->AddDefaultOps();
+		}
+		Controller->SetIKRig(SourceOrTarget, IKRig);
+		Controller->AssignIKRigToAllOps(SourceOrTarget, IKRig);
+		Controller->CleanAsset();
+#else
+		Controller->SetIKRig(SourceOrTarget, IKRig);
+#endif
+		bAssignmentFailed = Controller->GetIKRig(SourceOrTarget) != IKRig;
+	}
+	if (bAssignmentFailed)
+	{
+		const bool bRolledBack = GEditor && GEditor->UndoTransaction();
+		return MCPError(bRolledBack
+			? TEXT("IK Retargeter rig assignment failed readback validation and was rolled back")
+			: TEXT("IK Retargeter rig assignment failed readback validation and could not be rolled back"));
+	}
+	if (!SaveAssetPackage(Retargeter))
+	{
+		const bool bRolledBack = GEditor && GEditor->UndoTransaction();
+		return MCPError(bRolledBack
+			? TEXT("IK Retargeter rig assignment could not be saved and was rolled back")
+			: TEXT("IK Retargeter rig assignment could not be saved and the editor transaction could not be rolled back"));
+	}
 
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("retargeterPath"), Retargeter->GetPathName());
 	Result->SetStringField(TEXT("side"), Side.ToLower());
 	Result->SetStringField(TEXT("ikRig"), IKRig->GetPathName());
+	Result->SetStringField(TEXT("previousIkRig"), PrevRigPath);
+	Result->SetBoolField(TEXT("unchanged"), PrevRig == IKRig);
+
+	if (!PrevRigPath.IsEmpty())
+	{
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("retargeterPath"), Retargeter->GetPathName());
+		Rollback->SetStringField(TEXT("rigPath"), PrevRigPath);
+		Rollback->SetStringField(TEXT("side"), Side.ToLower());
+		MCPSetRollback(Result, TEXT("set_ik_retargeter_rig"), Rollback);
+#if UE_MCP_HAS_5_8_API
+		// On 5.8 this action installs the default op stack when there is none and
+		// runs CleanAsset. Reassigning the old rig does not uninstall those ops,
+		// nor restore chain mappings CleanAsset dropped as unresolvable.
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The replay puts the previous IK Rig back on this side. It does not remove a default retarget op stack this call installed, and chain mappings that CleanAsset dropped against the new rig are not restored: re-run animation(configure_ik_retargeter) with autoMapMode to rebuild them."));
+#else
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+#endif
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("This side carried no IK Rig before the call. set_ik_retargeter_rig requires a rigPath and cannot clear an assignment, so there is no call that returns the side to unassigned."));
+	}
 	return MCPResult(Result);
 }
+
+#if UE_MCP_HAS_5_8_API
+// The retargeter's current pose on one side, in the shape configure_ik_retargeter
+// accepts as its `pose` parameter. A whole-pose write is reversible only because
+// that action selects the pose, resets it, and replays per-bone rotation offsets
+// in that order, which is exactly a restore of what is captured here.
+static TSharedPtr<FJsonObject> CaptureRetargetPosePayload(
+	UIKRetargeterController* Controller,
+	const ERetargetSourceOrTarget Side,
+	const FString& SideName)
+{
+	const FName PoseName = Controller->GetCurrentRetargetPoseName(Side);
+	TMap<FName, FIKRetargetPose>& Poses = Controller->GetRetargetPoses(Side);
+	const FIKRetargetPose* Pose = Poses.Find(PoseName);
+	if (!Pose) return nullptr;
+
+	TSharedPtr<FJsonObject> PoseJson = MakeShared<FJsonObject>();
+	PoseJson->SetStringField(TEXT("side"), SideName);
+	PoseJson->SetStringField(TEXT("name"), PoseName.ToString());
+	PoseJson->SetBoolField(TEXT("reset"), true);
+
+	TArray<TSharedPtr<FJsonValue>> Offsets;
+	for (const TPair<FName, FQuat>& Delta : Pose->GetAllDeltaRotations())
+	{
+		TSharedPtr<FJsonObject> Offset = MakeShared<FJsonObject>();
+		Offset->SetStringField(TEXT("bone"), Delta.Key.ToString());
+		// configure_ik_retargeter rejects a quaternion that is not normalized
+		// within 1e-4, so normalize on the way out rather than on replay.
+		Offset->SetObjectField(TEXT("rotationQuaternion"), AnimationQuaternionToJson(Delta.Value.GetNormalized()));
+		Offsets.Add(MakeShared<FJsonValueObject>(Offset));
+	}
+	PoseJson->SetArrayField(TEXT("rotationOffsets"), Offsets);
+	PoseJson->SetNumberField(TEXT("rootOffsetZ"), Pose->GetRootTranslationDelta().Z);
+	return PoseJson;
+}
+#endif
 
 // ─── #701 auto_align_retarget_pose ──────────────────────────────────
 TSharedPtr<FJsonValue> FAnimationHandlers::AutoAlignRetargetPose(const TSharedPtr<FJsonObject>& Params)
 {
 	FString RetargeterPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("retargeterPath"), TEXT("assetPath"), RetargeterPath)) return Err;
+	if (MCPIsProtectedAssetPath(RetargeterPath))
+	{
+		return MCPError(FString::Printf(TEXT("Protected asset cannot be modified: %s"), *RetargeterPath));
+	}
 	const FString Side = OptionalString(Params, TEXT("side"), TEXT("target"));
+	// ParseSourceOrTarget maps anything that is not 'source' to Target, so an
+	// unrecognised side used to succeed silently and then be echoed into a
+	// rollback payload whose reader accepts only the two names. Refuse it here,
+	// the way set_ik_retargeter_rig does.
+	if (!Side.Equals(TEXT("source"), ESearchCase::IgnoreCase)
+		&& !Side.Equals(TEXT("target"), ESearchCase::IgnoreCase))
+	{
+		return MCPError(TEXT("'side' must be 'source' or 'target'"));
+	}
 
 	UIKRetargeter* Retargeter = LoadObject<UIKRetargeter>(nullptr, *RetargeterPath);
 	if (!Retargeter) return MCPError(FString::Printf(TEXT("IKRetargeter not found: %s"), *RetargeterPath));
 	UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter);
 	if (!Controller) return MCPError(TEXT("IKRetargeterController unavailable"));
 
-	Controller->AutoAlignAllBones(ParseSourceOrTarget(Side));
+	const ERetargetSourceOrTarget AlignSide = ParseSourceOrTarget(Side);
+#if UE_MCP_HAS_5_8_API
+	// Captured before the align overwrites every bone's delta rotation.
+	TSharedPtr<FJsonObject> PrevPose = CaptureRetargetPosePayload(Controller, AlignSide, Side.ToLower());
+#endif
+	Controller->AutoAlignAllBones(AlignSide);
 	SaveAssetPackage(Retargeter);
 
 	auto Result = MCPSuccess();
@@ -1922,6 +2806,37 @@ TSharedPtr<FJsonValue> FAnimationHandlers::AutoAlignRetargetPose(const TSharedPt
 	Result->SetStringField(TEXT("retargeterPath"), Retargeter->GetPathName());
 	Result->SetStringField(TEXT("side"), Side.ToLower());
 	Result->SetStringField(TEXT("method"), TEXT("ChainToChain"));
+
+#if UE_MCP_HAS_5_8_API
+	if (PrevPose.IsValid())
+	{
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("retargeterPath"), Retargeter->GetPathName());
+		// configure_ik_retargeter defaults ensureDefaultOps to TRUE, which would
+		// make a pose restore install a default retarget op stack on a retargeter
+		// that has none, or fail outright on a partial non-default stack. This
+		// rollback is about the pose and nothing else, so it says so.
+		Rollback->SetBoolField(TEXT("ensureDefaultOps"), false);
+		Rollback->SetObjectField(TEXT("pose"), PrevPose);
+		MCPSetRollback(Result, TEXT("configure_ik_retargeter"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The replay resets the pose and writes back every captured per-bone rotation offset plus the root offset's Z. ")
+			TEXT("The root translation offset's X and Y are not restored, because configure_ik_retargeter authors rootOffsetZ only. ")
+			TEXT("configure_ik_retargeter also runs CleanAsset on every call, which drops chain mappings it cannot resolve; rebuild them with the same action's autoMapMode if any go missing."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The retargeter has no retarget pose under the current pose name, so there were no offsets to capture and nothing for an inverse call to restore."));
+	}
+#else
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Auto-alignment overwrites every bone's delta rotation in the retarget pose. Writing them back needs animation(configure_ik_retargeter), which requires Unreal Engine 5.8, ")
+		TEXT("so on this engine there is no action that can replay them."));
+#endif
 	return MCPResult(Result);
 }
 
@@ -1930,7 +2845,20 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ResetRetargetPose(const TSharedPtr<FJ
 {
 	FString RetargeterPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("retargeterPath"), TEXT("assetPath"), RetargeterPath)) return Err;
+	if (MCPIsProtectedAssetPath(RetargeterPath))
+	{
+		return MCPError(FString::Printf(TEXT("Protected asset cannot be modified: %s"), *RetargeterPath));
+	}
 	const FString Side = OptionalString(Params, TEXT("side"), TEXT("target"));
+	// ParseSourceOrTarget maps anything that is not 'source' to Target, so an
+	// unrecognised side used to succeed silently and then be echoed into a
+	// rollback payload whose reader accepts only the two names. Refuse it here,
+	// the way set_ik_retargeter_rig does.
+	if (!Side.Equals(TEXT("source"), ESearchCase::IgnoreCase)
+		&& !Side.Equals(TEXT("target"), ESearchCase::IgnoreCase))
+	{
+		return MCPError(TEXT("'side' must be 'source' or 'target'"));
+	}
 
 	UIKRetargeter* Retargeter = LoadObject<UIKRetargeter>(nullptr, *RetargeterPath);
 	if (!Retargeter) return MCPError(FString::Printf(TEXT("IKRetargeter not found: %s"), *RetargeterPath));
@@ -1939,6 +2867,10 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ResetRetargetPose(const TSharedPtr<FJ
 
 	const ERetargetSourceOrTarget SoT = ParseSourceOrTarget(Side);
 	const FName CurrentPose = Controller->GetCurrentRetargetPoseName(SoT);
+#if UE_MCP_HAS_5_8_API
+	// Captured before the reset clears every offset the pose held.
+	TSharedPtr<FJsonObject> PrevPose = CaptureRetargetPosePayload(Controller, SoT, Side.ToLower());
+#endif
 	Controller->ResetRetargetPose(CurrentPose, TArray<FName>(), SoT);
 	SaveAssetPackage(Retargeter);
 
@@ -1947,12 +2879,50 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ResetRetargetPose(const TSharedPtr<FJ
 	Result->SetStringField(TEXT("retargeterPath"), Retargeter->GetPathName());
 	Result->SetStringField(TEXT("side"), Side.ToLower());
 	Result->SetStringField(TEXT("pose"), CurrentPose.ToString());
+
+#if UE_MCP_HAS_5_8_API
+	if (PrevPose.IsValid())
+	{
+		TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+		Rollback->SetStringField(TEXT("retargeterPath"), Retargeter->GetPathName());
+		// configure_ik_retargeter defaults ensureDefaultOps to TRUE, which would
+		// make a pose restore install a default retarget op stack on a retargeter
+		// that has none, or fail outright on a partial non-default stack. This
+		// rollback is about the pose and nothing else, so it says so.
+		Rollback->SetBoolField(TEXT("ensureDefaultOps"), false);
+		Rollback->SetObjectField(TEXT("pose"), PrevPose);
+		MCPSetRollback(Result, TEXT("configure_ik_retargeter"), Rollback);
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The replay writes back every captured per-bone rotation offset plus the root offset's Z. ")
+			TEXT("The root translation offset's X and Y are not restored, because configure_ik_retargeter authors rootOffsetZ only. ")
+			TEXT("configure_ik_retargeter also runs CleanAsset on every call, which drops chain mappings it cannot resolve; rebuild them with the same action's autoMapMode if any go missing."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The retargeter has no retarget pose under the current pose name, so there were no offsets to capture and nothing for an inverse call to restore."));
+	}
+#else
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("The reset clears every bone offset the pose held. Writing them back needs animation(configure_ik_retargeter), which requires Unreal Engine 5.8, ")
+		TEXT("so on this engine there is no action that can replay them."));
+#endif
 	return MCPResult(Result);
 }
 
 // ─── #701 batch_retarget_animations ─────────────────────────────────
 TSharedPtr<FJsonValue> FAnimationHandlers::BatchRetargetAnimations(const TSharedPtr<FJsonObject>& Params)
 {
+#if !(ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8))
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), false);
+	Result->SetStringField(TEXT("errorCode"), TEXT("unsupported_engine_version"));
+	Result->SetStringField(TEXT("error"), TEXT("batch_retarget_animations requires Unreal Engine 5.8 or newer"));
+	return MCPResult(Result);
+#else
 	FString RetargeterPath;
 	if (auto Err = RequireStringAlt(Params, TEXT("retargeterPath"), TEXT("assetPath"), RetargeterPath)) return Err;
 	FString SourceMeshPath, TargetMeshPath;
@@ -1965,6 +2935,46 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BatchRetargetAnimations(const TShared
 	if (!SourceMesh) return MCPError(FString::Printf(TEXT("Source mesh not found: %s"), *SourceMeshPath));
 	USkeletalMesh* TargetMesh = LoadObject<USkeletalMesh>(nullptr, *TargetMeshPath);
 	if (!TargetMesh) return MCPError(FString::Printf(TEXT("Target mesh not found: %s"), *TargetMeshPath));
+	if (SourceMesh == TargetMesh) return MCPError(TEXT("sourceMesh and targetMesh must be different"));
+	if (OptionalBool(Params, TEXT("overwrite"), false))
+	{
+		return MCPError(TEXT("overwrite=true is not supported; choose a new output name/path so existing assets are never replaced"));
+	}
+
+	bool bMappingInspectionAvailable = false;
+	int32 TargetChainCount = 0;
+	int32 MappedChainCount = 0;
+	TArray<TSharedPtr<FJsonValue>> UnmappedTargetChains;
+	if (UIKRetargeterController* Controller = UIKRetargeterController::GetController(Retargeter))
+	{
+		if (const UIKRigDefinition* TargetRig = Controller->GetIKRig(ERetargetSourceOrTarget::Target))
+		{
+			bMappingInspectionAvailable = true;
+			for (const FBoneChain& TargetChain : TargetRig->GetRetargetChains())
+			{
+				++TargetChainCount;
+				if (Controller->GetSourceChain(TargetChain.ChainName).IsNone())
+				{
+					UnmappedTargetChains.Add(MakeShared<FJsonValueString>(TargetChain.ChainName.ToString()));
+				}
+				else
+				{
+					++MappedChainCount;
+				}
+			}
+		}
+	}
+	const bool bRequireCompleteMapping = OptionalBool(Params, TEXT("requireCompleteMapping"), false);
+	if (bRequireCompleteMapping && !bMappingInspectionAvailable)
+	{
+		return MCPError(TEXT("Cannot verify complete mapping because the retargeter has no target IK Rig"));
+	}
+	if (bRequireCompleteMapping && !UnmappedTargetChains.IsEmpty())
+	{
+		return MCPError(FString::Printf(
+			TEXT("Retargeter has %d unmapped target chain(s) and requireCompleteMapping=true"),
+			UnmappedTargetChains.Num()));
+	}
 
 	const TArray<TSharedPtr<FJsonValue>>* AnimArr = nullptr;
 	if (!Params->TryGetArrayField(TEXT("animPaths"), AnimArr) || !AnimArr || AnimArr->Num() == 0)
@@ -1972,40 +2982,123 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BatchRetargetAnimations(const TShared
 		return MCPError(TEXT("Missing 'animPaths' (array of AnimSequence paths to retarget)"));
 	}
 
-	// The FIKRetargetBatchOperationInputs / UIKRetargetBatchOperation::RunBatchRetarget
-	// batch API is UE 5.8+. The 5.7 batch-retarget API differs; rather than a
-	// partial reimplementation, return a clear error below 5.8.
-#if !(ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8))
-	return MCPError(TEXT("batch_retarget_animations requires UE 5.8+ (the FIKRetargetBatchOperationInputs / RunBatchRetarget API is unavailable in this engine version)."));
-#else
 	FIKRetargetBatchOperationInputs Inputs;
 	Inputs.SourceMesh = SourceMesh;
 	Inputs.TargetMesh = TargetMesh;
 	Inputs.IKRetargetAsset = Retargeter;
-	Inputs.bOverwriteExistingFiles = OptionalBool(Params, TEXT("overwrite"), false);
+	Inputs.bOverwriteExistingFiles = false;
+	Inputs.bIncludeReferencedAssets = false;
 	Inputs.Prefix = OptionalString(Params, TEXT("prefix"));
 	Inputs.Suffix = OptionalString(Params, TEXT("suffix"), TEXT("_Retargeted"));
 	const FString TargetPath = OptionalString(Params, TEXT("outputPath"));
+	if (!TargetPath.IsEmpty() && MCPIsProtectedAssetPath(TargetPath))
+	{
+		return MCPError(FString::Printf(TEXT("Protected output path is not allowed: %s"), *TargetPath));
+	}
 	if (TargetPath.IsEmpty()) { Inputs.bUseSourcePath = true; }
 	else { Inputs.TargetPath = TargetPath; }
 
+	TSet<FString> SeenPaths;
 	int32 Loaded = 0;
-	for (const TSharedPtr<FJsonValue>& V : *AnimArr)
+	for (int32 Index = 0; Index < AnimArr->Num(); ++Index)
 	{
+		const TSharedPtr<FJsonValue>& V = (*AnimArr)[Index];
 		FString P;
-		if (!V->TryGetString(P) || P.IsEmpty()) continue;
-		if (UAnimSequence* Anim = LoadObject<UAnimSequence>(nullptr, *P))
+		if (!V.IsValid() || !V->TryGetString(P) || P.IsEmpty())
 		{
-			Inputs.AssetsToRetarget.Add(FAssetData(Anim));
-			++Loaded;
+			return MCPError(FString::Printf(TEXT("animPaths[%d] must be a non-empty AnimSequence asset path"), Index));
 		}
+		if (SeenPaths.Contains(P))
+		{
+			return MCPError(FString::Printf(TEXT("Duplicate animPaths entry: %s"), *P));
+		}
+		if (TargetPath.IsEmpty() && MCPIsProtectedAssetPath(P))
+		{
+			return MCPError(FString::Printf(TEXT("Cannot create a retargeted asset beside protected source path: %s"), *P));
+		}
+		UAnimSequence* Anim = LoadObject<UAnimSequence>(nullptr, *P);
+		if (!Anim)
+		{
+			return MCPError(FString::Printf(TEXT("AnimSequence not found: %s"), *P));
+		}
+		if (!SourceMesh->GetSkeleton() || !Anim->GetSkeleton()
+			|| !SourceMesh->GetSkeleton()->IsCompatibleForEditor(Anim->GetSkeleton()))
+		{
+			return MCPError(FString::Printf(
+				TEXT("AnimSequence skeleton is incompatible with sourceMesh: %s"), *P));
+		}
+		SeenPaths.Add(P);
+		Inputs.AssetsToRetarget.Add(FAssetData(Anim));
+		++Loaded;
 	}
-	if (Loaded == 0) return MCPError(TEXT("No valid AnimSequences resolved from animPaths"));
+
+	FScopedBatchRetargetEditorInstanceRestore RestoreEditorInstances(Retargeter);
+	FIKRetargetProcessor ValidationProcessor;
+	FRetargetInitParameters ValidationParameters;
+	ValidationParameters.SourceSkeletalMesh = SourceMesh;
+	ValidationParameters.TargetSkeletalMesh = TargetMesh;
+	ValidationParameters.RetargeterAsset = Retargeter;
+	ValidationParameters.bSuppressWarnings = false;
+	ValidationProcessor.Initialize(ValidationParameters);
+	const TArray<FText> ValidationErrors = ValidationProcessor.Log.GetErrors();
+	if (!ValidationProcessor.IsInitialized() || !ValidationErrors.IsEmpty())
+	{
+		return MCPError(!ValidationErrors.IsEmpty()
+			? FString::Printf(TEXT("IK Retargeter processor validation failed: %s"), *ValidationErrors[0].ToString())
+			: TEXT("IK Retargeter processor validation failed to initialize"));
+	}
 
 	const TArray<FAssetData> Created = UIKRetargetBatchOperation::RunBatchRetarget(Inputs);
+	auto DeleteCreatedAssets = [&Created]()
+	{
+		TArray<FString> ResidualPaths;
+		for (const FAssetData& AssetData : Created)
+		{
+			const FString ObjectPath = AssetData.GetObjectPathString();
+			if (ObjectPath.IsEmpty())
+			{
+				ResidualPaths.Add(TEXT("<unknown output path>"));
+				continue;
+			}
+			UEditorAssetLibrary::DeleteAsset(ObjectPath);
+			if (UEditorAssetLibrary::DoesAssetExist(ObjectPath)) ResidualPaths.Add(ObjectPath);
+		}
+		return ResidualPaths;
+	};
+	if (Created.Num() != Loaded)
+	{
+		const TArray<FString> ResidualPaths = DeleteCreatedAssets();
+		if (!ResidualPaths.IsEmpty())
+		{
+			return MCPError(FString::Printf(
+				TEXT("Batch retarget created %d of %d requested assets and cleanup failed for: %s"),
+				Created.Num(), Loaded, *FString::Join(ResidualPaths, TEXT(", "))));
+		}
+		return MCPError(FString::Printf(
+			TEXT("Batch retarget created %d of %d requested assets; all new outputs were deleted"),
+			Created.Num(), Loaded));
+	}
 
 	TArray<TSharedPtr<FJsonValue>> OutPaths;
-	for (const FAssetData& AD : Created) OutPaths.Add(MakeShared<FJsonValueString>(AD.GetObjectPathString()));
+	for (const FAssetData& AD : Created)
+	{
+		UObject* CreatedAsset = AD.GetAsset();
+		if (!CreatedAsset || !SaveAssetPackage(CreatedAsset))
+		{
+			const FString FailedPath = AD.GetObjectPathString();
+			const TArray<FString> ResidualPaths = DeleteCreatedAssets();
+			if (!ResidualPaths.IsEmpty())
+			{
+				return MCPError(FString::Printf(
+					TEXT("Failed to save retargeted asset '%s' and cleanup failed for: %s"),
+					*FailedPath, *FString::Join(ResidualPaths, TEXT(", "))));
+			}
+			return MCPError(FString::Printf(
+				TEXT("Failed to save retargeted asset '%s'; all new outputs were deleted"),
+				*FailedPath));
+		}
+		OutPaths.Add(MakeShared<FJsonValueString>(AD.GetObjectPathString()));
+	}
 
 	auto Result = MCPSuccess();
 	MCPSetCreated(Result);
@@ -2013,6 +3106,25 @@ TSharedPtr<FJsonValue> FAnimationHandlers::BatchRetargetAnimations(const TShared
 	Result->SetNumberField(TEXT("requested"), Loaded);
 	Result->SetNumberField(TEXT("createdCount"), OutPaths.Num());
 	Result->SetArrayField(TEXT("createdAssets"), OutPaths);
+	Result->SetBoolField(TEXT("includedReferencedAssets"), false);
+	Result->SetBoolField(TEXT("requireCompleteMapping"), bRequireCompleteMapping);
+	Result->SetBoolField(TEXT("mappingInspectionAvailable"), bMappingInspectionAvailable);
+	if (bMappingInspectionAvailable)
+	{
+		Result->SetNumberField(TEXT("targetChainCount"), TargetChainCount);
+		Result->SetNumberField(TEXT("mappedChainCount"), MappedChainCount);
+		Result->SetArrayField(TEXT("unmappedTargetChains"), UnmappedTargetChains);
+		Result->SetBoolField(TEXT("mappingComplete"), UnmappedTargetChains.IsEmpty());
+		if (!UnmappedTargetChains.IsEmpty())
+		{
+			Result->SetStringField(TEXT("mappingWarning"), FString::Printf(
+				TEXT("Retarget completed with %d unmapped target chain(s); inspect deformation and compare sampled poses before accepting the output"),
+				UnmappedTargetChains.Num()));
+		}
+	}
+	TSharedPtr<FJsonObject> RollbackPayload = MakeShared<FJsonObject>();
+	RollbackPayload->SetArrayField(TEXT("assetPaths"), OutPaths);
+	MCPSetRollback(Result, TEXT("delete_asset_batch"), RollbackPayload);
 	return MCPResult(Result);
 #endif
 }

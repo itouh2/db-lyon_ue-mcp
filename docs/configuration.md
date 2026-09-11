@@ -125,13 +125,40 @@ To turn it off entirely, set `nativeTools.enabled: false` (the `epic` gateway st
 
 The feedback approval mode (`interactive` / `auto-approve` / `defer`) is intentionally **not** in `ue-mcp.yml` - it varies per developer and per machine, so it lives in `~/.ue-mcp/state.json` and is managed with `npx ue-mcp feedback mode ...` or the `UE_MCP_FEEDBACK_MODE` env var. See [Feedback → modes](feedback.md#feedback-modes).
 
+### Dialog handling mode
+
+A modal dialog blocks Unreal's game thread, so every action is refused until it is answered. One guard per editor enforces that, and every route to the editor passes it, including each step of a running flow and the first call the server makes. This mode decides what happens next.
+
+It lives with the feedback mode and for the same reason: whether somebody is at the keyboard to answer a modal is a property of your machine, not project policy a collaborator should inherit.
+
+**Who may press is enforced, not just described.** `editor(action='respond_to_dialog')` is accepted only in `auto`. Under `interactive` and `defer` it comes back refused like any other action, because the answer belongs to the person: interactive asks them in a form, defer waits for them at the editor's own window. `editor(action='list_dialogs')` stays available in every mode, so the dialog can always be READ; only the press is withheld.
+
+`editor(set_dialog_policy)` is the exception. A dialog matching an armed pattern is answered immediately under every mode. Nothing else presses a button on its own, and there are no built-in policies.
+
+| Mode | What happens to a blocking dialog |
+|------|-----------------------------------|
+| `interactive` | You get an elicitation form with the dialog's buttons as the choices, plus "leave it open". The button you pick is pressed and the blocked call then runs. The agent cannot press it for you: `editor(respond_to_dialog)` is refused in this mode. |
+| `auto` | The refusal includes the `editor(action='respond_to_dialog')` call for each button. The agent picks one and makes that call. Nothing is pressed until it does. |
+| `defer` | The refusal names the dialog and its buttons but not the calls that press them, and `editor(respond_to_dialog)` is refused. Answer it in the Unreal Editor window. |
+
+Read in this order (highest wins): the `UE_MCP_DIALOG_MODE` env var, `dialog.mode` for this project in `~/.ue-mcp/state.json`, `dialog.mode` for this user in the same file, then the default. **The default is `interactive` when your MCP client advertises the elicitation capability and `defer` when it does not. It never resolves to `auto`**: with no channel to a person, the fallback is the mode that suspends, not the one that lets the agent decide. `auto` applies only when you name it.
+
+What counts as blocking: the modal stack first, then every top-level window and its children. A window blocks when it is a regular window that is either modal or parented to another one. Menus, tooltips and notifications are not regular windows, so a hover is never mistaken for a question. Visibility is not consulted, because a window that is up but undrawn, or drawn behind the editor, still holds whatever raised it. The detection lives in the C++ bridge, so a project running an older compiled plugin keeps the detection it was built with until the plugin is redeployed and rebuilt.
+
+Set it with `npx ue-mcp dialog mode <interactive|auto|defer>` (add `--editor <name>` to scope it to one project, `default` to clear it). An env value that names no mode is ignored, and the result says so.
+
+Under `interactive` the dialog is handed back whole on one call and the form goes up on the next, so its text lands somewhere nothing truncates it. An elicitation form is a few lines tall and the client decides how many of them it draws; one that keeps the opening line or two and collapses the rest would otherwise collapse the question itself. `dialogPhase` on the refusal says which call you are on: `relay` or `asking`.
+
+A client known to render the whole message skips that round trip. Every other client, including one nobody has checked, gets the handover: relaying needlessly costs one call, and not relaying against a client that collapses the message asks someone to choose a button for a question they cannot see. `UE_MCP_DIALOG_RELAY=off` turns the handover off whatever the client is, and `=on` forces it back on.
+
+
 ### User-machine state (`~/.ue-mcp/`)
 
 Machine-specific state that ue-mcp commands write but you wouldn't hand-edit lives under `~/.ue-mcp/`:
 
 | Path | What |
 |------|------|
-| `~/.ue-mcp/state.json` | Two things: (a) per-project `installedHooks` - absolute paths of every Claude Code `settings.json` where ue-mcp installed the feedback PostToolUse hook, keyed by absolute project root; (b) `preferences.feedback.mode` - your personal default for the feedback approval mode (`interactive` / `auto-approve` / `defer`). Maintained by `npx ue-mcp init`, `npx ue-mcp uninstall-hooks`, and `npx ue-mcp feedback mode`. |
+| `~/.ue-mcp/state.json` | Three things: (a) per-project `installedHooks` - absolute paths of every Claude Code `settings.json` where ue-mcp installed the feedback PostToolUse hook, keyed by absolute project root; (b) `preferences.feedback.mode` - your personal default for the feedback approval mode (`interactive` / `auto-approve` / `defer`). (c) `preferences.dialog.mode` and per-project `dialog.mode` - the dialog handling mode (`interactive` / `auto` / `defer`). Maintained by `npx ue-mcp init`, `npx ue-mcp uninstall-hooks`, `npx ue-mcp feedback mode` and `npx ue-mcp dialog mode`. Written by those commands, not by hand. |
 | `~/.ue-mcp/auth.json` | Cached GitHub OAuth token for `feedback(submit)` author=user mode. Mode 600. Written by `npx ue-mcp auth`. |
 | `~/.ue-mcp/pending-feedback/<id>.json` | Submissions captured while `feedback mode` is `defer`. Acted on with `npx ue-mcp feedback list/approve/discard`. |
 
@@ -171,13 +198,20 @@ Everything the server injects at session start - the `initialize` instructions p
 
 | Strategy | Seed (test project) | What's advertised | Cost to use |
 |----------|--------------------|-------------------|-------------|
-| **`full`** (default) | ~45k tokens | all 22 category tools, every action + parameter inline | zero discovery calls |
-| **`lean`** | ~23k tokens | the same 22 tools with their validated `action` enums, but descriptions collapsed to a summary; a `catalog` tool (`search` / `describe` / `list_categories`) and a per-category `describe` action serve the details on demand | ~1 round-trip to learn a category |
-| **`micro`** | ~1k tokens | a single `tools` gateway - `list_categories`, `describe`, and `call` - fronting every category; nothing else | discovery for everything |
+| **`full`** (default) | ~45k tokens | all <!-- count:tools -->26<!-- /count --> category tools, every action + parameter inline | zero discovery calls |
+| **`lean`** | ~23k tokens | the same <!-- count:tools -->26<!-- /count --> tools with their validated `action` enums, but descriptions collapsed to a summary; a `catalog` tool (`search` / `describe` / `list_categories`) and a per-category `describe` action serve the details on demand | ~1 round-trip to learn a category |
+| **`micro`** | ~1k tokens | a single `tools` gateway - `search`, `list_categories`, `describe`, and `call` - fronting every category | discovery for everything |
 
 - **full** is best when the agent should see the entire surface up front and you are not token-constrained.
 - **lean** keeps action names visible (so the model can often call directly, and unknown actions are still rejected up front) while dropping the prose. A solid middle ground.
-- **micro** mirrors the native MCP toolset gateway (`list_toolsets` / `describe_toolset` / `call_tool`): the agent calls `tools(action="list_categories")`, then `tools(action="describe", category="blueprint")`, then `tools(action="call", category="blueprint", method="create", args={ ... })`. Smallest possible seed, most discovery traffic.
+- **micro** mirrors the native MCP toolset gateway (`list_toolsets` / `describe_toolset` / `call_tool`): the agent calls `tools(action="search", query="rotate clockwise")`, then `tools(action="describe", category="level", method="nudge_component")`, then `tools(action="call", category="level", method="nudge_component", args={ ... })`. Omit `method` from describe to list a whole category. Smallest possible seed, most discovery traffic.
+- Lean reaches the same search and single-action describe through `catalog`. Both compact modes rank with the full-mode intent search and read nested argument fields off the declared schemas, so a narrow lookup never costs a whole category dump.
+
+The seed figures are measured on this repo's test project and move with the
+plugins and Epic toolsets you have enabled - `npm run context-tax` reports
+yours. A smaller seed is not automatically a cheaper session: count the
+discovery round-trips as well. All three modes carry the same short spatial
+interpretation and verification guidance.
 
 Set the strategy with the standalone command (writes `ue-mcp.yml` for you):
 
@@ -308,6 +342,7 @@ The C++ bridge plugin enables these UE plugins (adding them to `.uproject` if mi
 | `npx ue-mcp build` | Build the project C++ code using Unreal Build Tool. Stop the editor first. |
 | `npx ue-mcp auth` | Run the GitHub device flow standalone so `feedback(submit)` can author issues as your real GitHub user. Same step that lives inside `init`; use this if you skipped it at init time. |
 | `npx ue-mcp uninstall-hooks` | Remove the feedback PostToolUse hook from every Claude Code settings file recorded for this project in `~/.ue-mcp/state.json`. |
+| `npx ue-mcp dialog mode [<mode>]` | Read or set how a modal dialog blocking the editor is handled (`interactive`, `auto`, or `defer`). `--editor <name>` scopes it to one project; `default` clears it. Stored in `~/.ue-mcp/state.json`. See [Dialog handling mode](#dialog-handling-mode). |
 | `npx ue-mcp feedback mode [<mode>]` | Read or set your personal feedback approval mode (`interactive`, `auto-approve`, or `defer`). Stored in `~/.ue-mcp/state.json`. See [Feedback → modes](feedback.md#feedback-modes). |
 | `npx ue-mcp feedback list \| show \| approve \| discard \| review` | Manage submissions queued while feedback mode is `defer`. `review` (experimental) walks the queue interactively (approve/discard/skip per item). See [Feedback → Reviewing deferred submissions](feedback.md#reviewing-deferred-submissions). |
 | `npx ue-mcp resolve <issue>` | Fetch a feedback issue, branch, hand it to Claude Code to implement, open a PR. See [Feedback](feedback.md#resolving-feedback-issues). |
@@ -328,3 +363,48 @@ The server can manage the editor process:
 | `editor(action="stop_editor")` | Gracefully stop the editor |
 | `editor(action="restart_editor")` | Stop and relaunch |
 | `editor(action="build_project")` | Build the project C++ code via UBT |
+| `project(action="build")` | The same build, with `configuration`, `platform` and `clean` parameters |
+
+Both builds run UnrealBuildTool as a separate process, so they work with the
+editor stopped. That is the case that matters: UnrealBuildTool cannot link while
+an editor holds the module DLLs, so a full rebuild has to happen with the editor
+down.
+
+### Build parallelism
+
+UnrealBuildTool compiles one file per physical core by default, and each of those processes maps Unreal's precompiled header, which costs several GB. On a machine with fewer GB than cores, the compiler does not wait for room: it fails with `C3859` or `C1076` several minutes in, and the message names a paging file, so it reads as a broken machine rather than a default that does not fit it.
+
+ue-mcp computes a safe number from the machine's memory and core count and passes it to every build, including `ue-mcp build`, `ue-mcp update --build` and `editor(build_project)`. The cap is applied only when it is below what UnrealBuildTool would have chosen, so a machine with headroom builds exactly as before. There is nothing to configure.
+
+Set `UE_MCP_MAX_PARALLEL_ACTIONS` to a positive integer to override it, for a machine where the estimate is wrong in either direction. A build that runs out of room anyway reports what happened and what to change, rather than leaving the compiler's wording as the only explanation.
+
+## Which Engine A Project Uses
+
+The engine is resolved once, and the same answer drives the build tool, the
+editor launch, engine plugin discovery and the engine-source readers
+(`project(find_engine_symbol)`, `read_engine_header`, `search_engine_cpp`,
+`list_engine_modules`). Order, most specific first:
+
+1. `UE_MCP_TEST_ENGINE_ROOT` - an engine root pinned for the whole process.
+2. `UE_BUILD_TOOL_PATH` - a `Build.bat` / `Build.sh` pinned for the process.
+3. `editor.buildToolPath` in the project's `ue-mcp.yml` - the per-project form.
+4. `UE_EDITOR_PATH`, then `editor.path` - an editor binary names its own tree.
+5. `EngineAssociation` read as a path, absolute or relative to the project.
+6. An engine tree beside or above the project: the first directory from the
+   project upward that holds `Engine/Build/BatchFiles/`. This is the layout a
+   Perforce stream produces, with `<stream>/Engine` next to
+   `<stream>/MyProject/MyProject.uproject`.
+7. `EngineAssociation` as a registered build (a GUID, looked up in
+   `HKCU\Software\Epic Games\Unreal Engine\Builds`) or a version string such as
+   `5.8`, looked up as a launcher install.
+8. The engine the project's own log says it was last opened with.
+9. The default launcher install locations.
+
+`UE_MCP_PROTECTED_ENGINE_ROOTS` outranks all of it. An engine equal to or nested
+under a protected root is refused, including one that arrives through an
+explicit pin. Entries are separated by the platform path-list delimiter (`;` on
+Windows, `:` on macOS and Linux) and must be absolute.
+
+When nothing resolves, the error lists every path that was probed and where each
+came from, so a missing engine, a wrong root and an unsupported layout do not
+all read the same.

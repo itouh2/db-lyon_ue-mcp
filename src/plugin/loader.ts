@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import type { GuardDeclarations } from "../flow/guard-schema.js";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { TaskConstructor, TaskDefinition, FlowDefinition } from "@db-lyon/flowkit";
@@ -47,6 +48,10 @@ export interface PluginRecord {
   /** Validation status: "active" if loaded; anything else means skipped. */
   status: "active" | "skipped";
   statusReason?: string;
+  /** Units the manifest declared that did not survive validation, while the
+   *  rest of the plugin loaded. `"<manifest path>: <reason>"` each. Present
+   *  and non-empty means the plugin is active but narrower than authored. */
+  degraded: string[];
 }
 
 export interface PluginLoadResult {
@@ -62,6 +67,16 @@ export interface PluginLoadResult {
   taskDefs: Record<string, TaskDefinition>;
   /** Plugin-contributed flow definitions to merge into the FlowConfig. */
   flowDefs: Record<string, FlowDefinition>;
+  /**
+   * Guards each plugin declared, keyed by the plugin that declared them.
+   *
+   * Kept per plugin rather than merged, so a guard that cannot be built names
+   * the manifest to open, and so two plugins choosing the same guard name are
+   * distinguishable rather than one silently replacing the other.
+   */
+  guardsByPlugin: Array<{ plugin: string; guards: GuardDeclarations }>;
+  /** Task names per plugin, so a name that used to mean "guard" can be refused. */
+  taskNamesByPlugin: Array<{ plugin: string; taskNames: string[] }>;
   /** Per-category markdown to append to AI-facing docs. */
   knowledgeByCategory: Record<string, string[]>;
 }
@@ -73,6 +88,8 @@ const EMPTY_RESULT: PluginLoadResult = {
   classPathRegistrations: [],
   taskDefs: {},
   flowDefs: {},
+  guardsByPlugin: [],
+  taskNamesByPlugin: [],
   knowledgeByCategory: {},
 };
 
@@ -106,6 +123,8 @@ export async function loadPlugins(
   const classPathRegistrations: Array<{ classPath: string; ctor: TaskConstructor }> = [];
   const taskDefs: Record<string, TaskDefinition> = {};
   const flowDefs: Record<string, FlowDefinition> = {};
+  const guardsByPlugin: Array<{ plugin: string; guards: GuardDeclarations }> = [];
+  const taskNamesByPlugin: Array<{ plugin: string; taskNames: string[] }> = [];
   const knowledgeByCategory: Record<string, string[]> = {};
   // For each category, accumulate injection plans across all plugins.
   const plansByCategory = new Map<string, InjectionPlan[]>();
@@ -140,6 +159,13 @@ export async function loadPlugins(
         options: {},
       };
     }
+
+    // Guards this plugin declares. They are not tasks and are not registered
+    // as tasks: they are built into pipeline guards directly.
+    if (Object.keys(manifest.guards).length > 0) {
+      guardsByPlugin.push({ plugin: pkg.name, guards: manifest.guards });
+    }
+    taskNamesByPlugin.push({ plugin: pkg.name, taskNames: Object.keys(manifest.tasks) });
 
     // Merge plugin-supplied flows, filtered by the user's group toggles. A flow
     // whose group is disabled in `ue-mcp.pluginConfig.<slug>.groups` is dropped
@@ -314,6 +340,8 @@ export async function loadPlugins(
     classPathRegistrations,
     taskDefs,
     flowDefs,
+    guardsByPlugin,
+    taskNamesByPlugin,
     knowledgeByCategory,
   };
 }
@@ -353,6 +381,13 @@ async function loadOne(
     return skip(base, `manifest invalid: ${(e as Error).message}`);
   }
   const manifest = parsed.manifest;
+  // Salvaged units: the plugin loads, minus whatever failed validation on its
+  // own. Each one is warned individually so the log names the handler rather
+  // than leaving the reader to diff the manifest against the live surface.
+  for (const d of parsed.dropped) {
+    base.degraded.push(`${d.path}: ${d.reason}`);
+    warn("plugin", `${entry.name}: dropped ${d.path} - ${d.reason}`);
+  }
   base.manifestPath = parsed.manifestPath;
   base.actionPrefix = manifest.actionPrefix;
   base.minServerVersion = manifest.minServerVersion;
@@ -433,27 +468,29 @@ async function loadOne(
     }
   }
 
-  // Every inject entry must point to a task we just registered.
+  // Every inject and provides entry must point to a task we just registered.
+  // One that does not is dropped rather than fatal: an action with no task
+  // behind it cannot dispatch, but the plugin's other actions still can, and
+  // the reason travels on the record instead of taking the category down.
   for (const [category, actions] of Object.entries(manifest.inject)) {
     for (const [bareName, spec] of Object.entries(actions)) {
-      if (!taskCtors.has(spec.task)) {
-        return skip(
-          base,
-          `inject ${category}.${bareName} references unknown task '${spec.task}'`,
-        );
-      }
+      if (taskCtors.has(spec.task)) continue;
+      delete actions[bareName];
+      base.degraded.push(
+        `inject.${category}.${bareName}: references unknown task '${spec.task}'`,
+      );
+      warn("plugin", `${entry.name}: dropped inject.${category}.${bareName} - unknown task '${spec.task}'`);
     }
   }
 
-  // Every provides entry must also point to a task we just registered.
   for (const [category, providedSpec] of Object.entries(manifest.provides)) {
     for (const [actionName, actionSpec] of Object.entries(providedSpec.actions)) {
-      if (!taskCtors.has(actionSpec.task)) {
-        return skip(
-          base,
-          `provides ${category}.${actionName} references unknown task '${actionSpec.task}'`,
-        );
-      }
+      if (taskCtors.has(actionSpec.task)) continue;
+      delete providedSpec.actions[actionName];
+      base.degraded.push(
+        `provides.${category}.actions.${actionName}: references unknown task '${actionSpec.task}'`,
+      );
+      warn("plugin", `${entry.name}: dropped provides.${category}.${actionName} - unknown task '${actionSpec.task}'`);
     }
   }
 
@@ -475,6 +512,7 @@ function baseRecord(entry: PluginEntry): PluginRecord {
     flows: [],
     tasks: [],
     status: "skipped",
+    degraded: [],
   };
 }
 

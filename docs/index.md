@@ -1,6 +1,6 @@
 # UE-MCP
 
-**Unreal Engine Model Context Protocol Server** - lets AI assistants drive the Unreal Editor through <!-- count:tools -->24<!-- /count --> category tools covering <!-- count:actions -->783+<!-- /count --> actions.
+**Unreal Engine Model Context Protocol Server** - lets AI assistants drive the Unreal Editor through <!-- count:tools -->26<!-- /count --> category tools covering <!-- count:actions -->1930+<!-- /count --> actions.
 
 UE-MCP is a bridge between an AI client (Claude Code, Claude Desktop, Cursor, etc.) and the Unreal Editor. It runs a TypeScript MCP server on your machine, which talks over WebSocket to a C++ plugin running inside the editor. The result: your AI can place actors, write blueprints, author materials, sculpt landscape, set up Niagara VFX, configure replication, run PIE, build the project - anything the editor can do.
 
@@ -26,7 +26,7 @@ Start with **[Getting Started](getting-started.md)**. It assumes zero knowledge 
 | **Blueprints** | Read/write graphs, add nodes, connect pins, compile, CDO property access |
 | **Materials** | Create materials and instances, author expression graphs, set parameters |
 | **Assets** | CRUD, import meshes/textures/animations, datatables |
-| **Animation** | Read/create anim blueprints, montages, blendspaces, skeletons |
+| **Animation** | Anim blueprints, montages, retargeting, native Control Rig editing, deterministic pose analysis |
 | **VFX** | Create and configure Niagara systems and emitters |
 | **Landscape** | Sculpt terrain, paint weight layers, materials, splines, proxies |
 | **PCG** | Author and execute Procedural Content Generation graphs |
@@ -53,8 +53,11 @@ And a **plugin system** that lets npm packages inject new actions into the exist
 
 - **[Getting Started](getting-started.md)** - Zero-to-running walkthrough for first-time users
 - **[Architecture](architecture.md)** - How the TypeScript server, C++ plugin, and editor fit together
-- **[Tool Reference](tool-reference.md)** - All <!-- count:tools -->24<!-- /count --> tools with every action and its parameters
+- **[Tool Reference](tool-reference.md)** - All <!-- count:tools -->26<!-- /count --> tools with every action and its parameters
+- **[Native Control Rig Animation](control-rig-animation.md)** - Agent workflow for rig discovery, anatomical solving, quaternion keys, baking, and deterministic V&V
 - **[Flows](flows.md)** - Multi-step YAML workflows, custom tasks, hooks, rollback
+- **[Journal](journal.md)** - The per-project record of what a session did, produced, and how it ended
+- **[Skill Packs](skill-packs.md)** - Written workflows an agent reads, and checking that the calls they teach still exist
 - **[Plugins](plugins.md)** - npm packages that inject new actions into existing categories
 - **[Configuration](configuration.md)** - `ue-mcp.yml` and MCP client config
 - **[Neon Shrine Demo](neon-shrine-demo.md)** - 19-step procedural scene walkthrough

@@ -13,6 +13,46 @@ public:
 private:
 	// Handler implementations
 	static TSharedPtr<FJsonValue> ListAssets(const TSharedPtr<FJsonObject>& Params);
+
+	// UV authoring and inspection, in AssetHandlers_UV.cpp. There was no UV
+	// surface at all: one read-only peek at a single channel off render data.
+	// Lightmap settings themselves stay with asset(set_property); what earns a
+	// handler here is that writing them does nothing until the mesh rebuilds.
+	static TSharedPtr<FJsonValue> ReadUvChannels(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> SetUvChannelCount(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> UnwrapUvs(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> TransformUvs(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> GenerateLightmapUvs(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> ExportUvLayout(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> CheckUvs(const TSharedPtr<FJsonObject>& Params);
+
+	// Procedural mesh operations, in AssetHandlers_GeometryScript.cpp. Geometry
+	// Script is an engine PLUGIN and is reached by reflection rather than linked,
+	// so a project without it gets a named refusal instead of a broken build.
+	// Each of these defaults to writing a SEPARATE output asset, whose inverse is
+	// a complete delete rollback; inPlace=true is the destructive form and says
+	// that its edit cannot be undone.
+	static TSharedPtr<FJsonValue> SimplifyMesh(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> RemeshMesh(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> MirrorMesh(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> FillMeshHoles(const TSharedPtr<FJsonObject>& Params);
+	// Simple collision built from the mesh's own geometry, or cleared. Not a
+	// property write: what would go into AggGeom is the output of a decomposition
+	// solver, so there is no value a caller could supply to set_property.
+	static TSharedPtr<FJsonValue> GenerateMeshCollision(const TSharedPtr<FJsonObject>& Params);
+	// Plane-slice fracture into separate StaticMesh assets. NOT a
+	// GeometryCollection: the engine's fracture entry points carry no UFUNCTION,
+	// so reflection cannot reach them. The result says so.
+	static TSharedPtr<FJsonValue> FractureMesh(const TSharedPtr<FJsonObject>& Params);
+
+	// Project-wide asset hygiene, in AssetHandlers_Hygiene.cpp. The audit sweeps
+	// for unreferenced assets, broken references, duplicates, naming violations
+	// and redirector stubs; the fix applies the two of those a machine can act on
+	// safely, with a preflight, a dryRun that defaults to TRUE, and a quarantine
+	// move (which has an exact inverse) in place of a delete.
+	static TSharedPtr<FJsonValue> AuditAssetHygiene(const TSharedPtr<FJsonObject>& Params);
+	static TSharedPtr<FJsonValue> FixAssetHygiene(const TSharedPtr<FJsonObject>& Params);
+
 	static TSharedPtr<FJsonValue> SearchAssets(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadAsset(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ReadAssetProperties(const TSharedPtr<FJsonObject>& Params);
@@ -22,6 +62,9 @@ private:
 	static TSharedPtr<FJsonValue> DeleteAsset(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> DeleteAssetBatch(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> BulkRename(const TSharedPtr<FJsonObject>& Params);
+	// Bounded redirector clean-up after a move (#908). Lives in
+	// AssetHandlers_Redirectors.cpp.
+	static TSharedPtr<FJsonValue> FixupRedirectors(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> CreateDataAsset(const TSharedPtr<FJsonObject>& Params);
 	// Bounded batch create-or-update of UDataAsset instances. Lives in
 	// AssetHandlers_BulkUpsert.cpp.
@@ -32,6 +75,9 @@ private:
 	// #726: create an asset of any concrete UObject class via its registered
 	// factory (or NewObject fallback), not just UDataAsset subclasses.
 	static TSharedPtr<FJsonValue> CreateAssetByClass(const TSharedPtr<FJsonObject>& Params);
+	// A named subobject inside an existing asset's package (#975). Lives in
+	// AssetHandlers_Subobject.cpp.
+	static TSharedPtr<FJsonValue> CreateSubobject(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> SaveAsset(const TSharedPtr<FJsonObject>& Params);
 	// #429: bulk save of every dirty package - one-shot end-of-workflow flush.
 	static TSharedPtr<FJsonValue> SaveAllDirty(const TSharedPtr<FJsonObject>& Params);
@@ -97,6 +143,8 @@ private:
 	static TSharedPtr<FJsonValue> SetStringTableEntry(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> RemoveStringTableEntry(const TSharedPtr<FJsonObject>& Params);
 	static TSharedPtr<FJsonValue> ImportStringTable(const TSharedPtr<FJsonObject>& Params);
+	// CSV import with key-set validation and an explicit save result (#978).
+	static TSharedPtr<FJsonValue> ImportStringTableCsv(const TSharedPtr<FJsonObject>& Params);
 
 	// Export
 	static TSharedPtr<FJsonValue> ExportAsset(const TSharedPtr<FJsonObject>& Params);

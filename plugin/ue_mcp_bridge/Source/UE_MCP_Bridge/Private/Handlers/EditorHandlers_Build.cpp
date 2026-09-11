@@ -19,6 +19,8 @@
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformFile.h"
 #include "Modules/ModuleManager.h"
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/ARFilter.h"
 #if PLATFORM_WINDOWS
 #include "ILiveCodingModule.h"
 #endif
@@ -26,6 +28,96 @@
 #include "EditorValidatorSubsystem.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+
+namespace
+{
+	static FString MCPDataValidationResultToString(const EDataValidationResult Result)
+	{
+		switch (Result)
+		{
+		case EDataValidationResult::Valid:
+			return TEXT("valid");
+		case EDataValidationResult::Invalid:
+			return TEXT("invalid");
+		case EDataValidationResult::NotValidated:
+		default:
+			return TEXT("notValidated");
+		}
+	}
+
+	static TArray<TSharedPtr<FJsonValue>> MCPValidationTextArray(const TArray<FText>& Texts)
+	{
+		TArray<TSharedPtr<FJsonValue>> Values;
+		Values.Reserve(Texts.Num());
+		for (const FText& Text : Texts)
+		{
+			Values.Add(MakeShared<FJsonValueString>(Text.ToString()));
+		}
+		return Values;
+	}
+
+	static TArray<TSharedPtr<FJsonValue>> MCPValidationMessageArray(const TArray<TSharedRef<FTokenizedMessage>>& Messages)
+	{
+		TArray<TSharedPtr<FJsonValue>> Values;
+		Values.Reserve(Messages.Num());
+		for (const TSharedRef<FTokenizedMessage>& Message : Messages)
+		{
+			Values.Add(MakeShared<FJsonValueString>(Message->ToText().ToString()));
+		}
+		return Values;
+	}
+
+	static bool MCPResolveExplicitValidationAsset(
+		IAssetRegistry& AssetRegistry,
+		const FString& RequestedPath,
+		FAssetData& OutAsset,
+		FString& OutError)
+	{
+		const FString TrimmedPath = RequestedPath.TrimStartAndEnd();
+		if (TrimmedPath.IsEmpty())
+		{
+			OutError = TEXT("asset path is empty");
+			return false;
+		}
+
+		if (TrimmedPath.Contains(TEXT(".")) || TrimmedPath.Contains(TEXT(":")))
+		{
+			OutAsset = AssetRegistry.GetAssetByObjectPath(FSoftObjectPath(TrimmedPath));
+			if (!OutAsset.IsValid())
+			{
+				OutError = FString::Printf(TEXT("asset object path was not found: %s"), *TrimmedPath);
+				return false;
+			}
+			return true;
+		}
+
+		TArray<FAssetData> PackageAssets;
+		AssetRegistry.GetAssetsByPackageName(FName(*TrimmedPath), PackageAssets);
+		PackageAssets.Sort([](const FAssetData& A, const FAssetData& B)
+		{
+			return A.GetObjectPathString() < B.GetObjectPathString();
+		});
+
+		if (PackageAssets.Num() == 0)
+		{
+			OutError = FString::Printf(TEXT("asset package path was not found: %s"), *TrimmedPath);
+			return false;
+		}
+		if (PackageAssets.Num() != 1)
+		{
+			OutError = FString::Printf(TEXT("asset package path is ambiguous (%d assets): %s"), PackageAssets.Num(), *TrimmedPath);
+			return false;
+		}
+
+		OutAsset = PackageAssets[0];
+		if (!OutAsset.IsValid())
+		{
+			OutError = FString::Printf(TEXT("asset package path resolved to invalid asset data: %s"), *TrimmedPath);
+			return false;
+		}
+		return true;
+	}
+}
 
 TSharedPtr<FJsonValue> FEditorHandlers::BuildLighting(const TSharedPtr<FJsonObject>& Params)
 {
@@ -62,6 +154,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::BuildLighting(const TSharedPtr<FJsonObje
 	Result->SetStringField(TEXT("quality"), Quality);
 	Result->SetStringField(TEXT("command"), Command);
 	Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Lighting build triggered (%s)"), *Quality));
+	// A build is a trigger, not a state write: there is no "already built" the
+	// handler could find and skip, and every call starts another build.
+	Result->SetBoolField(TEXT("changed"), true);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("A lighting build overwrites the map's built lighting data in place. The previous build is not kept anywhere the bridge can reach, so no call restores it. Recover it from source control, or rebuild at the quality the map had before."));
 	return MCPResult(Result);
 }
 
@@ -77,52 +175,208 @@ TSharedPtr<FJsonValue> FEditorHandlers::BuildAll(const TSharedPtr<FJsonObject>& 
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("message"), TEXT("Build All triggered (geometry + lighting + navigation)"));
+	// A build is a trigger, not a state write: there is no "already built" the
+	// handler could find and skip, and every call starts another build.
+	Result->SetBoolField(TEXT("changed"), true);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Geometry, lighting and navigation data are each overwritten in place. The state before the build is not kept anywhere the bridge can reach, so no call restores it. Recover the map from source control instead."));
 	return MCPResult(Result);
 }
 
 
 TSharedPtr<FJsonValue> FEditorHandlers::ValidateAssets(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Directory = OptionalString(Params, TEXT("directory"), TEXT("/Game/"));
-
-	// Try to use the EditorValidatorSubsystem if available
-	UEditorValidatorSubsystem* ValidatorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UEditorValidatorSubsystem>() : nullptr;
-
-	if (ValidatorSubsystem)
+	if (!GEditor)
 	{
-		// Use the DataValidation console command for broad validation
-		if (GEditor && GEditor->GetEditorWorldContext().World())
+		return MCPError(TEXT("Editor not available"));
+	}
+
+	UEditorValidatorSubsystem* ValidatorSubsystem = GEditor->GetEditorSubsystem<UEditorValidatorSubsystem>();
+	if (!ValidatorSubsystem)
+	{
+		return MCPError(TEXT("EditorValidatorSubsystem is not available"));
+	}
+
+	const bool bHasAssetPaths = Params->HasField(TEXT("assetPaths"));
+	const bool bHasAssetPath = Params->HasField(TEXT("assetPath"));
+	const bool bHasDirectory = Params->HasField(TEXT("directory"));
+	if ((bHasAssetPaths || bHasAssetPath) && bHasDirectory)
+	{
+		return MCPError(TEXT("Specify either assetPaths/assetPath or directory, not both"));
+	}
+	if (bHasAssetPaths && bHasAssetPath)
+	{
+		return MCPError(TEXT("Specify only one of assetPaths or assetPath"));
+	}
+
+	FAssetRegistryModule* AssetRegistryModule = FModuleManager::LoadModulePtr<FAssetRegistryModule>(TEXT("AssetRegistry"));
+	if (!AssetRegistryModule || !AssetRegistryModule->IsValid())
+	{
+		return MCPError(TEXT("AssetRegistry is not available"));
+	}
+	IAssetRegistry* AssetRegistry = AssetRegistryModule->TryGet();
+	if (!AssetRegistry)
+	{
+		return MCPError(TEXT("AssetRegistry is shutting down"));
+	}
+
+	TArray<FAssetData> AssetDataList;
+	FString SelectionMode;
+	FString Selection;
+	if (bHasAssetPaths || bHasAssetPath)
+	{
+		TArray<FString> RequestedPaths;
+		if (bHasAssetPaths)
 		{
-			FString Command = FString::Printf(TEXT("DataValidation.ValidateAssets %s"), *Directory);
-			UKismetSystemLibrary::ExecuteConsoleCommand(
-				GEditor->GetEditorWorldContext().World(),
-				Command,
-				nullptr
-			);
+			const TArray<TSharedPtr<FJsonValue>>* PathValues = nullptr;
+			if (!Params->TryGetArrayField(TEXT("assetPaths"), PathValues) || !PathValues || PathValues->Num() == 0)
+			{
+				return MCPError(TEXT("assetPaths must be a non-empty array of exact asset paths"));
+			}
+			RequestedPaths.Reserve(PathValues->Num());
+			for (const TSharedPtr<FJsonValue>& PathValue : *PathValues)
+			{
+				FString RequestedPath;
+				if (!PathValue.IsValid() || !PathValue->TryGetString(RequestedPath) || RequestedPath.TrimStartAndEnd().IsEmpty())
+				{
+					return MCPError(TEXT("Every assetPaths entry must be a non-empty string"));
+				}
+				RequestedPaths.Add(RequestedPath);
+			}
+		}
+		else
+		{
+			FString RequestedPath;
+			if (!Params->TryGetStringField(TEXT("assetPath"), RequestedPath) || RequestedPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MCPError(TEXT("assetPath must be a non-empty exact package or object path"));
+			}
+			RequestedPaths.Add(RequestedPath);
 		}
 
-		auto Result = MCPSuccess();
-		Result->SetStringField(TEXT("directory"), Directory);
-		Result->SetStringField(TEXT("message"), TEXT("Asset validation triggered via EditorValidatorSubsystem"));
-		return MCPResult(Result);
+		TSet<FString> SeenObjectPaths;
+		for (const FString& RequestedPath : RequestedPaths)
+		{
+			FAssetData ResolvedAsset;
+			FString ResolveError;
+			if (!MCPResolveExplicitValidationAsset(*AssetRegistry, RequestedPath, ResolvedAsset, ResolveError))
+			{
+				return MCPError(ResolveError);
+			}
+
+			const FString ObjectPath = ResolvedAsset.GetObjectPathString();
+			if (!SeenObjectPaths.Contains(ObjectPath))
+			{
+				SeenObjectPaths.Add(ObjectPath);
+				AssetDataList.Add(ResolvedAsset);
+			}
+		}
+		SelectionMode = TEXT("explicit");
+		Selection = FString::Join(RequestedPaths, TEXT(","));
 	}
 	else
 	{
-		// Fallback: trigger via console command
-		if (GEditor && GEditor->GetEditorWorldContext().World())
+		const FString Directory = OptionalString(Params, TEXT("directory"), TEXT("/Game/")).TrimStartAndEnd();
+		if (Directory.IsEmpty() || !Directory.StartsWith(TEXT("/")))
 		{
-			UKismetSystemLibrary::ExecuteConsoleCommand(
-				GEditor->GetEditorWorldContext().World(),
-				TEXT("DataValidation.ValidateAssets"),
-				nullptr
-			);
+			return MCPError(TEXT("directory must be a non-empty package path such as /Game/"));
 		}
 
-		auto Result = MCPSuccess();
-		Result->SetStringField(TEXT("directory"), Directory);
-		Result->SetStringField(TEXT("message"), TEXT("Asset validation triggered via console command"));
-		return MCPResult(Result);
+		FARFilter Filter;
+		Filter.PackagePaths.Add(FName(*Directory));
+		Filter.bRecursivePaths = true;
+		if (!AssetRegistry->GetAssets(Filter, AssetDataList))
+		{
+			return MCPError(FString::Printf(TEXT("AssetRegistry could not enumerate directory: %s"), *Directory));
+		}
+		SelectionMode = TEXT("directory");
+		Selection = Directory;
 	}
+
+	AssetDataList.Sort([](const FAssetData& A, const FAssetData& B)
+	{
+		return A.GetObjectPathString() < B.GetObjectPathString();
+	});
+
+	FValidateAssetsSettings Settings;
+	Settings.ValidationUsecase = IsRunningCommandlet() ? EDataValidationUsecase::Commandlet : EDataValidationUsecase::Manual;
+	Settings.bCollectPerAssetDetails = true;
+	Settings.bShowIfNoFailures = false;
+#if UE_MCP_HAS_5_5_API
+	Settings.bSilent = true;
+#else
+	// 5.4 has no bSilent; bShowIfNoFailures above is the only noise control it
+	// offers.
+#endif
+	FValidateAssetsResults ValidationResults;
+	ValidatorSubsystem->ValidateAssetsWithSettings(AssetDataList, Settings, ValidationResults);
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("selectionMode"), SelectionMode);
+	Result->SetStringField(TEXT("selection"), Selection);
+	if (SelectionMode == TEXT("directory"))
+	{
+		// Preserve the legacy response field for { directory: ... } callers.
+		Result->SetStringField(TEXT("directory"), Selection);
+	}
+	Result->SetStringField(TEXT("validationUsecase"), Settings.ValidationUsecase == EDataValidationUsecase::Commandlet ? TEXT("commandlet") : TEXT("manual"));
+	Result->SetNumberField(TEXT("requested"), ValidationResults.NumRequested);
+	Result->SetNumberField(TEXT("checked"), ValidationResults.NumChecked);
+	Result->SetNumberField(TEXT("valid"), ValidationResults.NumValid);
+	Result->SetNumberField(TEXT("invalid"), ValidationResults.NumInvalid);
+	Result->SetNumberField(TEXT("skipped"), ValidationResults.NumSkipped);
+	Result->SetNumberField(TEXT("warnings"), ValidationResults.NumWarnings);
+	Result->SetNumberField(TEXT("unableToValidate"), ValidationResults.NumUnableToValidate);
+#if UE_MCP_HAS_5_5_API
+	Result->SetNumberField(TEXT("externalObjects"), ValidationResults.NumExternalObjects);
+#else
+	// 5.4 does not count external objects separately, and reporting a zero it
+	// never measured would read as "none found" rather than "not measured".
+#endif
+	Result->SetBoolField(TEXT("assetLimitReached"), ValidationResults.bAssetLimitReached);
+	const FString OverallResult = ValidationResults.NumInvalid > 0
+		? TEXT("invalid")
+		: (ValidationResults.NumUnableToValidate > 0 || ValidationResults.NumRequested == 0 || ValidationResults.NumChecked == 0
+			? TEXT("notValidated")
+			: (ValidationResults.NumWarnings > 0 ? TEXT("warning") : TEXT("valid")));
+	Result->SetStringField(TEXT("result"), OverallResult);
+
+	TArray<FString> DetailKeys;
+	ValidationResults.AssetsDetails.GetKeys(DetailKeys);
+	DetailKeys.Sort();
+	TArray<TSharedPtr<FJsonValue>> DetailsArray;
+	DetailsArray.Reserve(DetailKeys.Num());
+	for (const FString& DetailKey : DetailKeys)
+	{
+		const FValidateAssetsDetails* Details = ValidationResults.AssetsDetails.Find(DetailKey);
+		if (!Details)
+		{
+			continue;
+		}
+		auto DetailObject = MakeShared<FJsonObject>();
+		DetailObject->SetStringField(TEXT("objectPath"), DetailKey);
+		DetailObject->SetStringField(TEXT("packageName"), Details->PackageName.ToString());
+		DetailObject->SetStringField(TEXT("assetName"), Details->AssetName.ToString());
+		DetailObject->SetStringField(TEXT("result"), MCPDataValidationResultToString(Details->Result));
+		DetailObject->SetArrayField(TEXT("errors"), MCPValidationTextArray(Details->ValidationErrors));
+		DetailObject->SetArrayField(TEXT("warnings"), MCPValidationTextArray(Details->ValidationWarnings));
+		DetailObject->SetArrayField(TEXT("messages"), MCPValidationMessageArray(Details->ValidationMessages));
+		DetailsArray.Add(MakeShared<FJsonValueObject>(DetailObject));
+	}
+	Result->SetArrayField(TEXT("assets"), DetailsArray);
+#if UE_MCP_HAS_5_8_API
+	Result->SetArrayField(TEXT("validatorMessages"), MCPValidationMessageArray(ValidationResults.ValidatorMessages));
+#else
+	// FValidateAssetsResults::ValidatorMessages arrived in 5.8. Earlier engines
+	// keep no bucket for a message a validator raised outside any one asset, so
+	// the field is omitted rather than sent as an empty array, which would read
+	// as "every validator ran and none had anything to say".
+	Result->SetStringField(TEXT("validatorMessagesNote"),
+		TEXT("validatorMessages omitted: cross-asset validator messages need UE 5.8, and this editor is older. Per-asset messages are still reported under assets[].messages."));
+#endif
+	Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Validated %d assets"), ValidationResults.NumRequested));
+	return MCPResult(Result);
 }
 
 
@@ -139,6 +393,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::CookContent(const TSharedPtr<FJsonObject
 	Result->SetStringField(TEXT("platform"), Platform);
 	Result->SetStringField(TEXT("command"), Command);
 	Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Cook triggered for %s"), *Platform));
+	// A cook is a trigger, not a state write: there is no "already cooked" the
+	// handler could find and skip, and every call starts another cook.
+	Result->SetBoolField(TEXT("changed"), true);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("A cook writes into the platform's cooked output directory. Nothing in the bridge un-cooks content or restores the previous cooked output, and no inverse call exists."));
 	return MCPResult(Result);
 }
 
@@ -153,6 +413,10 @@ TSharedPtr<FJsonValue> FEditorHandlers::HotReload(const TSharedPtr<FJsonObject>&
 		{
 			auto Result = MCPSuccess();
 			Result->SetStringField(TEXT("message"), TEXT("Live Coding compile already in progress"));
+			// Nothing was started: the compile already under way is left alone.
+			Result->SetBoolField(TEXT("alreadyRunning"), true);
+			Result->SetBoolField(TEXT("changed"), false);
+			Result->SetBoolField(TEXT("rollbackPossible"), false);
 			return MCPResult(Result);
 		}
 
@@ -160,6 +424,11 @@ TSharedPtr<FJsonValue> FEditorHandlers::HotReload(const TSharedPtr<FJsonObject>&
 		LiveCoding->Compile();
 		auto Result = MCPSuccess();
 		Result->SetStringField(TEXT("message"), TEXT("Live Coding compile triggered"));
+		Result->SetBoolField(TEXT("alreadyRunning"), false);
+		Result->SetBoolField(TEXT("changed"), true);
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Patched code is loaded into the running editor process and cannot be unloaded. There is no inverse call; restart the editor to get back to the binary on disk."));
 		return MCPResult(Result);
 	}
 	else
@@ -172,6 +441,10 @@ TSharedPtr<FJsonValue> FEditorHandlers::HotReload(const TSharedPtr<FJsonObject>&
 			UKismetSystemLibrary::ExecuteConsoleCommand(World, TEXT("LiveCoding.Compile"), nullptr);
 			auto Result = MCPSuccess();
 			Result->SetStringField(TEXT("message"), TEXT("Hot reload triggered via console command (Live Coding module not active in session)"));
+			Result->SetBoolField(TEXT("changed"), true);
+			Result->SetBoolField(TEXT("rollbackPossible"), false);
+			Result->SetStringField(TEXT("rollbackNote"),
+				TEXT("Patched code is loaded into the running editor process and cannot be unloaded. There is no inverse call; restart the editor to get back to the binary on disk."));
 			return MCPResult(Result);
 		}
 		else
@@ -190,6 +463,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::BuildGeometry(const TSharedPtr<FJsonObje
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("message"), TEXT("Geometry rebuild triggered"));
+	// A build is a trigger, not a state write: there is no "already built" the
+	// handler could find and skip, and every call starts another build.
+	Result->SetBoolField(TEXT("changed"), true);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("MAP REBUILD regenerates the BSP model from the brushes in place. The previous model is not retained, so no call restores it; rebuilding again reproduces it only if the brushes are unchanged."));
 	return MCPResult(Result);
 }
 
@@ -202,6 +481,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::BuildHlod(const TSharedPtr<FJsonObject>&
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("message"), TEXT("HLOD build triggered"));
+	// A build is a trigger, not a state write: there is no "already built" the
+	// handler could find and skip, and every call starts another build.
+	Result->SetBoolField(TEXT("changed"), true);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("An HLOD build regenerates the proxy meshes and their actors in place. The previous generation is not retained, so no call restores it. Recover the map and its HLOD packages from source control instead."));
 	return MCPResult(Result);
 }
 
@@ -272,6 +557,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::BuildProject(const TSharedPtr<FJsonObjec
 	Result->SetStringField(TEXT("configuration"), Configuration);
 	Result->SetStringField(TEXT("platform"), Platform);
 	Result->SetStringField(TEXT("note"), TEXT("Build launched asynchronously. Check output log for progress."));
+	// Every call launches another UnrealBuildTool process; there is no
+	// "already built" state this handler could find and skip.
+	Result->SetBoolField(TEXT("changed"), true);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("UnrealBuildTool overwrites the binaries and intermediates it produces. The previous build output is not kept, and the process is asynchronous, so by the time a rollback ran there would be nothing to restore and nothing to cancel."));
 	return MCPResult(Result);
 }
 
@@ -330,6 +621,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::GenerateProjectFiles(const TSharedPtr<FJ
 		Result->SetStringField(TEXT("args"), Args);
 		Result->SetStringField(TEXT("projectPath"), ProjectPath);
 		Result->SetStringField(TEXT("note"), TEXT("Project file generation launched. Check output log for progress."));
+		// Every call launches another generation pass; there is no "already
+		// generated" state this handler could find and skip.
+		Result->SetBoolField(TEXT("changed"), true);
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The generated solution and project files are overwritten in place, and the generation runs asynchronously in another process. The previous files are not kept, so no call restores them."));
 		return MCPResult(Result);
 	}
 	else
@@ -348,6 +645,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::GenerateProjectFiles(const TSharedPtr<FJ
 		Result->SetStringField(TEXT("args"), Args);
 		Result->SetStringField(TEXT("projectPath"), ProjectPath);
 		Result->SetStringField(TEXT("note"), TEXT("Project file generation launched. Check output log for progress."));
+		// Every call launches another generation pass; there is no "already
+		// generated" state this handler could find and skip.
+		Result->SetBoolField(TEXT("changed"), true);
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The generated solution and project files are overwritten in place, and the generation runs asynchronously in another process. The previous files are not kept, so no call restores them."));
 		return MCPResult(Result);
 	}
 }

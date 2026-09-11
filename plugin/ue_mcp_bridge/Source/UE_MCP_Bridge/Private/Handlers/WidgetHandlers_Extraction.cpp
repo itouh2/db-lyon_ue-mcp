@@ -18,49 +18,16 @@
 
 namespace
 {
-FString MakeExtractionWidgetBlueprintObjectPath(const FString& InAssetPath)
-{
-	FString ObjectPath = InAssetPath;
-	ObjectPath.TrimStartAndEndInline();
-	ObjectPath.RemoveFromStart(TEXT("WidgetBlueprint'"));
-	ObjectPath.RemoveFromEnd(TEXT("'"));
-
-	const int32 LastSlashIndex = ObjectPath.Find(TEXT("/"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-	const int32 DotIndex = ObjectPath.Find(TEXT("."), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
-	if (DotIndex <= LastSlashIndex)
-	{
-		const FString AssetName = FPackageName::GetLongPackageAssetName(ObjectPath);
-		if (!AssetName.IsEmpty())
-		{
-			ObjectPath += TEXT(".") + AssetName;
-		}
-	}
-	return ObjectPath;
-}
-
+/**
+ * Extraction's loader. Delegates to the one shared resolver (#972) rather than
+ * carrying a second path-normalising, second-chance-loading copy of it: the
+ * module is a unity build, and two file-local copies of the same helper both
+ * collide and drift. A null return is still the normal "destination does not
+ * exist yet, create it" outcome here.
+ */
 UWidgetBlueprint* LoadWidgetBlueprintForExtraction(const FString& AssetPath)
 {
-	UObject* LoadedAsset = UEditorAssetLibrary::LoadAsset(AssetPath);
-	// A missing destination is the normal create path. StaticLoadObject on a
-	// non-existent package can force a blocking package search, so only use the
-	// fallback for explicit object/generated-class paths supplied by callers.
-	if (!LoadedAsset && AssetPath.Contains(TEXT(".")))
-	{
-		const FString ObjectPath = MakeExtractionWidgetBlueprintObjectPath(AssetPath);
-		LoadedAsset = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjectPath);
-	}
-
-	if (UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(LoadedAsset))
-	{
-		return WidgetBlueprint;
-	}
-
-	if (UClass* LoadedClass = Cast<UClass>(LoadedAsset))
-	{
-		return Cast<UWidgetBlueprint>(LoadedClass->ClassGeneratedBy);
-	}
-
-	return nullptr;
+	return MCPWidget::ResolveWidgetBlueprint(AssetPath).Blueprint;
 }
 
 struct FExtractedWidgetPlanEntry
@@ -543,22 +510,24 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ExtractWidgetSubtree(const TSharedPtr<FJ
 		++CopiedBindings;
 	}
 
-	// WidgetVariableNameToGuidMap keeps external references stable when a
-	// widget variable is later renamed. It landed in 5.5, so gate on the
-	// shared macro rather than an ad-hoc version expression.
-#if UE_MCP_HAS_5_5_API
-	for (const FExtractedWidgetPlanEntry& Entry : Plan)
-	{
-		const FName WidgetName(*Entry.DestinationName);
-		if (!Destination->WidgetVariableNameToGuidMap.Contains(WidgetName))
-		{
-			Destination->WidgetVariableNameToGuidMap.Add(WidgetName, FGuid::NewGuid());
-		}
-	}
-#endif
-
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Destination);
-	FKismetEditorUtilities::CompileBlueprint(Destination);
+
+	// WidgetVariableNameToGuidMap keeps external references stable when a widget
+	// variable is later renamed, and the compiler reports a failure for any
+	// widget variable it generates without an entry (#728). The entries are
+	// written off the widgets the destination tree actually owns rather than off
+	// the plan, because the importer renames a widget whose name was already
+	// taken while the plan still holds the name that was asked for.
+	const MCPWidgetGuidMap::FSyncReport GuidSync = MCPWidgetGuidMap::CompileChecked(Destination);
+	if (!GuidSync.bCompiled)
+	{
+		if (bCreatedDestination)
+		{
+			UEditorAssetLibrary::DeleteAsset(DestinationAssetPath);
+		}
+		return MCPWidgetGuidMap::BlockedError(DestinationAssetPath, GuidSync);
+	}
+
 	if (Destination->Status == BS_Error)
 	{
 		if (bCreatedDestination)
@@ -594,5 +563,6 @@ TSharedPtr<FJsonValue> FWidgetHandlers::ExtractWidgetSubtree(const TSharedPtr<FJ
 	Result->SetBoolField(TEXT("sourcePackageDirtyBefore"), bSourceDirtyBefore);
 	Result->SetBoolField(TEXT("sourcePackageDirtyAfter"), Source->GetOutermost()->IsDirty());
 	Result->SetBoolField(TEXT("sourceUnchanged"), bSourceDirtyBefore == Source->GetOutermost()->IsDirty());
+	MCPSetWidgetGuidOutcome(Result, GuidSync, Destination->GetPathName());
 	return MCPResult(Result);
 }

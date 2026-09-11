@@ -14,7 +14,17 @@ These are enforced both at install (`ue-mcp plugin install`) and at server load:
 - Every `inject:` and `provides:` entry must point to a task declared under `tasks:`, and every task's `class_path` must resolve under `dist/`.
 - `minServerVersion` is checked at install and re-checked at load.
 - `nativeModule.minBridgeApi` is checked at install (against the deployed bridge's `UEMCP_BRIDGE_API_VERSION`) and re-checked at load.
-- A plugin that fails any of these is skipped entirely (never partially injected) with a loud warning. Other plugins keep loading.
+- A plugin that fails a rule affecting the whole package (`actionPrefix`, an unknown `inject:` target, a version gate, an unresolvable `class_path`) is skipped entirely with a loud warning. Other plugins keep loading.
+- A failure confined to one handler, one injected or provided action, one flow, one task or one knowledge entry costs **that unit only**. The plugin still loads; the dropped units and their reasons appear as `degraded` on `plugins(action="list")` and `describe`, in `ue-mcp plugin list`, and in the `PLUGIN LOAD WARNINGS` block of the server instructions.
+
+## An action, or a whole category, is missing
+
+Read the `PLUGIN LOAD WARNINGS` block the server sends at initialize, or run `plugins(action="list")`. Two shapes:
+
+- `status: "skipped"` with a `statusReason` - the plugin never loaded, so none of its actions exist. Fix the reason and restart the server.
+- `status: "active"` with a non-empty `degraded` - the plugin loaded, but the listed units did not. Each entry names the manifest path and the validation error, e.g. `nativeModule.handlers.actor_set: nativeModule.handlers.actor_set.schema.value.type: Invalid enum value`.
+
+An absent warning for a plugin you expected means the plugin is not in `plugins:` at all, or its package is not under `node_modules/`.
 
 ## `plugins(action="list")` returns `pluginCount: 0`
 
@@ -62,3 +72,9 @@ The C++ side didn't compile in. Two common causes:
 2. The build failed silently because the deployed bridge is older than the plugin expects. Run `ue-mcp deploy` to refresh `MCPHandlerRegistration.h`, then `ue-mcp build`.
 
 If the rebuild succeeds but `Unknown method` persists, you've hit a stale Live Coding patch: delete `<projectDir>/Binaries/Win64/*.patch_*` and rebuild clean. UBT's incremental build can otherwise shadow a freshly built DLL with a leftover patch.
+
+### Find the whole gap in one call
+
+`project(action="get_status")` reports a `deployedPlugin` object describing the plugin that answered: the methods it registered, the methods this server advertises, and the difference in both directions. An advertised action the plugin never registered is named there, so a version skew is one read rather than a discovery made one failed call at a time.
+
+That is a different question from `pluginBuildStale`, and the two disagree in a case worth knowing about. `pluginBuildStale` compares timestamps: is the compiled bridge older than its source. A plugin built cleanly from an older tag is not stale by that measure and can still be missing handlers a newer server advertises, which is why `pluginBuildStale: false` is not on its own proof that the surface you were handed is the surface that answers.

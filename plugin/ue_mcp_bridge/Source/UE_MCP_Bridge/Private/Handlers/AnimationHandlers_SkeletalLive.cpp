@@ -9,6 +9,7 @@
 #include "AnimationHandlers.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+#include "HandlerPagination.h"
 #include "Editor.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -19,6 +20,7 @@
 #include "Animation/Skeleton.h"
 #include "Animation/AnimSingleNodeInstance.h"
 #include "Animation/AnimInstance.h"
+#include "Animation/AnimBlueprintGeneratedClass.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 
@@ -206,14 +208,36 @@ namespace
 			return MCPError(TEXT("world must be 'auto' (default), 'pie', 'game', or 'editor'"));
 		}
 
+		// #983: actorPath wins over the label token, and a label naming more
+		// than one actor in the world that answered is refused rather than
+		// read off whichever the iterator reached first.
+		const FString ActorPath = OptionalString(Params, TEXT("actorPath"));
 		TArray<TPair<FString, UWorld*>> Candidates = BuildWorldCandidates(RequestedScope);
 		for (const TPair<FString, UWorld*>& Candidate : Candidates)
 		{
-			AActor* Actor = FindActorByLabelNameOrPath(Candidate.Value, ActorToken);
-			if (Actor)
+			if (!ActorPath.IsEmpty())
+			{
+				if (AActor* ByPath = MCPFindActorByPath(Candidate.Value, ActorPath))
+				{
+					OutWorld = Candidate.Value;
+					OutActor = ByPath;
+					OutResolvedScope = Candidate.Key;
+					return nullptr;
+				}
+				continue;
+			}
+			TArray<AActor*> Matches;
+			MCPCollectActorsByToken(Candidate.Value, ActorToken, EMCPActorMatch::LabelNameOrPath, Matches);
+			if (Matches.Num() > 1)
+			{
+				return MCPAmbiguousActorError(
+					ActorToken, TEXT("actorLabel"), TEXT("actorPath"),
+					MCPDescribeActorMatchTier(ActorToken, Matches[0]), Matches);
+			}
+			if (Matches.Num() == 1)
 			{
 				OutWorld = Candidate.Value;
-				OutActor = Actor;
+				OutActor = Matches[0];
 				OutResolvedScope = Candidate.Key;
 				return nullptr;
 			}
@@ -230,7 +254,7 @@ namespace
 TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransform(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 	FString BoneName;
 	if (auto Err = RequireString(Params, TEXT("boneName"), BoneName)) return Err;
 	const FString ComponentName = OptionalString(Params, TEXT("componentName"));
@@ -240,6 +264,9 @@ TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransform(const TSharedPtr<FJs
 	AActor* Actor = nullptr;
 	FString ResolvedWorldScope;
 	if (auto Err = ResolveSkeletalActorForQuery(Params, ActorLabel, TEXT("auto"), World, Actor, ResolvedWorldScope)) return Err;
+	// A caller who passed only actorPath left ActorLabel holding the path, and
+	// every message below reads better naming the actor that answered (#983).
+	ActorLabel = Actor->GetActorLabel();
 	USkeletalMeshComponent* SK = ResolveSkeletalMeshComp(Actor, ComponentName);
 	if (!SK) return MakeSkeletalComponentNotFoundError(Actor, ActorLabel, ComponentName);
 
@@ -292,13 +319,16 @@ TSharedPtr<FJsonValue> FAnimationHandlers::GetBoneTransform(const TSharedPtr<FJs
 TSharedPtr<FJsonValue> FAnimationHandlers::ListBones(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 	const FString ComponentName = OptionalString(Params, TEXT("componentName"));
 
 	UWorld* World = nullptr;
 	AActor* Actor = nullptr;
 	FString ResolvedWorldScope;
 	if (auto Err = ResolveSkeletalActorForQuery(Params, ActorLabel, TEXT("auto"), World, Actor, ResolvedWorldScope)) return Err;
+	// A caller who passed only actorPath left ActorLabel holding the path, and
+	// every message below reads better naming the actor that answered (#983).
+	ActorLabel = Actor->GetActorLabel();
 	USkeletalMeshComponent* SK = ResolveSkeletalMeshComp(Actor, ComponentName);
 	if (!SK) return MakeSkeletalComponentNotFoundError(Actor, ActorLabel, ComponentName);
 	if (!SK->GetSkeletalMeshAsset()) return MCPError(FString::Printf(TEXT("SkeletalMeshComponent '%s' on actor '%s' has no SkeletalMesh asset"), *SK->GetName(), *ActorLabel));
@@ -306,16 +336,37 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ListBones(const TSharedPtr<FJsonObjec
 	const FReferenceSkeleton& Ref = SK->GetSkeletalMeshAsset()->GetRefSkeleton();
 	const int32 NumBones = Ref.GetNum();
 
-	TArray<TSharedPtr<FJsonValue>> Bones;
+	// T3: paged. A production skeleton runs to several hundred bones once
+	// twist, cloth and facial joints are in, and the whole hierarchy arrived in
+	// one response with no way to ask for part of it.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("list_bones|actor=%s|component=%s"), *Actor->GetPathName(), *SK->GetName()),
+			/*DefaultLimit*/ 200, /*MaxLimit*/ 5000, Page))
+	{
+		return Err;
+	}
+
+	// Deliberately NOT sorted. Reference-skeleton index order is a contract of
+	// the asset: parents precede children, so the emitted sequence is the
+	// hierarchy itself, and alphabetising it would destroy the one thing that
+	// makes a bone list readable.
+	TArray<MCPPagination::FPageRow> Bones;
+	Bones.Reserve(NumBones);
 	for (int32 i = 0; i < NumBones; ++i)
 	{
+		const FString BoneName = Ref.GetBoneName(i).ToString();
 		TSharedPtr<FJsonObject> B = MakeShared<FJsonObject>();
-		B->SetStringField(TEXT("name"), Ref.GetBoneName(i).ToString());
+		B->SetStringField(TEXT("name"), BoneName);
 		B->SetNumberField(TEXT("index"), i);
 		const int32 ParentIdx = Ref.GetParentIndex(i);
 		B->SetNumberField(TEXT("parentIndex"), ParentIdx);
 		if (ParentIdx != INDEX_NONE) B->SetStringField(TEXT("parentName"), Ref.GetBoneName(ParentIdx).ToString());
-		Bones.Add(MakeShared<FJsonValueObject>(B));
+		// The bone NAME is the anchor, not its index: a skeleton edited between
+		// two pages renumbers every bone after the change, and an index would
+		// then resume at a different joint while claiming to be exact.
+		Bones.Add({ BoneName, MakeShared<FJsonValueObject>(B) });
 	}
 
 	auto Result = MCPSuccess();
@@ -326,7 +377,7 @@ TSharedPtr<FJsonValue> FAnimationHandlers::ListBones(const TSharedPtr<FJsonObjec
 	Result->SetStringField(TEXT("worldName"), World ? World->GetName() : TEXT(""));
 	AddSkeletalComponentMetadata(Result, SK);
 	Result->SetNumberField(TEXT("boneCount"), NumBones);
-	Result->SetArrayField(TEXT("bones"), Bones);
+	MCPPagination::EmitPage(Page, Bones, TEXT("bones"), Result);
 	return MCPResult(Result);
 }
 
@@ -335,10 +386,12 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RebindLeaderPose(const TSharedPtr<FJs
 {
 	REQUIRE_EDITOR_WORLD(World);
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
-	AActor* Actor = FindActorByLabel(World, ActorLabel);
-	if (!Actor) return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+	if (!Actor) return ActorErr;
+	ActorLabel = Actor->GetActorLabel();
 
 	TArray<USkeletalMeshComponent*> Comps;
 	Actor->GetComponents<USkeletalMeshComponent>(Comps);
@@ -361,10 +414,22 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RebindLeaderPose(const TSharedPtr<FJs
 	if (!Body) return MCPError(TEXT("Could not resolve a body SkeletalMeshComponent"));
 
 	int32 Rebound = 0;
+	int32 AlreadyBoundToBody = 0;
 	TArray<TSharedPtr<FJsonValue>> Bound;
+	// What each component was following before, reported so a caller can see
+	// what the rebind displaced. It is not a rollback payload: no action points
+	// a component at an arbitrary leader or clears one.
+	TArray<TSharedPtr<FJsonValue>> PreviousLeaders;
 	for (USkeletalMeshComponent* C : Comps)
 	{
 		if (C == Body) continue;
+		const USkinnedMeshComponent* PrevLeader = C->LeaderPoseComponent.Get();
+		if (PrevLeader == Body) ++AlreadyBoundToBody;
+		TSharedPtr<FJsonObject> Prev = MakeShared<FJsonObject>();
+		Prev->SetStringField(TEXT("component"), C->GetName());
+		Prev->SetStringField(TEXT("previousLeader"), PrevLeader ? PrevLeader->GetName() : FString());
+		PreviousLeaders.Add(MakeShared<FJsonValueObject>(Prev));
+
 		C->SetLeaderPoseComponent(nullptr, /*bForceUpdate*/ true);
 		C->SetLeaderPoseComponent(Body, /*bForceUpdate*/ true);
 		Bound.Add(MakeShared<FJsonValueString>(C->GetName()));
@@ -373,10 +438,18 @@ TSharedPtr<FJsonValue> FAnimationHandlers::RebindLeaderPose(const TSharedPtr<FJs
 
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
+	Result->SetBoolField(TEXT("unchanged"), Rebound > 0 && AlreadyBoundToBody == Rebound);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetStringField(TEXT("body"), Body->GetName());
 	Result->SetNumberField(TEXT("rebound"), Rebound);
+	Result->SetNumberField(TEXT("alreadyBoundToBody"), AlreadyBoundToBody);
 	Result->SetArrayField(TEXT("components"), Bound);
+	Result->SetArrayField(TEXT("previousLeaders"), PreviousLeaders);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("This points every other skeletal mesh component at one body component. No action sets a component's leader pose to an arbitrary component or clears one, so the previous bindings listed in previousLeaders cannot be replayed. ")
+		TEXT("The binding is live component state on the spawned actor rather than saved asset data, so it is rebuilt from the actor's construction when the world reloads."));
 	return MCPResult(Result);
 }
 
@@ -385,12 +458,14 @@ TSharedPtr<FJsonValue> FAnimationHandlers::PreviewAnimation(const TSharedPtr<FJs
 {
 	REQUIRE_EDITOR_WORLD(World);
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 	bool bEnabled = true;
 	Params->TryGetBoolField(TEXT("enabled"), bEnabled);
 
-	AActor* Actor = FindActorByLabel(World, ActorLabel);
-	if (!Actor) return MCPError(FString::Printf(TEXT("Actor not found: %s"), *ActorLabel));
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* Actor = MCPResolveActor(World, Params, ActorErr);
+	if (!Actor) return ActorErr;
+	ActorLabel = Actor->GetActorLabel();
 
 	TArray<USkeletalMeshComponent*> Comps;
 	Actor->GetComponents<USkeletalMeshComponent>(Comps);
@@ -413,12 +488,312 @@ TSharedPtr<FJsonValue> FAnimationHandlers::PreviewAnimation(const TSharedPtr<FJs
 	auto Result = MCPSuccess();
 	MCPSetUpdated(Result);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Result->SetBoolField(TEXT("enabled"), bEnabled);
 	Result->SetNumberField(TEXT("componentsUpdated"), Updated);
 
 	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Payload->SetStringField(TEXT("actorPath"), Actor->GetPathName());
 	Payload->SetBoolField(TEXT("enabled"), !bEnabled);
 	MCPSetRollback(Result, TEXT("preview_animation"), Payload);
+	return MCPResult(Result);
+}
+
+
+// Set the transient component override rather than the skeletal mesh's
+// PostProcessAnimBlueprint asset setting. A live actor may be an editor-world
+// actor or a PIE copy; either way this is intentionally not saved into an asset
+// or template and disappears when that component is reconstructed.
+TSharedPtr<FJsonValue> FAnimationHandlers::SetLivePostProcessAnimBlueprint(const TSharedPtr<FJsonObject>& Params)
+{
+#if !UE_MCP_HAS_5_5_API
+	// USkeletalMeshComponent::OverridePostProcessAnimBP, its setter, and
+	// GetPostProcessAnimBPClassToBeUsed all arrived in 5.5. On 5.4 the
+	// post-process AnimBP belongs to the SkeletalMesh asset and a component
+	// carries no override to set or clear, so there is no live override to
+	// report on either.
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("success"), false);
+	Result->SetStringField(TEXT("errorCode"), TEXT("unsupported_engine_version"));
+	Result->SetStringField(TEXT("error"), TEXT("set_live_post_process_anim_blueprint requires Unreal Engine 5.5 or newer, because the per-component post-process AnimBP override does not exist in 5.4. Set the post-process AnimBP on the SkeletalMesh asset instead."));
+	return MCPResult(Result);
+#else
+	FString ActorLabel;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
+	const FString ComponentName = OptionalString(Params, TEXT("componentName"));
+	const FString AnimBlueprintClassPath = OptionalString(Params, TEXT("animBlueprintClassPath"));
+	bool bClear = false;
+	Params->TryGetBoolField(TEXT("clear"), bClear);
+	if (bClear && !AnimBlueprintClassPath.IsEmpty())
+	{
+		return MCPError(TEXT("Pass either animBlueprintClassPath or clear=true, not both"));
+	}
+	if (!bClear && AnimBlueprintClassPath.IsEmpty())
+	{
+		return MCPError(TEXT("animBlueprintClassPath is required unless clear=true"));
+	}
+
+	UAnimBlueprintGeneratedClass* NewClass = nullptr;
+	if (!bClear)
+	{
+		NewClass = LoadObject<UAnimBlueprintGeneratedClass>(nullptr, *AnimBlueprintClassPath);
+		if (!NewClass)
+		{
+			return MCPError(FString::Printf(
+				TEXT("AnimBlueprintGeneratedClass not found: %s. Pass the generated class object path (for example /Game/Animations/ABP_Name.ABP_Name_C), not the AnimBlueprint asset path."),
+				*AnimBlueprintClassPath));
+		}
+		if (!NewClass->IsChildOf(UAnimInstance::StaticClass()))
+		{
+			return MCPError(FString::Printf(TEXT("Class is not an AnimInstance subclass: %s"), *AnimBlueprintClassPath));
+		}
+	}
+
+	UWorld* World = nullptr;
+	AActor* Actor = nullptr;
+	FString ResolvedWorldScope;
+	if (auto Err = ResolveSkeletalActorForQuery(Params, ActorLabel, TEXT("auto"), World, Actor, ResolvedWorldScope)) return Err;
+	ActorLabel = Actor->GetActorLabel();
+	USkeletalMeshComponent* SK = ResolveSkeletalMeshComp(Actor, ComponentName);
+	if (!SK) return MakeSkeletalComponentNotFoundError(Actor, ActorLabel, ComponentName);
+	const USkeletalMesh* MeshAsset = SK->GetSkeletalMeshAsset();
+	if (!MeshAsset)
+	{
+		return MCPError(FString::Printf(TEXT("Skeletal mesh component '%s' has no skeletal mesh"), *SK->GetName()));
+	}
+	if (NewClass)
+	{
+		if (SK->GetAnimClass() == NewClass)
+		{
+			return MCPError(TEXT("The post-process AnimBP must differ from the component's main AnimBP"));
+		}
+
+		const USkeleton* MeshSkeleton = MeshAsset->GetSkeleton();
+		const USkeleton* AnimSkeleton = NewClass->GetTargetSkeleton();
+		if (MeshSkeleton && AnimSkeleton && MeshSkeleton != AnimSkeleton
+			&& !MeshSkeleton->IsCompatibleForEditor(AnimSkeleton)
+			&& !AnimSkeleton->IsCompatibleForEditor(MeshSkeleton))
+		{
+			return MCPError(FString::Printf(
+				TEXT("Post-process AnimBP skeleton '%s' is not compatible with component mesh skeleton '%s'"),
+				*AnimSkeleton->GetPathName(), *MeshSkeleton->GetPathName()));
+		}
+	}
+
+	const TSubclassOf<UAnimInstance> PreviousOverride = SK->OverridePostProcessAnimBP;
+	const bool bAlreadySet = PreviousOverride == NewClass;
+	if (!bAlreadySet)
+	{
+		SK->SetOverridePostProcessAnimBP(NewClass, /*ReinitAnimInstances*/ true);
+	}
+
+	const TSubclassOf<UAnimInstance> OverrideAfter = SK->OverridePostProcessAnimBP;
+	const TSubclassOf<UAnimInstance> EffectiveAfter = SK->GetPostProcessAnimBPClassToBeUsed();
+	UAnimInstance* InstanceAfter = SK->GetPostProcessInstance();
+
+	auto Result = MCPSuccess();
+	if (bAlreadySet) MCPSetExisted(Result); else MCPSetUpdated(Result);
+	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
+	Result->SetStringField(TEXT("world"), ResolvedWorldScope);
+	Result->SetStringField(TEXT("worldName"), World ? World->GetName() : TEXT(""));
+	AddSkeletalComponentMetadata(Result, SK);
+	Result->SetBoolField(TEXT("clear"), bClear);
+	Result->SetBoolField(TEXT("alreadySet"), bAlreadySet);
+	Result->SetBoolField(TEXT("transient"), true);
+	Result->SetStringField(TEXT("persistence"), TEXT("live component override only; no asset or component template was modified"));
+	Result->SetStringField(TEXT("previousOverrideClass"), PreviousOverride ? PreviousOverride->GetPathName() : TEXT(""));
+	Result->SetStringField(TEXT("overrideClass"), OverrideAfter ? OverrideAfter->GetPathName() : TEXT(""));
+	Result->SetStringField(TEXT("effectivePostProcessClass"), EffectiveAfter ? EffectiveAfter->GetPathName() : TEXT(""));
+	Result->SetStringField(TEXT("postProcessInstancePath"), InstanceAfter ? InstanceAfter->GetPathName() : TEXT(""));
+	Result->SetStringField(TEXT("postProcessInstanceClass"), InstanceAfter ? InstanceAfter->GetClass()->GetPathName() : TEXT(""));
+	Result->SetBoolField(TEXT("postProcessEnabled"), !SK->GetDisablePostProcessBlueprint());
+
+	TSharedPtr<FJsonObject> Rollback = MakeShared<FJsonObject>();
+	Rollback->SetStringField(TEXT("actorPath"), Actor->GetPathName());
+	Rollback->SetStringField(TEXT("componentName"), SK->GetName());
+	Rollback->SetStringField(TEXT("world"), ResolvedWorldScope);
+	if (PreviousOverride)
+	{
+		Rollback->SetStringField(TEXT("animBlueprintClassPath"), PreviousOverride->GetPathName());
+	}
+	else
+	{
+		Rollback->SetBoolField(TEXT("clear"), true);
+	}
+	MCPSetRollback(Result, TEXT("set_live_post_process_anim_blueprint"), Rollback);
+	return MCPResult(Result);
+#endif
+}
+
+
+// #922/#926: the EVALUATED pose off a live SkeletalMeshComponent, in the editor
+// world or in PIE.
+//
+// get_bone_transforms reads a skeleton's REFERENCE pose, which is the read that
+// looks correct while the running instance is wrong: in #922 a character lay
+// flat on the floor and every transform the bridge could show read clean,
+// because none of them were the pose the component was actually holding.
+// get_bone_transform answers for one bone at a time. This answers for a set, off
+// the component's own evaluated arrays, and reports what is driving the
+// evaluation next to the numbers, so a flat character and a stopped anim
+// instance are distinguishable from one call.
+TSharedPtr<FJsonValue> FAnimationHandlers::GetLiveBoneTransforms(const TSharedPtr<FJsonObject>& Params)
+{
+	// How many bones one response carries. A humanoid skeleton is a few hundred,
+	// so the whole thing fits; a crowd-scale or facial rig can be far more.
+	constexpr int32 LiveBoneTransformCap = 1000;
+
+	FString ActorLabel;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
+	const FString ComponentName = OptionalString(Params, TEXT("componentName"));
+	const FString Space = OptionalString(Params, TEXT("space"), TEXT("world")).ToLower();
+	if (!(Space == TEXT("world") || Space == TEXT("component") || Space == TEXT("local")))
+	{
+		return MCPError(TEXT("space must be 'world' (default), 'component', or 'local'"));
+	}
+
+	UWorld* World = nullptr;
+	AActor* Actor = nullptr;
+	FString ResolvedWorldScope;
+	if (auto Err = ResolveSkeletalActorForQuery(Params, ActorLabel, TEXT("auto"), World, Actor, ResolvedWorldScope)) return Err;
+	// A caller who passed only actorPath left ActorLabel holding the path, and
+	// every message below reads better naming the actor that answered (#983).
+	ActorLabel = Actor->GetActorLabel();
+	USkeletalMeshComponent* SK = ResolveSkeletalMeshComp(Actor, ComponentName);
+	if (!SK) return MakeSkeletalComponentNotFoundError(Actor, ActorLabel, ComponentName);
+	USkeletalMesh* Mesh = SK->GetSkeletalMeshAsset();
+	if (!Mesh)
+	{
+		return MCPError(FString::Printf(
+			TEXT("SkeletalMeshComponent '%s' on actor '%s' has no SkeletalMesh asset"), *SK->GetName(), *ActorLabel));
+	}
+
+	const FReferenceSkeleton& RefSkeleton = Mesh->GetRefSkeleton();
+
+	// boneNames selects a subset; omitting it returns every bone, which is what a
+	// caller diagnosing a pose wants and is a few hundred entries on a character.
+	TArray<FName> RequestedBones;
+	const TArray<TSharedPtr<FJsonValue>>* BonesArray = nullptr;
+	if (Params->TryGetArrayField(TEXT("boneNames"), BonesArray) && BonesArray)
+	{
+		for (const TSharedPtr<FJsonValue>& Entry : *BonesArray)
+		{
+			if (!Entry.IsValid()) continue;
+			const FString Name = Entry->AsString();
+			if (!Name.IsEmpty()) RequestedBones.Add(FName(*Name));
+		}
+	}
+	if (RequestedBones.Num() == 0)
+	{
+		for (int32 BoneIndex = 0; BoneIndex < RefSkeleton.GetNum(); ++BoneIndex)
+		{
+			RequestedBones.Add(RefSkeleton.GetBoneName(BoneIndex));
+		}
+	}
+	if (RequestedBones.Num() > LiveBoneTransformCap)
+	{
+		return MCPError(FString::Printf(
+			TEXT("%d bones requested, over the %d limit. Pass 'boneNames' with the bones you need."),
+			RequestedBones.Num(), LiveBoneTransformCap));
+	}
+
+	const TArray<FTransform>& ComponentSpace = SK->GetComponentSpaceTransforms();
+	const TArray<FTransform> BoneSpace = SK->GetBoneSpaceTransforms();
+
+	TArray<TSharedPtr<FJsonValue>> Bones;
+	TArray<TSharedPtr<FJsonValue>> Missing;
+	Bones.Reserve(RequestedBones.Num());
+	for (const FName& BoneName : RequestedBones)
+	{
+		const int32 BoneIndex = SK->GetBoneIndex(BoneName);
+		if (BoneIndex == INDEX_NONE)
+		{
+			Missing.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+			continue;
+		}
+
+		FTransform Transform;
+		if (Space == TEXT("world"))
+		{
+			Transform = SK->GetBoneTransform(BoneIndex);
+		}
+		else if (Space == TEXT("component"))
+		{
+			if (!ComponentSpace.IsValidIndex(BoneIndex))
+			{
+				Missing.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+				continue;
+			}
+			Transform = ComponentSpace[BoneIndex];
+		}
+		else
+		{
+			if (!BoneSpace.IsValidIndex(BoneIndex))
+			{
+				Missing.Add(MakeShared<FJsonValueString>(BoneName.ToString()));
+				continue;
+			}
+			Transform = BoneSpace[BoneIndex];
+		}
+
+		TSharedPtr<FJsonObject> BoneObj = MakeShared<FJsonObject>();
+		BoneObj->SetStringField(TEXT("name"), BoneName.ToString());
+		BoneObj->SetNumberField(TEXT("index"), BoneIndex);
+		const int32 ParentIndex = RefSkeleton.GetParentIndex(BoneIndex);
+		BoneObj->SetNumberField(TEXT("parentIndex"), ParentIndex);
+		if (ParentIndex != INDEX_NONE)
+		{
+			BoneObj->SetStringField(TEXT("parentName"), RefSkeleton.GetBoneName(ParentIndex).ToString());
+		}
+		BoneObj->SetObjectField(TEXT("location"), MCPVec3ToJsonObject(Transform.GetLocation()));
+		BoneObj->SetObjectField(TEXT("rotation"), MCPRotatorToJsonObject(Transform.GetRotation().Rotator()));
+		BoneObj->SetObjectField(TEXT("scale"), MCPVec3ToJsonObject(Transform.GetScale3D()));
+		Bones.Add(MakeShared<FJsonValueObject>(BoneObj));
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorName"), Actor->GetName());
+	Result->SetStringField(TEXT("actorPath"), Actor->GetPathName());
+	Result->SetStringField(TEXT("world"), ResolvedWorldScope);
+	Result->SetStringField(TEXT("worldName"), World ? World->GetName() : TEXT(""));
+	AddSkeletalComponentMetadata(Result, SK);
+	Result->SetStringField(TEXT("space"), Space);
+	Result->SetNumberField(TEXT("boneCount"), Bones.Num());
+	Result->SetArrayField(TEXT("bones"), Bones);
+	if (Missing.Num() > 0)
+	{
+		Result->SetArrayField(TEXT("unresolvedBones"), Missing);
+	}
+
+	// The component's own placement, so a component-space read lifts to world
+	// without a second call, and a component transform that reads clean while
+	// the pose does not is visible side by side (#922).
+	const FTransform ComponentToWorld = SK->GetComponentTransform();
+	TSharedPtr<FJsonObject> ComponentTransform = MakeShared<FJsonObject>();
+	ComponentTransform->SetObjectField(TEXT("location"), MCPVec3ToJsonObject(ComponentToWorld.GetLocation()));
+	ComponentTransform->SetObjectField(TEXT("rotation"), MCPRotatorToJsonObject(ComponentToWorld.GetRotation().Rotator()));
+	ComponentTransform->SetObjectField(TEXT("scale"), MCPVec3ToJsonObject(ComponentToWorld.GetScale3D()));
+	Result->SetObjectField(TEXT("componentTransform"), ComponentTransform);
+
+	// What is driving the pose. A stopped or absent anim instance is the usual
+	// reason an evaluated read matches the reference pose exactly.
+	TSharedPtr<FJsonObject> Evaluation = MakeShared<FJsonObject>();
+	const EAnimationMode::Type AnimationMode = SK->GetAnimationMode();
+	Evaluation->SetStringField(TEXT("animationMode"),
+		AnimationMode == EAnimationMode::AnimationBlueprint ? TEXT("AnimationBlueprint")
+		: AnimationMode == EAnimationMode::AnimationSingleNode ? TEXT("AnimationSingleNode")
+		: TEXT("AnimationCustomMode"));
+	if (UAnimInstance* AnimInstance = SK->GetAnimInstance())
+	{
+		Evaluation->SetStringField(TEXT("animInstanceClass"), AnimInstance->GetClass()->GetPathName());
+	}
+	Evaluation->SetNumberField(TEXT("componentSpaceTransformCount"), ComponentSpace.Num());
+	Evaluation->SetNumberField(TEXT("refSkeletonBoneCount"), RefSkeleton.GetNum());
+	Evaluation->SetBoolField(TEXT("componentVisible"), SK->IsVisible());
+	Result->SetObjectField(TEXT("evaluation"), Evaluation);
+
 	return MCPResult(Result);
 }

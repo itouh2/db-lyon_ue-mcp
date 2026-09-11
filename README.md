@@ -5,7 +5,7 @@
 [![stars](https://img.shields.io/github/stars/db-lyon/ue-mcp)](https://github.com/db-lyon/ue-mcp/stargazers)
 [![MIT](https://img.shields.io/npm/l/ue-mcp)](LICENSE)
 
-**Unreal Engine Model Context Protocol Server** - gives AI assistants deep read/write access to the Unreal Editor through <!-- count:tools -->24<!-- /count --> category tools covering <!-- count:actions -->783+<!-- /count --> actions, plus a YAML flow engine for multi-step workflows and an npm plugin system for extending the surface.
+**Unreal Engine Model Context Protocol Server** - gives AI assistants deep read/write access to the Unreal Editor through <!-- count:tools -->26<!-- /count --> category tools covering <!-- count:actions -->1930+<!-- /count --> actions, plus a YAML flow engine for multi-step workflows and an npm plugin system for extending the surface.
 
 On UE 5.8+ it also wraps Epic's entire native AI Toolset Registry - 830 official Unreal tools, called in-process and surfaced as `epic_*` actions in the matching category: Sequencer in `animation`, PCG in `pcg`, static meshes in `asset`.
 
@@ -52,6 +52,8 @@ Then talk to your AI in plain English:
 npx ue-mcp doctor
 ```
 
+Documentation lives at **https://ue-mcp.com/docs/**, one page per file in `docs/`, published automatically on release. Link there rather than to a file in this repository.
+
 Most first-run failures are one of three things: the editor hasn't been restarted since `init`, the bridge plugin failed to compile (check the editor's Output Log for `UE_MCP_Bridge`), or the editor is open on a different project than the one configured. See [Troubleshooting](https://ue-mcp.com/docs/troubleshooting/).
 
 ### Manual Configuration
@@ -88,7 +90,7 @@ Nothing is pre-authored. Every asset in the scene is created by the agent at run
 | **Blueprints** | Read/write graphs, add nodes, connect pins, compile, CDO and component property access |
 | **Materials** | Create materials and instances, author expression graphs, set parameters |
 | **Assets** | CRUD, import meshes/textures/animations, datatables, mesh bounds/collision/nav |
-| **Animation** | Anim blueprints, montages, blendspaces, skeletons |
+| **Animation** | Anim blueprints, montages, retargeting, native Control Rig editing, deterministic pose analysis |
 | **VFX** | Niagara systems, emitters, modules, renderers, parameters |
 | **Landscape** | Sculpt terrain, paint weight layers, materials, splines, proxies |
 | **Foliage** | Painting, foliage types, instance queries |
@@ -137,7 +139,7 @@ flows:
 flow(action="run", flowName="build_and_check")
 ```
 
-Every one of the <!-- count:actions -->783+<!-- /count --> actions is also a flow task. Flows support step references, retries, rollback, custom tasks in your own `.js`/`.ts`, and shell steps. See [Flows](https://ue-mcp.com/docs/flows/).
+Every one of the <!-- count:actions -->1930+<!-- /count --> actions is also a flow task. Flows support step references, retries, rollback, custom tasks in your own `.js`/`.ts`, and shell steps. See [Flows](https://ue-mcp.com/docs/flows/).
 
 ## Plugins
 
@@ -156,6 +158,7 @@ The package ships skills that teach agents the non-obvious parts of driving the 
 | Skill | Covers |
 |-------|--------|
 | `ue-mcp-workflow` | Required order of operations, editor lifecycle, project scoping |
+| [`ue-mcp-animation`](skills/ue-mcp-animation/SKILL.md) | UE 5.8 IK/retarget authoring, per-rig Control Rig solving, generic contact locks, bake and deterministic V&V |
 | `ue-mcp-blueprint` | Graph authoring, node discovery, pin wiring, compile loops |
 | `ue-mcp-niagara` | Emitter/module stack authoring and renderer setup |
 | `ue-mcp-native-cpp` | Writing and building native C++ against the bridge |
@@ -191,6 +194,8 @@ Editor process control (`editor(start_editor)` / `stop_editor` / `restart_editor
 - [Tool Reference](https://ue-mcp.com/docs/tool-reference/) - Every tool, action, and parameter
 - [Architecture](https://ue-mcp.com/docs/architecture/) - How the server, bridge, and editor fit together
 - [Flows](https://ue-mcp.com/docs/flows/) - Multi-step YAML workflows, custom tasks, rollback
+- [Journal](https://ue-mcp.com/docs/journal/) - The per-project record of what a session did, produced, and how it ended
+- [Skill Packs](https://ue-mcp.com/docs/skill-packs/) - Written workflows an agent reads, and checking that the calls they teach still exist
 - [Plugins](https://ue-mcp.com/docs/plugins/) - Extending the surface through npm
 - [Configuration](https://ue-mcp.com/docs/configuration/) - `ue-mcp.yml` and MCP client config
 - [Troubleshooting](https://ue-mcp.com/docs/troubleshooting/) - Connection, build, and asset path issues

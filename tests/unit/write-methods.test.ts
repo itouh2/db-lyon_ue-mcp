@@ -8,10 +8,38 @@ describe("classifyWrite", () => {
     expect(r.contentPaths).toEqual(["/Game/Foo"]);
   });
 
-  it("does not classify read verbs as writes", () => {
-    for (const m of ["read_asset", "list_assets", "get_asset_properties", "search_assets", "find_references"]) {
+  it("does not classify declared reads as writes", () => {
+    // Real bridge methods, whose actions declare `read`. Two of the five names
+    // this used to use (`get_asset_properties`, `find_references`) are not
+    // bridge methods at all, so the case was asserting that a verb list liked
+    // the look of a name nothing dispatches.
+    for (const m of ["read_asset", "list_assets", "get_world_outliner", "bulk_read_asset_properties"]) {
       expect(classifyWrite(m, { assetPath: "/Game/Foo" }).writes).toBe(false);
     }
+  });
+
+  it("does not classify a read a HANDLER makes on its own as a write", () => {
+    // No ActionSpec forwards to these, so nothing about the graph covers them.
+    // They are enumerated as reads rather than defaulted to changes.
+    expect(classifyWrite("search_assets", { assetPath: "/Game/Foo" }).writes).toBe(false);
+    expect(classifyWrite("get_engine_state", { assetPath: "/Game/Foo" }).writes).toBe(false);
+  });
+
+  it("classifies a declared mutation whose name no verb list matched", () => {
+    // `unwrap_uvs` rewrites a mesh's UV layout in place and `mesh_boolean`
+    // overwrites a StaticMesh package. Neither matches WRITE_VERB, so neither
+    // was ever checked out before a write reached disk.
+    expect(classifyWrite("unwrap_uvs", { assetPath: "/Game/SM_Rock" })).toEqual({
+      writes: true,
+      contentPaths: ["/Game/SM_Rock"],
+    });
+    expect(classifyWrite("mesh_boolean", { assetPath: "/Game/SM_Cut" }).writes).toBe(true);
+  });
+
+  it("treats a method this server does not carry as a candidate write", () => {
+    // A plugin calling the bridge with a method of its own. Nothing vouches
+    // for it, and an unnecessary checkout is the cheap side of the decision.
+    expect(classifyWrite("vendor_frobnicate", { assetPath: "/Game/Foo" }).writes).toBe(true);
   });
 
   it("extracts source and destination for a move", () => {
@@ -81,5 +109,51 @@ describe("classifyWrite", () => {
   it("ignores non-string path params", () => {
     const r = classifyWrite("save_asset", { assetPath: 123 });
     expect(r.writes).toBe(false);
+  });
+
+  it("extracts the actual Control Rig edit outputs", () => {
+    expect(classifyWrite("begin_control_rig_edit", { sequencePath: "/Game/Edit/LS_A" }).contentPaths)
+      .toEqual(["/Game/Edit/LS_A"]);
+    expect(classifyWrite("apply_control_rig_edits", { sequencePath: "/Game/Edit/LS_A" }).contentPaths)
+      .toEqual(["/Game/Edit/LS_A"]);
+    expect(classifyWrite("bake_control_rig_edit", {
+      sequencePath: "/Game/Edit/LS_A",
+      outputAssetPath: "/Game/Edit/A_Result",
+    }).contentPaths).toEqual(["/Game/Edit/A_Result"]);
+  });
+
+  it("extracts the edited IK or retargeter asset, not referenced inputs", () => {
+    const cases: Array<[string, Record<string, unknown>, string]> = [
+      ["configure_ik_rig", {
+        rigPath: "/Game/Rigs/IK_A",
+        skeletalMeshPath: "/Game/Characters/SK_A",
+      }, "/Game/Rigs/IK_A"],
+      ["configure_ik_retargeter", {
+        retargeterPath: "/Game/Rigs/RTG_A",
+        sourceRig: "/Game/Rigs/IK_Source",
+        targetRig: "/Game/Rigs/IK_Target",
+      }, "/Game/Rigs/RTG_A"],
+      ["set_ik_rig_mesh", {
+        rigPath: "/Game/Rigs/IK_A",
+        meshPath: "/Game/Characters/SK_A",
+      }, "/Game/Rigs/IK_A"],
+      ["set_ik_retargeter_rig", {
+        retargeterPath: "/Game/Rigs/RTG_A",
+        rigPath: "/Game/Rigs/IK_Target",
+      }, "/Game/Rigs/RTG_A"],
+      ["auto_align_retarget_pose", {
+        retargeterPath: "/Game/Rigs/RTG_A",
+      }, "/Game/Rigs/RTG_A"],
+      ["reset_retarget_pose", {
+        retargeterPath: "/Game/Rigs/RTG_A",
+      }, "/Game/Rigs/RTG_A"],
+    ];
+
+    for (const [method, params, expectedPath] of cases) {
+      expect(classifyWrite(method, params), method).toEqual({
+        writes: true,
+        contentPaths: [expectedPath],
+      });
+    }
   });
 });

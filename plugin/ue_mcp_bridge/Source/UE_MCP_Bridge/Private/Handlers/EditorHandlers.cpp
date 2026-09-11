@@ -1,6 +1,7 @@
 #include "EditorHandlers.h"
 #include "HandlerRegistry.h"
 #include "HandlerUtils.h"
+#include "HandlerPagination.h"
 
 #include "MessageLogModule.h"
 #include "IMessageLogListing.h"
@@ -23,11 +24,13 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "IPythonScriptPlugin.h"
+#include "Misc/Base64.h"
 #include "LevelSequence.h"
 #include "LevelSequenceEditorBlueprintLibrary.h"
 #include "Framework/Docking/TabManager.h"
 #include "Widgets/Docking/SDockTab.h"
 #include "ISettingsModule.h"
+#include "Interfaces/IMainFrameModule.h"
 #include "Modules/ModuleManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/ConfigContext.h"
@@ -41,6 +44,7 @@
 #include "RenderingThread.h"
 #include "Misc/AutomationTest.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Slate/SceneViewport.h"
 #include "HAL/PlatformMemory.h"
 #include "Misc/App.h"
@@ -240,12 +244,43 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("set_viewport_camera"), &SetViewportCamera);
 	Registry.RegisterHandler(TEXT("undo"), &Undo);
 	Registry.RegisterHandler(TEXT("redo"), &Redo);
+	Registry.RegisterHandler(TEXT("get_viewport_state"), &GetViewportState);
+	Registry.RegisterHandler(TEXT("set_view_mode"), &SetViewMode);
+	Registry.RegisterHandler(TEXT("set_viewport_exposure"), &SetViewportExposure);
+	Registry.RegisterHandler(TEXT("set_viewport_view"), &SetViewportView);
+	Registry.RegisterHandler(TEXT("set_game_view"), &SetGameView);
+	Registry.RegisterHandler(TEXT("redraw_viewport"), &RedrawViewport);
+	Registry.RegisterHandler(TEXT("begin_editor_transaction"), &BeginEditorTransaction);
+	Registry.RegisterHandler(TEXT("end_editor_transaction"), &EndEditorTransaction);
+	Registry.RegisterHandler(TEXT("cancel_editor_transaction"), &CancelEditorTransaction);
+	Registry.RegisterHandler(TEXT("get_undo_state"), &GetUndoState);
+	Registry.RegisterHandler(TEXT("undo_redo_steps"), &UndoRedoSteps);
+	Registry.RegisterHandler(TEXT("get_transaction_history"), &GetTransactionHistory);
+	// Insights trace control, frame timing and standalone runs, in
+	// EditorHandlers_Profiling.cpp.
+	Registry.RegisterHandler(TEXT("start_insights_trace"), &StartInsightsTrace);
+	Registry.RegisterHandler(TEXT("stop_insights_trace"), &StopInsightsTrace);
+	Registry.RegisterHandler(TEXT("pause_insights_trace"), &PauseInsightsTrace);
+	Registry.RegisterHandler(TEXT("get_insights_trace_status"), &GetInsightsTraceStatus);
+	Registry.RegisterHandler(TEXT("list_trace_channels"), &ListTraceChannels);
+	Registry.RegisterHandler(TEXT("set_trace_channels"), &SetTraceChannels);
+	Registry.RegisterHandler(TEXT("begin_profile_region"), &BeginProfileRegion);
+	Registry.RegisterHandler(TEXT("end_profile_region"), &EndProfileRegion);
+	Registry.RegisterHandler(TEXT("add_trace_bookmark"), &AddTraceBookmark);
+	Registry.RegisterHandler(TEXT("get_frame_timing"), &GetFrameTiming);
+	// trigger_hitch blocks the game thread for up to 5 seconds by design, which
+	// is longer than a default handler budget allows for.
+	Registry.RegisterHandlerWithTimeout(TEXT("trigger_hitch"), &TriggerHitch, 30.0f);
+	Registry.RegisterHandler(TEXT("launch_standalone_game"), &LaunchStandaloneGame);
+	Registry.RegisterHandler(TEXT("get_standalone_status"), &GetStandaloneStatus);
+	Registry.RegisterHandler(TEXT("stop_standalone_game"), &StopStandaloneGame);
 	Registry.RegisterHandler(TEXT("reload_handlers"), &ReloadHandlers);
 	// save_asset is owned by FAssetHandlers (#768: adds force, file size, mtime).
 	// Registering it here too meant the winner was decided by registration
 	// order in BridgeServer.cpp, which is not a contract.
 	Registry.RegisterHandler(TEXT("save_dirty"), &SaveDirty);
 	Registry.RegisterHandler(TEXT("list_dirty_packages"), &ListDirtyPackages);
+	Registry.RegisterHandler(TEXT("get_world_state"), &GetWorldState);
 	Registry.RegisterHandler(TEXT("request_editor_shutdown"), &RequestEditorShutdown);
 	Registry.RegisterHandler(TEXT("list_pie_instances"), &ListPIEInstances);
 	Registry.RegisterHandler(TEXT("invoke_object_function"), &InvokeObjectFunction);
@@ -254,6 +289,8 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("read_bone_transforms"), &ReadBoneTransforms);
 	Registry.RegisterHandler(TEXT("teleport_runtime_actor"), &TeleportRuntimeActor);
 	Registry.RegisterHandler(TEXT("set_movement_mode"), &SetMovementMode);
+	Registry.RegisterHandler(TEXT("set_runtime_visibility"), &SetRuntimeVisibility);
+	Registry.RegisterHandler(TEXT("restore_runtime_visibility"), &RestoreRuntimeVisibility);
 	// #802: resolve a live instance path, and write to a live instance.
 	Registry.RegisterHandler(TEXT("find_object"), &FindLiveObjects);
 	Registry.RegisterHandler(TEXT("set_object_property"), &SetObjectProperty);
@@ -271,6 +308,7 @@ void FEditorHandlers::RegisterHandlers(FMCPHandlerRegistry& Registry)
 	Registry.RegisterHandler(TEXT("run_stat_command"), &RunStatCommand);
 	Registry.RegisterHandler(TEXT("set_scalability"), &SetScalability);
 	Registry.RegisterHandler(TEXT("set_cvars"), &SetCVars);
+	Registry.RegisterHandler(TEXT("get_cvars"), &GetCVars);
 	Registry.RegisterHandler(TEXT("build_geometry"), &BuildGeometry);
 	Registry.RegisterHandler(TEXT("build_hlod"), &BuildHlod);
 	Registry.RegisterHandler(TEXT("list_crashes"), &ListCrashes);
@@ -317,7 +355,182 @@ TSharedPtr<FJsonValue> FEditorHandlers::ExecuteCommand(const TSharedPtr<FJsonObj
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("command"), Command);
+	// The command was dispatched. Whether it changed anything is the command's
+	// business: the console reports nothing back that this handler could read.
+	Result->SetBoolField(TEXT("changed"), true);
+	// No rollback. An arbitrary console command has no captured before-state:
+	// the string is opaque here, most commands are not writes to a value that
+	// could be read first, and the ones that are (a cvar assignment, a toggle)
+	// invert to their previous value rather than to running the same command
+	// again. Use editor(set_cvars) when the write is a console variable - it
+	// reads the old value first and emits the inverse.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("A console command's effect is opaque to the bridge and nothing was captured before it ran. Re-running the same command is not an inverse. For console variables use editor(set_cvars), which records the previous value and emits a rollback that restores it."));
 	return MCPResult(Result);
+}
+
+// #995: both Python handlers hand back everything the interpreter logged,
+// which is the right default and a poor one for a verification script: a few
+// hundred printed lines is 60-80 KB of response for a caller that named a
+// resultVariable and wants one value out of it, and the response is then
+// rejected for exceeding the token limit. captureLog and maxLogChars are the
+// two ways out. They live here because the emission block was copied between
+// the two handlers, and a control added to one copy would have been a control
+// the other silently lacked.
+namespace
+{
+	/**
+	 * Quote an arbitrary string as a Python string literal. Used to carry a
+	 * path, a function name and a JSON payload into a generated statement
+	 * without any of them being able to end the literal they sit in.
+	 */
+	static FString PythonStringLiteral(const FString& In)
+	{
+		FString S = In;
+		S.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+		S.ReplaceInline(TEXT("\""), TEXT("\\\""));
+		S.ReplaceInline(TEXT("\r"), TEXT("\\r"));
+		S.ReplaceInline(TEXT("\n"), TEXT("\\n"));
+		S.ReplaceInline(TEXT("\t"), TEXT("\\t"));
+		return FString(TEXT("\"")) + S + TEXT("\"");
+	}
+
+	/**
+	 * The value of a Python variable, as text a caller can use directly.
+	 *
+	 * UE only evaluates a statement to `repr(value)`, so a str came back
+	 * wearing quotes: a script that set `mcp_result = 'done'` produced
+	 * `result: "'done'"`, and nothing in the response said whether those
+	 * quotes were data or packaging. This evaluates the variable base64 encoded
+	 * instead. Base64 is pure ASCII with no escapes, so its own repr is exactly
+	 * one quote character on each side and the text inside survives byte for
+	 * byte, unicode and embedded quotes included.
+	 *
+	 * A str yields its own characters; anything else yields its repr, which is
+	 * what makes a dict or a list readable. Returns false when the variable
+	 * does not exist or the round trip fails, and the caller then falls back to
+	 * the plain evaluation so this can only ever add fidelity.
+	 */
+	static bool EvaluatePythonResultVariable(
+		IPythonScriptPlugin* PythonPlugin,
+		const FString& VariableName,
+		FString& OutText)
+	{
+		if (!PythonPlugin || VariableName.IsEmpty()) return false;
+
+		FPythonCommandEx EncodeCommand;
+		EncodeCommand.Command = FString::Printf(
+			TEXT("__import__('base64').b64encode((lambda __mcp_v: __mcp_v if isinstance(__mcp_v, str) else repr(__mcp_v))(%s).encode('utf-8')).decode('ascii')"),
+			*VariableName);
+		EncodeCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
+		EncodeCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
+		if (!PythonPlugin->ExecPythonCommandEx(EncodeCommand)) return false;
+
+		FString Encoded = EncodeCommand.CommandResult.TrimStartAndEnd();
+		if (Encoded.Len() < 2) return false;
+		const TCHAR Quote = Encoded[0];
+		if ((Quote != TEXT('\'') && Quote != TEXT('"')) || Encoded[Encoded.Len() - 1] != Quote)
+		{
+			return false;
+		}
+		Encoded = Encoded.Mid(1, Encoded.Len() - 2);
+
+		TArray<uint8> Bytes;
+		if (!FBase64::Decode(Encoded, Bytes)) return false;
+		Bytes.Add(0);
+		OutText = FString(UTF8_TO_TCHAR(reinterpret_cast<const char*>(Bytes.GetData())));
+		return true;
+	}
+
+	static void EmitPythonLog(const TSharedPtr<FJsonObject>& Params,
+							const FPythonCommandEx& Command,
+							const TSharedPtr<FJsonObject>& Result)
+	{
+		bool bCaptureLog = true;
+		Params->TryGetBoolField(TEXT("captureLog"), bCaptureLog);
+		int32 MaxLogChars = 0;  // 0 means no cap
+		Params->TryGetNumberField(TEXT("maxLogChars"), MaxLogChars);
+		if (MaxLogChars < 0) MaxLogChars = 0;
+
+		int32 TotalChars = 0;
+		int32 ErrorCount = 0;
+		for (const FPythonLogOutputEntry& Entry : Command.LogOutput)
+		{
+			if (Entry.Type == EPythonLogOutputType::Error) ++ErrorCount;
+			TotalChars += Entry.Output.Len() + 1;
+		}
+		Result->SetNumberField(TEXT("logEntryCount"), Command.LogOutput.Num());
+		Result->SetNumberField(TEXT("logChars"), TotalChars);
+		Result->SetNumberField(TEXT("logErrorCount"), ErrorCount);
+
+		auto EntryJson = [](const FPythonLogOutputEntry& Entry)
+		{
+			TSharedPtr<FJsonObject> LogEntry = MakeShared<FJsonObject>();
+			LogEntry->SetStringField(TEXT("type"), LexToString(Entry.Type));
+			LogEntry->SetStringField(TEXT("output"), Entry.Output);
+			return MakeShared<FJsonValueObject>(LogEntry);
+		};
+
+		if (!bCaptureLog)
+		{
+			// Errors are not suppressible. A traceback is the one thing a caller
+			// cannot reconstruct from a returned value, and dropping it is how a
+			// failed run reads as an empty one.
+			TArray<TSharedPtr<FJsonValue>> Errors;
+			FString ErrorText;
+			for (const FPythonLogOutputEntry& Entry : Command.LogOutput)
+			{
+				if (Entry.Type != EPythonLogOutputType::Error) continue;
+				Errors.Add(EntryJson(Entry));
+				if (!ErrorText.IsEmpty()) ErrorText += TEXT("\n");
+				ErrorText += Entry.Output;
+			}
+			Result->SetArrayField(TEXT("log_output"), Errors);
+			Result->SetStringField(TEXT("output"), ErrorText);
+			Result->SetBoolField(TEXT("logSuppressed"), true);
+			Result->SetStringField(TEXT("logSuppressedNote"), FString::Printf(
+				TEXT("captureLog was false, so the %d characters this script logged were dropped and only its %d error entries kept. Re-run without captureLog to read the rest."),
+				TotalChars, Errors.Num()));
+			return;
+		}
+
+		// Under a cap the tail is what is kept: a script that failed says why at
+		// the end. Capping the joined string alone would not have helped, because
+		// log_output carries the same text a second time.
+		int32 First = 0;
+		if (MaxLogChars > 0 && TotalChars > MaxLogChars)
+		{
+			int32 Budget = MaxLogChars;
+			First = Command.LogOutput.Num();
+			for (int32 Index = Command.LogOutput.Num() - 1; Index >= 0; --Index)
+			{
+				const int32 Cost = Command.LogOutput[Index].Output.Len() + 1;
+				if (Cost > Budget) break;
+				Budget -= Cost;
+				First = Index;
+			}
+		}
+
+		TArray<TSharedPtr<FJsonValue>> LogArray;
+		FString CombinedOutput;
+		for (int32 Index = First; Index < Command.LogOutput.Num(); ++Index)
+		{
+			const FPythonLogOutputEntry& Entry = Command.LogOutput[Index];
+			LogArray.Add(EntryJson(Entry));
+			if (!CombinedOutput.IsEmpty()) CombinedOutput += TEXT("\n");
+			CombinedOutput += Entry.Output;
+		}
+		Result->SetArrayField(TEXT("log_output"), LogArray);
+		Result->SetStringField(TEXT("output"), CombinedOutput);
+		if (First > 0)
+		{
+			Result->SetBoolField(TEXT("logTruncated"), true);
+			Result->SetStringField(TEXT("logTruncatedNote"), FString::Printf(
+				TEXT("maxLogChars was %d and this script logged %d characters, so the first %d of %d entries were dropped and the tail kept."),
+				MaxLogChars, TotalChars, First, Command.LogOutput.Num()));
+		}
+	}
 }
 
 TSharedPtr<FJsonValue> FEditorHandlers::ExecutePython(const TSharedPtr<FJsonObject>& Params)
@@ -349,14 +562,26 @@ TSharedPtr<FJsonValue> FEditorHandlers::ExecutePython(const TSharedPtr<FJsonObje
 	bool bResultVariableResolved = false;
 	if (bSuccess && !ResultVariable.IsEmpty())
 	{
-		FPythonCommandEx EvalCommand;
-		EvalCommand.Command = ResultVariable;
-		EvalCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
-		EvalCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
-		if (PythonPlugin->ExecPythonCommandEx(EvalCommand))
+		FString VariableText;
+		if (EvaluatePythonResultVariable(PythonPlugin, ResultVariable, VariableText))
 		{
-			ResultText = EvalCommand.CommandResult;
+			ResultText = VariableText;
 			bResultVariableResolved = true;
+		}
+		else
+		{
+			// The encoded round trip is the accurate path; a plain evaluation is
+			// kept behind it so a variable it cannot encode still reports
+			// something rather than nothing.
+			FPythonCommandEx EvalCommand;
+			EvalCommand.Command = ResultVariable;
+			EvalCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
+			EvalCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
+			if (PythonPlugin->ExecPythonCommandEx(EvalCommand))
+			{
+				ResultText = EvalCommand.CommandResult;
+				bResultVariableResolved = true;
+			}
 		}
 	}
 
@@ -368,23 +593,17 @@ TSharedPtr<FJsonValue> FEditorHandlers::ExecutePython(const TSharedPtr<FJsonObje
 		Result->SetBoolField(TEXT("resultVariableResolved"), bResultVariableResolved);
 	}
 
-	TArray<TSharedPtr<FJsonValue>> LogArray;
-	for (const FPythonLogOutputEntry& Entry : PythonCommand.LogOutput)
-	{
-		TSharedPtr<FJsonObject> LogEntry = MakeShared<FJsonObject>();
-		LogEntry->SetStringField(TEXT("type"), LexToString(Entry.Type));
-		LogEntry->SetStringField(TEXT("output"), Entry.Output);
-		LogArray.Add(MakeShared<FJsonValueObject>(LogEntry));
-	}
-	Result->SetArrayField(TEXT("log_output"), LogArray);
+	EmitPythonLog(Params, PythonCommand, Result);
 
-	FString CombinedOutput;
-	for (const FPythonLogOutputEntry& Entry : PythonCommand.LogOutput)
-	{
-		if (!CombinedOutput.IsEmpty()) CombinedOutput += TEXT("\n");
-		CombinedOutput += Entry.Output;
-	}
-	Result->SetStringField(TEXT("output"), CombinedOutput);
+	// The script ran (or failed to). What it wrote is its own business: the
+	// interpreter reports no diff this handler could read, and a script that is
+	// a pure query is indistinguishable from one that rewrote the project.
+	Result->SetBoolField(TEXT("changed"), bSuccess);
+	// No rollback. Arbitrary Python can do anything, nothing was captured
+	// before it ran, and there is no inverse script to name.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Arbitrary Python has no inverse and nothing was captured before it ran. Wrap the writes in editor(begin_editor_transaction) and roll back with editor(cancel_editor_transaction) when they are transactional, or write the undo script yourself."));
 
 	return MCPResult(Result);
 }
@@ -421,13 +640,62 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunPythonFile(const TSharedPtr<FJsonObje
 		}
 	}
 
+	// #995: a project script under Tools/ usually holds several independent
+	// stages - preflight(), migrate(), verify() - behind a main() that chains
+	// them, and during a session you want one stage, not main(). Running the
+	// file top to bottom could not express that, so every such call went
+	// through execute_python carrying a hand-written exec-into-a-namespace
+	// preamble. entryPoint is that preamble, written once and correctly.
+	//
+	// runpy.run_path with a run_name other than __main__ is what keeps the main
+	// guard from firing, and it hands back the namespace the file defined, so
+	// the named function is called from a module that really was loaded rather
+	// than from a re-exec of the source.
+	const FString EntryPoint = OptionalString(Params, TEXT("entryPoint"));
+
 	FPythonCommandEx PythonCommand;
-	PythonCommand.Command = FilePath;
 	PythonCommand.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
 	PythonCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
-	for (const FString& A : ExtraArgs)
+	if (EntryPoint.IsEmpty())
 	{
-		PythonCommand.Command += TEXT(" ") + A;
+		PythonCommand.Command = FilePath;
+		for (const FString& A : ExtraArgs)
+		{
+			PythonCommand.Command += TEXT(" ") + A;
+		}
+	}
+	else
+	{
+		// With an entryPoint the args are the call arguments rather than
+		// sys.argv, which is what a caller asking for one stage means by them.
+		// They go over as JSON and are decoded on the other side, so a value
+		// carrying quotes or newlines cannot break the statement around it.
+		TArray<TSharedPtr<FJsonValue>> ArgValues;
+		for (const FString& A : ExtraArgs) ArgValues.Add(MakeShared<FJsonValueString>(A));
+		FString ArgsJson;
+		const TSharedRef<TJsonWriter<>> ArgsWriter = TJsonWriterFactory<>::Create(&ArgsJson);
+		FJsonSerializer::Serialize(ArgValues, ArgsWriter);
+
+		FString KwargsJson(TEXT("{}"));
+		const TSharedPtr<FJsonObject>* KwargsObj = nullptr;
+		if (Params->TryGetObjectField(TEXT("kwargs"), KwargsObj) && KwargsObj && KwargsObj->IsValid())
+		{
+			KwargsJson.Reset();
+			const TSharedRef<TJsonWriter<>> KwargsWriter = TJsonWriterFactory<>::Create(&KwargsJson);
+			FJsonSerializer::Serialize(KwargsObj->ToSharedRef(), KwargsWriter);
+		}
+
+		PythonCommand.Command = FString::Printf(
+			TEXT("import runpy as _uemcp_runpy, json as _uemcp_json\n")
+			TEXT("_uemcp_path = %s\n")
+			TEXT("_uemcp_entry = %s\n")
+			TEXT("_uemcp_ns = _uemcp_runpy.run_path(_uemcp_path, run_name='ue_mcp_entry')\n")
+			TEXT("_uemcp_fn = _uemcp_ns.get(_uemcp_entry)\n")
+			TEXT("if not callable(_uemcp_fn):\n")
+			TEXT("    raise NameError('run_python_file: {!r} is not a callable defined by {}'.format(_uemcp_entry, _uemcp_path))\n")
+			TEXT("result = _uemcp_fn(*_uemcp_json.loads(%s), **_uemcp_json.loads(%s))\n"),
+			*PythonStringLiteral(FilePath), *PythonStringLiteral(EntryPoint),
+			*PythonStringLiteral(ArgsJson), *PythonStringLiteral(KwargsJson));
 	}
 
 	bool bSuccess = PythonPlugin->ExecPythonCommandEx(PythonCommand);
@@ -435,43 +703,57 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunPythonFile(const TSharedPtr<FJsonObje
 	// #732: same first-class result channel as execute_python. The file runs in
 	// the Public (__main__) scope, so a named resultVariable can be read back.
 	FString ResultText = PythonCommand.CommandResult;
-	const FString ResultVariable = OptionalString(Params, TEXT("resultVariable"));
+	FString ResultVariable = OptionalString(Params, TEXT("resultVariable"));
+	// An entryPoint call leaves its return value in `result`, so a caller who
+	// asked for one function does not also have to say where to find what it
+	// returned. An explicit resultVariable still wins.
+	if (ResultVariable.IsEmpty() && !EntryPoint.IsEmpty()) ResultVariable = TEXT("result");
 	bool bResultVariableResolved = false;
 	if (bSuccess && !ResultVariable.IsEmpty())
 	{
-		FPythonCommandEx EvalCommand;
-		EvalCommand.Command = ResultVariable;
-		EvalCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
-		EvalCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
-		if (PythonPlugin->ExecPythonCommandEx(EvalCommand))
+		FString VariableText;
+		if (EvaluatePythonResultVariable(PythonPlugin, ResultVariable, VariableText))
 		{
-			ResultText = EvalCommand.CommandResult;
+			ResultText = VariableText;
 			bResultVariableResolved = true;
+		}
+		else
+		{
+			// The encoded round trip is the accurate path; a plain evaluation is
+			// kept behind it so a variable it cannot encode still reports
+			// something rather than nothing.
+			FPythonCommandEx EvalCommand;
+			EvalCommand.Command = ResultVariable;
+			EvalCommand.ExecutionMode = EPythonCommandExecutionMode::EvaluateStatement;
+			EvalCommand.FileExecutionScope = EPythonFileExecutionScope::Public;
+			if (PythonPlugin->ExecPythonCommandEx(EvalCommand))
+			{
+				ResultText = EvalCommand.CommandResult;
+				bResultVariableResolved = true;
+			}
 		}
 	}
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), bSuccess);
 	Result->SetStringField(TEXT("path"), FilePath);
+	if (!EntryPoint.IsEmpty()) Result->SetStringField(TEXT("entryPoint"), EntryPoint);
 	Result->SetStringField(TEXT("result"), ResultText);
 	if (!ResultVariable.IsEmpty())
 	{
 		Result->SetBoolField(TEXT("resultVariableResolved"), bResultVariableResolved);
 	}
 
-	TArray<TSharedPtr<FJsonValue>> LogArray;
-	FString CombinedOutput;
-	for (const FPythonLogOutputEntry& Entry : PythonCommand.LogOutput)
-	{
-		TSharedPtr<FJsonObject> LogEntry = MakeShared<FJsonObject>();
-		LogEntry->SetStringField(TEXT("type"), LexToString(Entry.Type));
-		LogEntry->SetStringField(TEXT("output"), Entry.Output);
-		LogArray.Add(MakeShared<FJsonValueObject>(LogEntry));
-		if (!CombinedOutput.IsEmpty()) CombinedOutput += TEXT("\n");
-		CombinedOutput += Entry.Output;
-	}
-	Result->SetArrayField(TEXT("log_output"), LogArray);
-	Result->SetStringField(TEXT("output"), CombinedOutput);
+	EmitPythonLog(Params, PythonCommand, Result);
+
+	// The file ran (or failed to). What it wrote is its own business: the
+	// interpreter reports no diff this handler could read.
+	Result->SetBoolField(TEXT("changed"), bSuccess);
+	// No rollback. An arbitrary script file can do anything, nothing was
+	// captured before it ran, and there is no inverse script to name.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("An arbitrary script file has no inverse and nothing was captured before it ran. Wrap the writes in editor(begin_editor_transaction) and roll back with editor(cancel_editor_transaction) when they are transactional, or ship an undo script alongside it."));
 
 	return MCPResult(Result);
 }
@@ -537,6 +819,16 @@ TSharedPtr<FJsonValue> FEditorHandlers::PurgePythonModules(const TSharedPtr<FJso
 	Result->SetStringField(TEXT("prefix"), Prefix);
 	Result->SetArrayField(TEXT("purged"), Purged);
 	Result->SetNumberField(TEXT("count"), Purged.Num());
+	// A prefix that matched nothing left sys.modules exactly as it was, which
+	// is also what a replay of this call finds.
+	Result->SetBoolField(TEXT("changed"), Purged.Num() > 0);
+	// No rollback. Re-importing is not the inverse of a purge: it reloads the
+	// modules from what is on disk NOW, and the module objects the purge
+	// dropped (with whatever state they held) are gone. Reloading the current
+	// files is also the reason the purge was asked for in the first place.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("The purged module objects and the state they held cannot be put back. Importing the same names again builds new modules from the files on disk, which is a fresh load rather than a restore, and there is no bridge call that does it."));
 	return MCPResult(Result);
 }
 
@@ -553,9 +845,26 @@ TSharedPtr<FJsonValue> FEditorHandlers::CloseSequence(const TSharedPtr<FJsonObje
 
 	auto Result = MCPSuccess();
 	Result->SetBoolField(TEXT("wasOpen"), bWasOpen);
+	Result->SetBoolField(TEXT("changed"), bWasOpen);
 	if (bWasOpen)
 	{
 		Result->SetStringField(TEXT("closedSequence"), OpenPath);
+		// The inverse of closing the Sequencer on a sequence is opening that
+		// sequence again, which is what open_asset does for a ULevelSequence.
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("assetPath"), OpenPath);
+		MCPSetRollback(Result, TEXT("open_asset"), Payload);
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Reopens the same sequence in Sequencer. Only the fact that it is open comes back: the playhead position, the selection, the track expansion and any locked-camera state the closed editor held are not captured and are not restored."));
+	}
+	else
+	{
+		// Nothing was open, so nothing was closed and there is nothing to
+		// reopen. This is the idempotent replay of a flow that already closed.
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("No sequence was open, so nothing changed and there is nothing to restore."));
 	}
 	return MCPResult(Result);
 }
@@ -567,16 +876,27 @@ TSharedPtr<FJsonValue> FEditorHandlers::OpenTab(const TSharedPtr<FJsonObject>& P
 	FString TabId;
 	if (auto Err = RequireString(Params, TEXT("tabId"), TabId)) return Err;
 
+	// Asked before invoking: TryInvokeTab draws attention to a tab that is
+	// already up and returns it either way, so this is the only point at which
+	// "was it already open" is answerable.
+	const bool bAlreadyOpen = FGlobalTabmanager::Get()->FindExistingLiveTab(FTabId(*TabId)).IsValid();
 	TSharedPtr<SDockTab> Tab = FGlobalTabmanager::Get()->TryInvokeTab(FTabId(*TabId));
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("tabId"), TabId);
 	Result->SetBoolField(TEXT("opened"), Tab.IsValid());
+	Result->SetBoolField(TEXT("alreadyOpen"), bAlreadyOpen);
+	Result->SetBoolField(TEXT("changed"), Tab.IsValid() && !bAlreadyOpen);
 	if (!Tab.IsValid())
 	{
 		Result->SetBoolField(TEXT("success"), false);
 		Result->SetStringField(TEXT("error"), FString::Printf(TEXT("No registered tab with id '%s' (try 'ProjectSettings', 'OutputLog', 'ContentBrowserTab1', ...)"), *TabId));
 	}
+	// No rollback: nothing in the bridge closes an editor tab. close_sequence
+	// is the one exception and it is specific to Sequencer, not a tab id.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("No bridge call closes an editor tab by id, so an opened tab cannot be put away again. Nothing outside the editor's own window layout was written."));
 	return MCPResult(Result);
 }
 
@@ -607,7 +927,9 @@ TSharedPtr<FJsonValue> FEditorHandlers::OpenSettings(const TSharedPtr<FJsonObjec
 	}
 
 	// Make sure the viewer tab exists, then show the requested section.
-	FGlobalTabmanager::Get()->TryInvokeTab(FTabId(Container == TEXT("Editor") ? TEXT("EditorSettings") : TEXT("ProjectSettings")));
+	const FTabId ViewerTabId(Container == TEXT("Editor") ? TEXT("EditorSettings") : TEXT("ProjectSettings"));
+	const bool bAlreadyOpen = FGlobalTabmanager::Get()->FindExistingLiveTab(ViewerTabId).IsValid();
+	FGlobalTabmanager::Get()->TryInvokeTab(ViewerTabId);
 	if (!Category.IsEmpty())
 	{
 		SettingsModule->ShowViewer(FName(*Container), FName(*Category), FName(*Section));
@@ -617,6 +939,15 @@ TSharedPtr<FJsonValue> FEditorHandlers::OpenSettings(const TSharedPtr<FJsonObjec
 	Result->SetStringField(TEXT("container"), Container);
 	Result->SetStringField(TEXT("category"), Category);
 	Result->SetStringField(TEXT("section"), Section);
+	Result->SetBoolField(TEXT("alreadyOpen"), bAlreadyOpen);
+	// Navigating an already-open viewer to a different section is still a
+	// change to what it shows, so only a repeat with no section is a true no-op.
+	Result->SetBoolField(TEXT("changed"), !bAlreadyOpen || !Category.IsEmpty());
+	// No rollback: nothing in the bridge closes a settings viewer or reads back
+	// which section it was showing, so neither half can be restored.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("No bridge call closes the settings viewer, and the section it was showing before is not readable, so there is nothing to restore it to. This opens and navigates editor UI; it writes no project setting."));
 	return MCPResult(Result);
 }
 
@@ -657,6 +988,71 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetProperty(const TSharedPtr<FJsonObject
 		return MCPError(ResolvePropertyErr);
 	}
 
+	// Capture what is about to be overwritten. This is the only value an
+	// inverse call could restore, and it is unreadable once the write lands.
+	//
+	// Structured, not export text. Exported text is refused or misread on
+	// replay in three ways: a TMap with a struct key exports pairs that
+	// ImportMapText rejects, a gameplay tag exports as TagName="A.B" rather
+	// than the plain name its setter looks up, and a null object reference
+	// exports as the literal None, which the setter then tries to load.
+	// SerializeValue is the read half of the setter's own format.
+	//
+	// It does NOT make a float exact. MCPJsonProperty::SetJsonOnPropertyImpl
+	// has no numeric branch (its only integer write is the enum one), so a
+	// JSON number falls through to the export-text fallback, is stringified by
+	// FString::SanitizeFloat, and SanitizeFloat is Printf("%f"): six
+	// fractional digits with trailing zeros stripped. So 1e-9 still restores
+	// as zero and 0.123456789 still restores as 0.123457, and an int64 past
+	// 2^53 loses its low bits to the double it travelled in. The truncation
+	// moved from the reader to the writer rather than going away. What did
+	// change is that the probe below now MEASURES it, so those values are
+	// reported rollbackLossy instead of silently restoring wrong. Making them
+	// exact needs a numeric branch in the shared setter, which is not this
+	// file.
+	TSharedPtr<FJsonValue> PreviousStructured =
+		FMCPJsonSerializer::SerializeValue(PropertyValue, Property);
+
+	// A raw copy of the same value, which answers two questions no pair of
+	// exported strings can: whether the write below actually changed anything,
+	// and whether the rollback this call is about to advertise really restores
+	// what was here. FText and instanced subobjects are new instances on every
+	// import and are never Identical, so they are reported as uncompared
+	// rather than as a false mismatch.
+	const bool bComparable = MCPJsonProperty::PropertyIsComparableByIdentity(Property);
+	FDefaultConstructedPropertyElement PreviousRaw(Property);
+	Property->CopyCompleteValue(PreviousRaw.GetObjAddress(), PropertyValue);
+
+	// Prove the round trip rather than asserting it: apply the exact value the
+	// rollback would send to a scratch copy and compare. The two ways this can
+	// go wrong are kept apart, because they call for opposite answers. If the
+	// setter REFUSES the value the rollback cannot run at all and must not be
+	// advertised - an FTransform is the common case, since it serializes as
+	// translation/rotation/scale with a Rotator while its reflected fields are
+	// Translation, Rotation as an FQuat and Scale3D, so the replay fails on
+	// the field names. If the setter accepts it and the result differs, the
+	// rollback runs and lands somewhere near, which is lossy but usable.
+	// This costs one deserialize on a path that already runs
+	// PostEditChangeProperty and, by default, writes the package to disk.
+	bool bRollbackApplies = false;
+	bool bRollbackRoundTrips = false;
+	FString ProbeError;
+	if (bComparable)
+	{
+		FDefaultConstructedPropertyElement Probe(Property);
+		bRollbackApplies =
+			MCPJsonProperty::SetJsonOnProperty(Property, Probe.GetObjAddress(), PreviousStructured, ProbeError);
+		bRollbackRoundTrips = bRollbackApplies
+			&& Property->Identical(Probe.GetObjAddress(), PreviousRaw.GetObjAddress(), PPF_None);
+	}
+	else
+	{
+		// Not comparable, so the probe would prove nothing either way. The
+		// rollback is still offered: it is the same call that wrote the value
+		// in the first place.
+		bRollbackApplies = true;
+	}
+
 	Asset->Modify();
 	if (LeafOwner && LeafOwner != Asset)
 	{
@@ -691,6 +1087,58 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetProperty(const TSharedPtr<FJsonObject
 	Result->SetStringField(TEXT("propertyName"), PropertyName);
 	Result->SetStringField(TEXT("type"), Property->GetCPPType());
 	Result->SetBoolField(TEXT("saved"), bSave);
+	// previousValue and value are BOTH structured, and set_object_property
+	// reports the same pair in the same form. A caller that reads them off one
+	// action must not have to re-parse them off the other.
+	Result->SetField(TEXT("previousValue"), PreviousStructured);
+	Result->SetField(TEXT("value"), FMCPJsonSerializer::SerializeValue(PropertyValue, Property));
+	// The property's own comparison, not a string one. A value not comparable
+	// by identity says so instead of claiming a no-op it cannot establish.
+	const bool bChanged = !bComparable
+		|| !Property->Identical(PropertyValue, PreviousRaw.GetObjAddress(), PPF_None);
+	Result->SetBoolField(TEXT("changed"), bChanged);
+	// changeDetected has ONE meaning everywhere it appears: true when `changed`
+	// came from comparing the value before against the value after, false when
+	// it came from anything else.
+	Result->SetBoolField(TEXT("changeDetected"), bComparable);
+	if (bChanged) MCPSetUpdated(Result);
+
+	if (bRollbackApplies)
+	{
+		// Self-inverse: the same handler with the value this call replaced, in
+		// the structured form the setter takes back. Addressed with the path the
+		// caller used, which has just been proved to resolve to this object
+		// under these same rules, and with the same save flag so the undo
+		// persists exactly as far as the write did.
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("objectPath"), AssetPath);
+		Payload->SetStringField(TEXT("propertyName"), PropertyName);
+		Payload->SetField(TEXT("value"), PreviousStructured);
+		Payload->SetBoolField(TEXT("save"), bSave);
+		MCPSetRollback(Result, TEXT("set_property"), Payload);
+		Result->SetBoolField(TEXT("rollbackLossy"), !bRollbackRoundTrips);
+		if (bRollbackRoundTrips)
+		{
+			Result->SetStringField(TEXT("rollbackNote"),
+				TEXT("The rollback value was applied to a scratch copy of this property and came back identical, so it restores the property's own value. That is what was measured: PostEditChangeProperty and the save are replayed but not verified, and side effects the first write had on other objects are not covered."));
+		}
+		else
+		{
+			Result->SetStringField(TEXT("rollbackNote"), bComparable
+				? TEXT("The rollback value applied to a scratch copy but did not come back identical, so the restore is approximate. The usual cause is a number: the shared setter has no numeric branch, so a JSON number is written through FString::SanitizeFloat and keeps six fractional digits. Property kinds the serializer has no structured form for, and a null object reference, land here too.")
+				: TEXT("The rollback value could not be verified: FText and instanced subobjects are fresh instances on every import and are never identical to the original, so no comparison can tell a good restore from a bad one here."));
+		}
+	}
+	else
+	{
+		// The setter refused its own serialization of this value, so replaying
+		// it would fail rather than restore. Advertising it would hand the flow
+		// engine a rollback that errors.
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+			TEXT("No rollback is offered: the value this call replaced does not survive its own round trip. Applying the serialized form to a scratch copy of the property was refused with: %s"),
+			*ProbeError));
+	}
 	// #820: report what actually landed for containers, so a caller can check
 	// the count without a second read.
 	if (FMapProperty* MapProp = CastField<FMapProperty>(Property))
@@ -860,9 +1308,15 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetRealtime(const TSharedPtr<FJsonObject
 	}
 
 	int32 ViewportsChanged = 0;
+	// The realtime flag is per viewport and this call writes one value to all of
+	// them, so the state being replaced is only restorable when every viewport
+	// already agreed. Counted rather than assumed.
+	int32 PreviouslyEnabled = 0;
+	int32 PreviouslyDisabled = 0;
 	for (FLevelEditorViewportClient* ViewportClient : GEditor->GetLevelViewportClients())
 	{
 		if (!ViewportClient) continue;
+		if (ViewportClient->IsRealtime()) ++PreviouslyEnabled; else ++PreviouslyDisabled;
 		ViewportClient->SetRealtime(bEnabled);
 		ViewportsChanged++;
 	}
@@ -871,6 +1325,23 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetRealtime(const TSharedPtr<FJsonObject
 	MCPSetUpdated(Result);
 	Result->SetBoolField(TEXT("enabled"), bEnabled);
 	Result->SetNumberField(TEXT("viewportsChanged"), ViewportsChanged);
+	Result->SetNumberField(TEXT("previouslyEnabled"), PreviouslyEnabled);
+	Result->SetNumberField(TEXT("previouslyDisabled"), PreviouslyDisabled);
+	const bool bChanged = bEnabled ? PreviouslyDisabled > 0 : PreviouslyEnabled > 0;
+	Result->SetBoolField(TEXT("changed"), bChanged);
+
+	// Self-inverse: the same handler with the flag every viewport held before.
+	const bool bWasMixed = PreviouslyEnabled > 0 && PreviouslyDisabled > 0;
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetBoolField(TEXT("enabled"), PreviouslyEnabled >= PreviouslyDisabled);
+	MCPSetRollback(Result, TEXT("set_realtime"), Payload);
+	Result->SetBoolField(TEXT("rollbackLossy"), bWasMixed);
+	if (bWasMixed)
+	{
+		Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+			TEXT("The viewports did not agree before this call (%d realtime, %d not) and this handler writes one flag to all of them, so the rollback restores the majority value to every viewport rather than the per-viewport split."),
+			PreviouslyEnabled, PreviouslyDisabled));
+	}
 	return MCPResult(Result);
 }
 
@@ -1163,7 +1634,11 @@ TSharedPtr<FJsonValue> FEditorHandlers::HitTestViewportPixel(const TSharedPtr<FJ
 		{
 			FString Label;
 			if (!V->TryGetString(Label)) continue;
-			if (AActor* A = FindActorByLabel(World, Label)) Query.AddIgnoredActor(A);
+			// #983: an ignore list is the plural case, so a label naming
+			// several actors ignores all of them.
+			TArray<AActor*> Matches;
+			MCPCollectActorsByToken(World, Label, EMCPActorMatch::LabelNameOrPath, Matches);
+			for (AActor* A : Matches) Query.AddIgnoredActor(A);
 		}
 	}
 
@@ -1172,6 +1647,19 @@ TSharedPtr<FJsonValue> FEditorHandlers::HitTestViewportPixel(const TSharedPtr<FJ
 
 	auto Result = MCPSuccess();
 	Result->SetBoolField(TEXT("hit"), bHit);
+	// MISCLASSIFIED, and these markers are the interim answer rather than the
+	// right one. This is a deprojection and a line trace: it writes nothing, so
+	// under the house rule (markers belong on handlers classifyActionClass
+	// calls a mutation, and only those) it should carry none. It is classified
+	// a mutation today, so it has to satisfy the convention or be exempted, and
+	// stating the truth is better than an exemption. The real fix is
+	// reclassifying it to a read in src/action-class.ts, after which these
+	// three lines should be deleted. Reported as misclassified, not fixed here,
+	// because that file is owned centrally.
+	Result->SetBoolField(TEXT("changed"), false);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("A query, not a write: this deprojects a viewport pixel into a world ray and traces it. No actor, asset or viewport state is touched."));
 	TSharedPtr<FJsonObject> RayObj = MakeShared<FJsonObject>();
 	TSharedPtr<FJsonObject> OriginObj = MakeShared<FJsonObject>();
 	OriginObj->SetNumberField(TEXT("x"), RayOrigin.X);
@@ -1190,6 +1678,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::HitTestViewportPixel(const TSharedPtr<FJ
 	AActor* HitActor = Hit.GetActor();
 	UPrimitiveComponent* HitComp = Hit.GetComponent();
 	if (HitActor) Result->SetStringField(TEXT("actorLabel"), HitActor->GetActorLabel());
+	if (HitActor) Result->SetStringField(TEXT("actorPath"), HitActor->GetPathName());
 	if (HitActor) Result->SetStringField(TEXT("actorClass"), HitActor->GetClass()->GetName());
 	if (HitComp)
 	{
@@ -1249,10 +1738,27 @@ TSharedPtr<FJsonValue> FEditorHandlers::GetOutputLog(const TSharedPtr<FJsonObjec
 	FString Filter = OptionalString(Params, TEXT("filter"));
 	FString Category = OptionalString(Params, TEXT("category"));
 
+	// T3: paged. `maxLines` still selects the recency WINDOW read out of the
+	// ring buffer, so the default call returns what it always did. What it no
+	// longer does is stop at that count and say nothing: every matching line in
+	// the window is a row, and `limit` pages them.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("get_output_log|maxLines=%d|filter=%s|category=%s"),
+				MaxLines, *Filter, *Category),
+			/*DefaultLimit*/ 200, /*MaxLimit*/ 4096, Page))
+	{
+		return Err;
+	}
+
 	// Read from ring-buffer log capture (#82)
 	TArray<FMCPLogCapture::FMCPLogLine> RecentLines = FMCPLogCapture::Get().GetRecentLines(MaxLines * 2); // over-fetch for filtering
 
-	TArray<TSharedPtr<FJsonValue>> LinesArray;
+	// Chronological, oldest first, exactly as the ring buffer holds them. No
+	// sort: the log stream's own order is the contract here, and the sequence
+	// number the rows are anchored on is monotonic in it.
+	TArray<MCPPagination::FPageRow> Rows;
 	for (const FMCPLogCapture::FMCPLogLine& Line : RecentLines)
 	{
 		if (!Filter.IsEmpty() && !Line.Message.Contains(Filter, ESearchCase::IgnoreCase))
@@ -1268,15 +1774,16 @@ TSharedPtr<FJsonValue> FEditorHandlers::GetOutputLog(const TSharedPtr<FJsonObjec
 		LineObj->SetStringField(TEXT("message"), Line.Message);
 		LineObj->SetStringField(TEXT("category"), Line.Category);
 		LineObj->SetStringField(TEXT("verbosity"), Line.Verbosity);
-		LinesArray.Add(MakeShared<FJsonValueObject>(LineObj));
-
-		if (LinesArray.Num() >= MaxLines) break;
+		LineObj->SetNumberField(TEXT("sequence"), Line.Sequence);
+		Rows.Add({ FString::FromInt(Line.Sequence), MakeShared<FJsonValueObject>(LineObj) });
 	}
 
 	auto Result = MCPSuccess();
-	Result->SetArrayField(TEXT("lines"), LinesArray);
-	Result->SetNumberField(TEXT("lineCount"), LinesArray.Num());
 	Result->SetNumberField(TEXT("maxLines"), MaxLines);
+	MCPPagination::EmitPage(Page, Rows, TEXT("lines"), Result);
+	// The old field name for the row count, kept so an existing caller reads
+	// the same answer out of the same name.
+	Result->SetNumberField(TEXT("lineCount"), Result->GetNumberField(TEXT("count")));
 	return MCPResult(Result);
 }
 
@@ -1285,25 +1792,45 @@ TSharedPtr<FJsonValue> FEditorHandlers::SearchLog(const TSharedPtr<FJsonObject>&
 	FString Query;
 	if (auto Err = RequireString(Params, TEXT("query"), Query)) return Err;
 
-	int32 MaxResults = OptionalInt(Params, TEXT("maxResults"), 100);
+	// The buffer holds 4096 lines, so this default collects every match in it
+	// rather than the first 100. It used to cap the SEARCH at 100 and report
+	// nothing about the rest, which read as "that is all there is".
+	const int32 MaxResults = FMath::Clamp(OptionalInt(Params, TEXT("maxResults"), 4096), 1, 4096);
+
+	// T3: paged.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params,
+			FString::Printf(TEXT("search_log|query=%s|maxResults=%d"), *Query, MaxResults),
+			/*DefaultLimit*/ 100, /*MaxLimit*/ 4096, Page))
+	{
+		return Err;
+	}
 
 	// Search ring-buffer log capture (#82)
 	TArray<FMCPLogCapture::FMCPLogLine> Matches = FMCPLogCapture::Get().Search(Query, MaxResults);
 
-	TArray<TSharedPtr<FJsonValue>> MatchesArray;
+	// Chronological, as the buffer holds them, anchored on each line's absolute
+	// sequence number. No sort: the stream's own order is what a log read means.
+	TArray<MCPPagination::FPageRow> Rows;
+	Rows.Reserve(Matches.Num());
 	for (const FMCPLogCapture::FMCPLogLine& Line : Matches)
 	{
 		TSharedPtr<FJsonObject> MatchObj = MakeShared<FJsonObject>();
 		MatchObj->SetStringField(TEXT("message"), Line.Message);
 		MatchObj->SetStringField(TEXT("category"), Line.Category);
 		MatchObj->SetStringField(TEXT("verbosity"), Line.Verbosity);
-		MatchesArray.Add(MakeShared<FJsonValueObject>(MatchObj));
+		MatchObj->SetNumberField(TEXT("sequence"), Line.Sequence);
+		Rows.Add({ FString::FromInt(Line.Sequence), MakeShared<FJsonValueObject>(MatchObj) });
 	}
 
 	auto Result = MCPSuccess();
-	Result->SetArrayField(TEXT("matches"), MatchesArray);
-	Result->SetNumberField(TEXT("matchCount"), MatchesArray.Num());
 	Result->SetStringField(TEXT("query"), Query);
+	// `maxResults` bounds the search itself, so say when it was the thing that
+	// ended the collection rather than the buffer running out.
+	Result->SetBoolField(TEXT("cappedAtMaxResults"), Rows.Num() >= MaxResults);
+	MCPPagination::EmitPage(Page, Rows, TEXT("matches"), Result);
+	Result->SetNumberField(TEXT("matchCount"), Result->GetNumberField(TEXT("count")));
 	return MCPResult(Result);
 }
 
@@ -1433,8 +1960,18 @@ TSharedPtr<FJsonValue> FEditorHandlers::GetBuildStatus(const TSharedPtr<FJsonObj
 }
 TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJsonObject>& Params)
 {
-	FString Filename;
-	if (auto Err = RequireString(Params, TEXT("filename"), Filename)) return Err;
+	// #966: capture_scene_png names this parameter `outputPath` and this action
+	// named it `filename`, for the same thing, so passing one to the other
+	// failed on a call that was otherwise correct. Both are accepted by both.
+	FString Filename = OptionalString(Params, TEXT("filename"));
+	if (Filename.IsEmpty())
+	{
+		Filename = OptionalString(Params, TEXT("outputPath"));
+	}
+	if (Filename.IsEmpty())
+	{
+		return MCPError(TEXT("Missing 'filename' (also accepted as 'outputPath'): where to write the image"));
+	}
 
 	// Ensure the filename has a proper extension
 	if (!Filename.EndsWith(TEXT(".png")) && !Filename.EndsWith(TEXT(".jpg")) && !Filename.EndsWith(TEXT(".bmp")))
@@ -1561,6 +2098,9 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJson
 		{
 			return MCPError(TEXT("PNG encode failed"));
 		}
+		// Asked before the write, because it is the difference between creating
+		// a file and destroying whatever was at that path.
+		const bool bOverwrote = IFileManager::Get().FileExists(*FullPath);
 		const TArray64<uint8> PngData = PngWrapper->GetCompressed(100);
 		if (!FFileHelper::SaveArrayToFile(PngData, *FullPath))
 		{
@@ -1573,6 +2113,17 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJson
 		Result->SetNumberField(TEXT("width"), CaptureSize.X);
 		Result->SetNumberField(TEXT("height"), CaptureSize.Y);
 		Result->SetStringField(TEXT("note"), CaptureDescription);
+		Result->SetBoolField(TEXT("overwrote"), bOverwrote);
+		// A capture always writes a fresh frame, so it never finds work already
+		// done and skips it.
+		Result->SetBoolField(TEXT("changed"), true);
+		// No rollback: nothing in the bridge deletes a file from disk, so a
+		// capture cannot be taken back, and when it overwrote an existing image
+		// that image is gone as well.
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), bOverwrote
+			? TEXT("No bridge call deletes a file from disk, and this capture replaced a file that was already at that path. Neither the new file nor the one it overwrote can be restored. Capture to a fresh path when a flow may need to roll back.")
+			: TEXT("No bridge call deletes a file from disk, so the captured image cannot be removed again. Nothing else was written."));
 		if (ReportContext && ReportContext->World())
 		{
 			Result->SetNumberField(TEXT("pieInstance"), ReportContext->PIEInstance);
@@ -1712,6 +2263,10 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJson
 		FullPath = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"), Filename);
 	}
 
+	// Asked before the request is queued, because it is the difference between
+	// creating a file and destroying whatever was at that path.
+	const bool bOverwrote = IFileManager::Get().FileExists(*FullPath);
+
 	// Request the screenshot
 	FScreenshotRequest::RequestScreenshot(FullPath, false, false);
 
@@ -1719,6 +2274,17 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScreenshot(const TSharedPtr<FJson
 	Result->SetStringField(TEXT("filename"), FullPath);
 	Result->SetStringField(TEXT("target"), TEXT("editor"));
 	Result->SetStringField(TEXT("note"), TEXT("Screenshot queued. The file will be written asynchronously by the renderer."));
+	Result->SetBoolField(TEXT("overwrote"), bOverwrote);
+	// The request was queued; a capture never finds work already done and
+	// skips it. The write itself happens after this response is sent.
+	Result->SetBoolField(TEXT("changed"), true);
+	// No rollback: nothing in the bridge deletes a file from disk, and the
+	// write is asynchronous, so a rollback could run before the file even
+	// exists and would have nothing to act on either way.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"), bOverwrote
+		? TEXT("No bridge call deletes a file from disk, and a file was already at that path when the request was queued. Capture to a fresh path when a flow may need to roll back.")
+		: TEXT("No bridge call deletes a file from disk, so the captured image cannot be removed again. The renderer also writes it after this response is sent, so there is nothing to act on at rollback time."));
 	return MCPResult(Result);
 }
 
@@ -1744,16 +2310,167 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetViewportCamera(const TSharedPtr<FJson
 		return MCPError(TEXT("No viewport client available"));
 	}
 
+		// Validate every supplied value before touching the viewport. OptionalVec3
+		// intentionally supplies defaults for older callers, but silently turning a
+		// malformed new projection/zoom value into a camera write is unsafe.
+		auto ValidateFiniteObjectFields = [&](const TCHAR* Key, const TArray<FString>& FieldNames) -> TSharedPtr<FJsonValue>
+		{
+				if (!Params->HasField(Key)) return nullptr;
+				const TSharedPtr<FJsonObject>* Object = nullptr;
+				if (!Params->TryGetObjectField(Key, Object) || !Object || !Object->IsValid())
+				{
+						return MCPError(FString::Printf(TEXT("'%s' must be an object"), Key));
+				}
+				for (const FString& FieldName : FieldNames)
+				{
+						if (!(*Object)->HasField(FieldName)) continue;
+						double Number = 0.0;
+						if (!(*Object)->TryGetNumberField(FieldName, Number) || !FMath::IsFinite(Number))
+						{
+								return MCPError(FString::Printf(TEXT("'%s.%s' must be a finite number"), Key, *FieldName));
+						}
+				}
+				return nullptr;
+		};
+		auto ViewportTypeName = [](ELevelViewportType Type) -> const TCHAR*
+		{
+				switch (Type)
+				{
+						case LVT_Perspective: return TEXT("perspective");
+						case LVT_OrthoXY: return TEXT("top");
+						case LVT_OrthoNegativeXY: return TEXT("bottom");
+						case LVT_OrthoXZ: return TEXT("left");
+						case LVT_OrthoNegativeXZ: return TEXT("right");
+						case LVT_OrthoNegativeYZ: return TEXT("front");
+						case LVT_OrthoYZ: return TEXT("back");
+						case LVT_OrthoFreelook: return TEXT("orthoFreelook");
+						default: return TEXT("unknown");
+				}
+		};
+		if (TSharedPtr<FJsonValue> Error = ValidateFiniteObjectFields(TEXT("location"), { TEXT("x"), TEXT("y"), TEXT("z") })) return Error;
+		if (TSharedPtr<FJsonValue> Error = ValidateFiniteObjectFields(TEXT("rotation"), { TEXT("pitch"), TEXT("yaw"), TEXT("roll") })) return Error;
+
+		FString RequestedProjection;
+		FString RequestedViewportType;
+		const bool bHasProjection = Params->HasField(TEXT("projection"));
+		const bool bHasViewportType = Params->HasField(TEXT("viewportType"));
+		if (bHasProjection && !Params->TryGetStringField(TEXT("projection"), RequestedProjection))
+		{
+				return MCPError(TEXT("'projection' must be a string such as 'perspective' or 'top'"));
+		}
+		if (bHasViewportType && !Params->TryGetStringField(TEXT("viewportType"), RequestedViewportType))
+		{
+				return MCPError(TEXT("'viewportType' must be a string such as 'perspective' or 'top'"));
+		}
+		if (bHasProjection && bHasViewportType && !RequestedProjection.Equals(RequestedViewportType, ESearchCase::IgnoreCase))
+		{
+				return MCPError(TEXT("'projection' and 'viewportType' disagree; provide only one or use the same value"));
+		}
+
+		FString Projection = bHasProjection ? RequestedProjection : RequestedViewportType;
+		Projection.TrimStartAndEndInline();
+		ELevelViewportType NewViewportType = ViewportClient->GetViewportType();
+		if (bHasProjection || bHasViewportType)
+		{
+				const struct FProjectionName { const TCHAR* Name; ELevelViewportType Type; } Names[] =
+				{
+						{ TEXT("perspective"), LVT_Perspective },
+						{ TEXT("top"), LVT_OrthoXY }, { TEXT("bottom"), LVT_OrthoNegativeXY },
+						{ TEXT("left"), LVT_OrthoXZ }, { TEXT("right"), LVT_OrthoNegativeXZ },
+						{ TEXT("front"), LVT_OrthoNegativeYZ }, { TEXT("back"), LVT_OrthoYZ },
+						{ TEXT("orthofreelook"), LVT_OrthoFreelook }
+				};
+				bool bFound = false;
+				for (const FProjectionName& Name : Names)
+				{
+						if (Projection.Equals(Name.Name, ESearchCase::IgnoreCase))
+						{
+								NewViewportType = Name.Type;
+								bFound = true;
+								break;
+						}
+				}
+				if (!bFound)
+				{
+						return MCPError(TEXT("Unknown viewport projection/type. Valid values are perspective, top, bottom, left, right, front, back, and orthoFreelook"));
+				}
+		}
+
+		const bool bHasOrthoZoom = Params->HasField(TEXT("orthoZoom"));
+		double RequestedOrthoZoom = 0.0;
+		if (bHasOrthoZoom)
+		{
+				if (!Params->TryGetNumberField(TEXT("orthoZoom"), RequestedOrthoZoom) || !FMath::IsFinite(RequestedOrthoZoom)
+					|| RequestedOrthoZoom < MIN_ORTHOZOOM || RequestedOrthoZoom > MAX_ORTHOZOOM)
+				{
+						return MCPError(TEXT("'orthoZoom' must be finite and within the engine MIN_ORTHOZOOM/MAX_ORTHOZOOM bounds"));
+				}
+		}
+
+		// Read the camera that is about to be replaced. This is the only state an
+	// inverse call could restore, and it is unreadable once the write lands.
+		const FVector PreviousLocation = ViewportClient->GetViewLocation();
+		const FRotator PreviousRotation = ViewportClient->GetViewRotation();
+		const ELevelViewportType PreviousViewportType = ViewportClient->GetViewportType();
+		const float PreviousOrthoZoom = ViewportClient->GetOrthoZoom();
+
+	// Viewport type selects a distinct transform cache. Select it before pose writes.
+	if (bHasProjection || bHasViewportType)
+	{
+		ViewportClient->SetViewportType(NewViewportType);
+	}
 	if (Params->HasField(TEXT("location")))
 	{
 		ViewportClient->SetViewLocation(OptionalVec3(Params, TEXT("location")));
 	}
-	if (Params->HasField(TEXT("rotation")))
-	{
-		ViewportClient->SetViewRotation(OptionalRotator(Params, TEXT("rotation")));
-	}
+		if (Params->HasField(TEXT("rotation")))
+		{
+				ViewportClient->SetViewRotation(OptionalRotator(Params, TEXT("rotation")));
+		}
+		if (bHasOrthoZoom)
+		{
+				ViewportClient->SetOrthoZoom(static_cast<float>(RequestedOrthoZoom));
+		}
+		ViewportClient->Invalidate();
 
 	auto Result = MCPSuccess();
+	const FVector CurrentLocation = ViewportClient->GetViewLocation();
+	const FRotator CurrentRotation = ViewportClient->GetViewRotation();
+	TSharedPtr<FJsonObject> PrevLoc = MakeShared<FJsonObject>();
+	PrevLoc->SetNumberField(TEXT("x"), PreviousLocation.X);
+	PrevLoc->SetNumberField(TEXT("y"), PreviousLocation.Y);
+	PrevLoc->SetNumberField(TEXT("z"), PreviousLocation.Z);
+	TSharedPtr<FJsonObject> PrevRot = MakeShared<FJsonObject>();
+	PrevRot->SetNumberField(TEXT("pitch"), PreviousRotation.Pitch);
+	PrevRot->SetNumberField(TEXT("yaw"), PreviousRotation.Yaw);
+	PrevRot->SetNumberField(TEXT("roll"), PreviousRotation.Roll);
+	Result->SetObjectField(TEXT("previousLocation"), PrevLoc);
+	Result->SetObjectField(TEXT("previousRotation"), PrevRot);
+		Result->SetBoolField(TEXT("changed"),
+				!CurrentLocation.Equals(PreviousLocation) || !CurrentRotation.Equals(PreviousRotation)
+				|| ViewportClient->GetViewportType() != PreviousViewportType
+				|| !FMath::IsNearlyEqual(ViewportClient->GetOrthoZoom(), PreviousOrthoZoom));
+		Result->SetStringField(TEXT("projection"), ViewportTypeName(ViewportClient->GetViewportType()));
+		Result->SetStringField(TEXT("viewportType"), ViewportTypeName(ViewportClient->GetViewportType()));
+		Result->SetNumberField(TEXT("orthoZoom"), ViewportClient->GetOrthoZoom());
+		Result->SetObjectField(TEXT("location"), MCPVec3ToJsonObject(CurrentLocation));
+		auto CurrentRot = MakeShared<FJsonObject>();
+		CurrentRot->SetNumberField(TEXT("pitch"), CurrentRotation.Pitch);
+		CurrentRot->SetNumberField(TEXT("yaw"), CurrentRotation.Yaw);
+		CurrentRot->SetNumberField(TEXT("roll"), CurrentRotation.Roll);
+		Result->SetObjectField(TEXT("rotation"), CurrentRot);
+
+	// Self-inverse: the same handler with the camera this call replaced. Both
+	// halves are sent, so a location-only write still restores the whole pose.
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetObjectField(TEXT("location"), PrevLoc);
+		Payload->SetObjectField(TEXT("rotation"), PrevRot);
+		Payload->SetStringField(TEXT("projection"), ViewportTypeName(PreviousViewportType));
+		Payload->SetNumberField(TEXT("orthoZoom"), PreviousOrthoZoom);
+	MCPSetRollback(Result, TEXT("set_viewport_camera"), Payload);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Restores the view location and rotation. It targets the active level viewport the same way this call did, so a different viewport becoming active in between moves that one instead."));
 	return MCPResult(Result);
 }
 
@@ -1767,6 +2484,24 @@ TSharedPtr<FJsonValue> FEditorHandlers::Undo(const TSharedPtr<FJsonObject>& Para
 	bool bSuccess = GEditor->UndoTransaction();
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), bSuccess);
+	// False means the undo buffer had nothing left to reverse, which is a
+	// no-op rather than a failure to report a change for.
+	Result->SetBoolField(TEXT("changed"), bSuccess);
+	if (bSuccess)
+	{
+		// Undo and redo really are each other's inverse: undoing pushes the
+		// step onto the redo stack, and editor(redo) pops exactly that step.
+		MCPSetRollback(Result, TEXT("redo"), MakeShared<FJsonObject>());
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("editor(redo) re-applies the step this undid. The redo stack is cleared by any new transaction, so a write made between the undo and the rollback discards the step and the redo then does nothing."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Nothing was undone, so there is nothing to redo."));
+	}
 	return MCPResult(Result);
 }
 
@@ -1780,6 +2515,24 @@ TSharedPtr<FJsonValue> FEditorHandlers::Redo(const TSharedPtr<FJsonObject>& Para
 	bool bSuccess = GEditor->RedoTransaction();
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetBoolField(TEXT("success"), bSuccess);
+	// False means the redo stack was empty, which is a no-op rather than a
+	// failure to report a change for.
+	Result->SetBoolField(TEXT("changed"), bSuccess);
+	if (bSuccess)
+	{
+		// Redo and undo really are each other's inverse: redoing pushes the
+		// step back onto the undo stack, and editor(undo) reverses exactly it.
+		MCPSetRollback(Result, TEXT("undo"), MakeShared<FJsonObject>());
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("editor(undo) reverses the step this re-applied, as long as no later transaction was recorded on top of it. When one was, the undo reverses that newer step instead."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Nothing was redone, so there is nothing to undo."));
+	}
 	return MCPResult(Result);
 }
 
@@ -1787,6 +2540,13 @@ TSharedPtr<FJsonValue> FEditorHandlers::ReloadHandlers(const TSharedPtr<FJsonObj
 {
 	// No-op in C++ bridge - this was used in the Python bridge to reload Python handler modules.
 	auto Result = MCPSuccess();
+	// Nothing to reload: handlers are registered once at module startup, so
+	// this writes no state at all and every call is the same no-op.
+	Result->SetBoolField(TEXT("changed"), false);
+	Result->SetBoolField(TEXT("unchanged"), true);
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Nothing happened, so there is nothing to undo. Handler registration is fixed for the life of the loaded module; editor(hot_reload) is what replaces the code behind it."));
 	return MCPResult(Result);
 }
 
@@ -1865,6 +2625,14 @@ TSharedPtr<FJsonValue> FEditorHandlers::SaveDirty(const TSharedPtr<FJsonObject>&
 		Result->SetArrayField(TEXT("failed"), Failed);
 		Result->SetBoolField(TEXT("success"), false);
 	}
+	// Nothing dirty means nothing was written, which is what a replay of this
+	// call after a successful one finds.
+	Result->SetBoolField(TEXT("changed"), Saved.Num() > 0);
+	// No rollback: the previous contents of each .uasset were overwritten on
+	// disk and are not held anywhere the bridge can reach.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("SavePackage overwrites each package on disk and the bytes it replaced are gone. Nothing un-saves a package, and marking one dirty again would not restore its previous contents. Recover from source control if the write was wrong."));
 	return MCPResult(Result);
 }
 
@@ -1896,6 +2664,71 @@ TSharedPtr<FJsonValue> FEditorHandlers::ListDirtyPackages(const TSharedPtr<FJson
 	Result->SetNumberField(TEXT("mapCount"), Maps.Num());
 	Result->SetArrayField(TEXT("content"), Content);
 	Result->SetArrayField(TEXT("maps"), Maps);
+	return MCPResult(Result);
+}
+
+// #920 / #921: one read that answers "which world is open, and what is unsaved"
+// together. level(get_current) and list_dirty_packages are two calls, so the
+// editor can change between them and neither answer proves which world the
+// other described. Both reports were filed independently by the same team,
+// which is a fair signal that two calls is genuinely not good enough for a QA
+// gate. This runs in one game-thread dispatch, so the pair is consistent.
+TSharedPtr<FJsonValue> FEditorHandlers::GetWorldState(const TSharedPtr<FJsonObject>& Params)
+{
+	if (!GEditor)
+	{
+		return MCPError(TEXT("Editor not available"));
+	}
+
+	UWorld* EditorWorld = GEditor->GetEditorWorldContext().World();
+	if (!EditorWorld)
+	{
+		// Fail closed. An empty answer here would read as "nothing is open and
+		// nothing is dirty", which is the reassuring shape of a wrong answer.
+		return MCPError(TEXT("No editor world is currently resolvable, so world state cannot be reported"));
+	}
+
+	auto Result = MCPSuccess();
+
+	UPackage* WorldPackage = EditorWorld->GetOutermost();
+	Result->SetStringField(TEXT("editorWorldName"), EditorWorld->GetName());
+	Result->SetStringField(TEXT("editorWorldPackage"), WorldPackage ? WorldPackage->GetName() : FString());
+	Result->SetBoolField(TEXT("worldPackageDirty"), WorldPackage != nullptr && WorldPackage->IsDirty());
+
+	if (ULevel* Persistent = EditorWorld->PersistentLevel)
+	{
+		if (UPackage* LevelPackage = Persistent->GetOutermost())
+		{
+			Result->SetStringField(TEXT("persistentLevelPackage"), LevelPackage->GetName());
+		}
+	}
+
+	// PIE and SIE are distinct states and a caller acting on the wrong one gets
+	// a confidently wrong result, so report both rather than one "inPIE" flag.
+	const bool bSimulating = GEditor->bIsSimulatingInEditor;
+	const bool bPlayWorld = GEditor->PlayWorld != nullptr;
+	Result->SetBoolField(TEXT("playInEditor"), bPlayWorld && !bSimulating);
+	Result->SetBoolField(TEXT("simulateInEditor"), bSimulating);
+	Result->SetStringField(TEXT("mode"), bSimulating ? TEXT("simulate") : (bPlayWorld ? TEXT("play") : TEXT("editor")));
+
+	const FDirtyEditorPackages Dirty = CollectDirtyEditorPackages();
+	TArray<FString> All;
+	All.Reserve(Dirty.Content.Num() + Dirty.Maps.Num());
+	All.Append(Dirty.Content);
+	All.Append(Dirty.Maps);
+	All.Sort();
+
+	TArray<TSharedPtr<FJsonValue>> DirtyJson;
+	DirtyJson.Reserve(All.Num());
+	for (const FString& PackageName : All)
+	{
+		DirtyJson.Add(MakeShared<FJsonValueString>(PackageName));
+	}
+	Result->SetArrayField(TEXT("dirtyPackages"), DirtyJson);
+	Result->SetNumberField(TEXT("dirtyPackageCount"), All.Num());
+	Result->SetNumberField(TEXT("dirtyContentCount"), Dirty.Content.Num());
+	Result->SetNumberField(TEXT("dirtyMapCount"), Dirty.Maps.Num());
+
 	return MCPResult(Result);
 }
 
@@ -1956,28 +2789,37 @@ TSharedPtr<FJsonValue> FEditorHandlers::RequestEditorShutdown(const TSharedPtr<F
 			{
 				return true;
 			}
-			UKismetSystemLibrary::QuitEditor();
+			IMainFrameModule& MainFrameModule = FModuleManager::LoadModuleChecked<IMainFrameModule>(TEXT("MainFrame"));
+			MainFrameModule.RequestCloseEditor();
 			return false;
 		}),
 		1.0f);
 
 	Result->SetBoolField(TEXT("scheduled"), true);
 	Result->SetStringField(TEXT("message"), TEXT("Graceful editor shutdown scheduled; active PIE/SIE will end before close"));
+	// The early returns above leave scheduled=false and success=false, so
+	// reaching here always armed a shutdown that was not already armed.
+	Result->SetBoolField(TEXT("changed"), true);
+	// No rollback. The ticker cannot be cancelled from here, and once it fires
+	// the editor is closing: a rollback would either arrive too late to matter
+	// or arrive after the process that would run it is gone.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("The scheduled close cannot be called off, and nothing restarts the editor from inside it. editor(start_editor) launches a NEW editor process rather than restoring this session."));
 	return MCPResult(Result);
 }
 
 TSharedPtr<FJsonValue> FEditorHandlers::FocusViewportOnActor(const TSharedPtr<FJsonObject>& Params)
 {
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	REQUIRE_EDITOR_WORLD(World);
 
-	AActor* TargetActor = FindActorByLabel(World, ActorLabel);
-	if (!TargetActor)
-	{
-		return MCPError(FString::Printf(TEXT("Actor '%s' not found"), *ActorLabel));
-	}
+	TSharedPtr<FJsonValue> ActorErr;
+	AActor* TargetActor = MCPResolveActor(World, Params, ActorErr);
+	if (!TargetActor) return ActorErr;
+	ActorLabel = TargetActor->GetActorLabel();
 
 	// Get the viewport client
 	FLevelEditorViewportClient* ViewportClient = GCurrentLevelEditingViewportClient;
@@ -1995,8 +2837,21 @@ TSharedPtr<FJsonValue> FEditorHandlers::FocusViewportOnActor(const TSharedPtr<FJ
 		return MCPError(TEXT("No viewport client available"));
 	}
 
+	// Read the camera that is about to be moved. This is the only state an
+	// inverse call could restore, and it is unreadable once the focus lands.
+	const FVector PreviousLocation = ViewportClient->GetViewLocation();
+	const FRotator PreviousRotation = ViewportClient->GetViewRotation();
+	const bool bViewportIsOrtho = ViewportClient->IsOrtho();
+
 	// Focus on the actor's bounding box
 	FBox ActorBounds = TargetActor->GetComponentsBoundingBox(true);
+	// Which branch runs decides whether the camera move is observable here.
+	// FocusViewportOnBox defaults bInstant to false and hands the move to
+	// TransitionToLocation, which, whenever the client has a real viewport
+	// widget, only sets DesiredLocation and starts a curve: ViewLocation is
+	// advanced by UpdateTransition on later ticks, so reading it back in this
+	// call still returns the location the camera had before the focus.
+	const bool bFocusedOnBounds = ActorBounds.IsValid != 0;
 	if (ActorBounds.IsValid)
 	{
 		ViewportClient->FocusViewportOnBox(ActorBounds);
@@ -2020,6 +2875,58 @@ TSharedPtr<FJsonValue> FEditorHandlers::FocusViewportOnActor(const TSharedPtr<FJ
 	auto Result = MCPSuccess();
 	Result->SetObjectField(TEXT("viewLocation"), LocObj);
 	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	Result->SetStringField(TEXT("actorPath"), TargetActor->GetPathName());
+
+	TSharedPtr<FJsonObject> PrevLoc = MakeShared<FJsonObject>();
+	PrevLoc->SetNumberField(TEXT("x"), PreviousLocation.X);
+	PrevLoc->SetNumberField(TEXT("y"), PreviousLocation.Y);
+	PrevLoc->SetNumberField(TEXT("z"), PreviousLocation.Z);
+	TSharedPtr<FJsonObject> PrevRot = MakeShared<FJsonObject>();
+	PrevRot->SetNumberField(TEXT("pitch"), PreviousRotation.Pitch);
+	PrevRot->SetNumberField(TEXT("yaw"), PreviousRotation.Yaw);
+	PrevRot->SetNumberField(TEXT("roll"), PreviousRotation.Roll);
+	Result->SetObjectField(TEXT("previousLocation"), PrevLoc);
+	Result->SetObjectField(TEXT("previousRotation"), PrevRot);
+	// The bounds branch animates, so a read-back here would compare the camera
+	// against itself and report changed=false for a call that visibly moves it.
+	// Only the fallback branch writes the transform outright and is comparable.
+	Result->SetBoolField(TEXT("changed"), bFocusedOnBounds
+		|| !FinalLocation.Equals(PreviousLocation)
+		|| !ViewportClient->GetViewRotation().Equals(PreviousRotation));
+	Result->SetBoolField(TEXT("changeDetected"), !bFocusedOnBounds);
+	if (bFocusedOnBounds)
+	{
+		Result->SetStringField(TEXT("viewLocationNote"),
+			TEXT("The camera moves to the framed position over several ticks, so viewLocation is where it started rather than where it will end up. Read it back with editor(get_viewport_state) after the transition to see the destination."));
+	}
+
+	// The inverse of framing an actor is putting the camera back where it was,
+	// which is what set_viewport_camera writes. Both halves are sent so the
+	// whole pose comes back, and SetViewLocation assigns DesiredLocation as
+	// well as ViewLocation, so a rollback that runs mid-transition ends the
+	// animation instead of being overwritten by the next tick.
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetObjectField(TEXT("location"), PrevLoc);
+	Payload->SetObjectField(TEXT("rotation"), PrevRot);
+	MCPSetRollback(Result, TEXT("set_viewport_camera"), Payload);
+	// Lossy either way when the bounds branch ran: it writes more viewport
+	// state than set_viewport_camera can write back.
+	Result->SetBoolField(TEXT("rollbackLossy"), bFocusedOnBounds);
+	if (bFocusedOnBounds)
+	{
+		// FocusViewportOnBox calls ToggleOrbitCamera(false) and
+		// CameraController->ResetVelocity() before it branches on projection,
+		// so both of those apply either way; SetLookAt is the one the
+		// perspective branch adds. set_viewport_camera writes none of them.
+		Result->SetStringField(TEXT("rollbackNote"), bViewportIsOrtho
+			? TEXT("Restores the view location and rotation only. Framing a box in an orthographic viewport also rewrites its ortho zoom, turns orbit mode off and resets the camera controller's velocity, and set_viewport_camera has no parameter for any of those, so they stay as this call left them.")
+			: TEXT("Restores the view location and rotation only. Framing a box also moves the orbit look-at point onto the framed actor, turns orbit mode off and resets the camera controller's velocity, and set_viewport_camera writes none of those, so the pivot stays on the actor after the rollback."));
+	}
+	else
+	{
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The actor had no valid bounds, so this wrote the camera transform directly and restoring it is exact. It targets the active level viewport the same way this call did, so a different viewport becoming active in between moves that one instead."));
+	}
 	return MCPResult(Result);
 }
 TSharedPtr<FJsonValue> FEditorHandlers::CreateNewLevel(const TSharedPtr<FJsonObject>& Params)
@@ -2047,6 +2954,27 @@ TSharedPtr<FJsonValue> FEditorHandlers::CreateNewLevel(const TSharedPtr<FJsonObj
 		return MCPResult(Existed);
 	}
 
+	// #833: validate the destination BEFORE handing it to the subsystem.
+	// NewLevel("") logs "NewLevel. Failed to create the level." at Error and
+	// leaves the editor on an untitled map, so a caller that simply omitted the
+	// parameter produced an engine error in the log AND unloaded whatever level
+	// was open. Every one of these is knowable up front.
+	if (LevelPath.IsEmpty())
+	{
+		return MCPError(TEXT("levelPath is required (e.g. \"/Game/Maps/MyLevel\"). Nothing was created and the "
+			"currently loaded level was left alone."));
+	}
+	{
+		FText PackageNameError;
+		if (!FPackageName::IsValidLongPackageName(LevelPath, /*bIncludeReadOnlyRoots*/ false, &PackageNameError))
+		{
+			return MCPError(FString::Printf(
+				TEXT("levelPath '%s' is not a valid long package name: %s. Use a mounted root, e.g. ")
+				TEXT("\"/Game/Maps/MyLevel\". Nothing was created."),
+				*LevelPath, *PackageNameError.ToString()));
+		}
+	}
+
 	// #224: treat templateLevel="Empty" / "None" / "" as "no template",
 	// since callers reasonably read "Empty" as a sentinel for the empty
 	// template. NewLevelFromTemplate("/Game/X", "Empty") otherwise tries to
@@ -2068,16 +2996,10 @@ TSharedPtr<FJsonValue> FEditorHandlers::CreateNewLevel(const TSharedPtr<FJsonObj
 	if (!bSuccess)
 	{
 		// #224: surface concrete reasons instead of a bare "Failed to create".
+		// The empty and malformed paths are rejected above, before the engine
+		// is asked, so what reaches here is a real refusal.
 		FString Reason;
-		if (LevelPath.IsEmpty())
-		{
-			Reason = TEXT("levelPath is required (e.g. \"/Game/Maps/MyLevel\")");
-		}
-		else if (!LevelPath.StartsWith(TEXT("/")))
-		{
-			Reason = FString::Printf(TEXT("levelPath must be a /Game/... mount point, got '%s'"), *LevelPath);
-		}
-		else if (bHasTemplate && !UEditorAssetLibrary::DoesAssetExist(TemplateLevel))
+		if (bHasTemplate && !UEditorAssetLibrary::DoesAssetExist(TemplateLevel))
 		{
 			Reason = FString::Printf(TEXT("templateLevel asset not found: '%s' (omit or pass \"Empty\" for an empty level)"), *TemplateLevel);
 		}
@@ -2118,6 +3040,20 @@ TSharedPtr<FJsonValue> FEditorHandlers::SaveCurrentLevel(const TSharedPtr<FJsonO
 		return MCPError(TEXT("LevelEditorSubsystem not available"));
 	}
 
+	// #833: an untitled map has no file to write, and SaveCurrentLevel answers
+	// that with "Can't save the level because it doesn't have a filename" in
+	// the editor log and a bare false here. The world knows its own package, so
+	// say which call gives it a name instead of asking for an impossible save.
+	const FString PackageName = World->GetOutermost()->GetName();
+	if (!FPackageName::DoesPackageExist(PackageName))
+	{
+		return MCPError(FString::Printf(
+			TEXT("The current level '%s' has never been saved, so it has no file to save to and this action cannot ")
+			TEXT("give it one. Write it to a path first with level(create, levelPath=\"/Game/Maps/<Name>\"), which ")
+			TEXT("creates and saves the map, or level(save) to save the packages that do have files."),
+			*PackageName));
+	}
+
 	bool bSuccess = LevelEditorSubsystem->SaveCurrentLevel();
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
@@ -2133,6 +3069,14 @@ TSharedPtr<FJsonValue> FEditorHandlers::SaveCurrentLevel(const TSharedPtr<FJsonO
 	{
 		Result->SetStringField(TEXT("message"), TEXT("Current level saved"));
 	}
+	// SaveCurrentLevel reports only whether the save ran; it does not say
+	// whether the map was dirty, so this is the honest granularity available.
+	Result->SetBoolField(TEXT("changed"), bSuccess);
+	// No rollback: the previous .umap on disk was overwritten and is not held
+	// anywhere the bridge can reach.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Saving overwrites the map file and the bytes it replaced are gone. Nothing un-saves a level. Recover from source control if the write was wrong."));
 
 	return MCPResult(Result);
 }
@@ -2159,16 +3103,28 @@ TSharedPtr<FJsonValue> FEditorHandlers::OpenAsset(const TSharedPtr<FJsonObject>&
 		return MCPError(TEXT("AssetEditorSubsystem not available"));
 	}
 
+	// Asked before opening: OpenEditorForAsset focuses an editor that is already
+	// up and returns true either way, so this is the only point at which
+	// "was it already open" is answerable.
+	const bool bAlreadyOpen = AssetEditorSubsystem->FindEditorForAsset(Asset, /*bFocusIfOpen=*/false) != nullptr;
 	bool bOpened = AssetEditorSubsystem->OpenEditorForAsset(Asset);
 
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("assetPath"), AssetPath);
 	Result->SetStringField(TEXT("assetClass"), Asset->GetClass()->GetName());
 	Result->SetBoolField(TEXT("success"), bOpened);
+	Result->SetBoolField(TEXT("alreadyOpen"), bAlreadyOpen);
+	Result->SetBoolField(TEXT("changed"), bOpened && !bAlreadyOpen);
 	if (!bOpened)
 	{
 		Result->SetStringField(TEXT("error"), FString::Printf(TEXT("Failed to open editor for '%s' (%s)"), *AssetPath, *Asset->GetClass()->GetName()));
 	}
+	// No rollback: nothing in the bridge closes an asset editor. close_sequence
+	// is the one exception and it only handles Level Sequences, so naming it
+	// here would fail for every other asset class.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("No bridge call closes an asset editor for an arbitrary asset, so an opened editor cannot be put away again. Opening one writes no asset data; editor(close_sequence) is available when the asset is a Level Sequence."));
 
 	return MCPResult(Result);
 }
@@ -2201,6 +3157,19 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunStatCommand(const TSharedPtr<FJsonObj
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("command"), Command);
+	// The command was dispatched. Most stat commands toggle rather than set, so
+	// the overlay's state after this depends on what it was before, and Exec
+	// reports nothing back that this handler could compare.
+	Result->SetBoolField(TEXT("changed"), true);
+	// No rollback. A stat command toggles, so its inverse is the state the
+	// overlay was in beforehand, and that was not captured: nothing here reads
+	// which stats were enabled before the Exec. Re-running the same command is
+	// an inverse only when it happens to be a plain toggle and the stat was off
+	// to begin with, which is a guess rather than a rollback, and "stat none"
+	// has no inverse at all.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Stat commands toggle rather than set, and the overlay state before this call was not captured, so there is no value to restore. Re-running the same command would be a guess, not an inverse, and 'stat none' has no inverse at all."));
 	return MCPResult(Result);
 }
 
@@ -2220,6 +3189,10 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetScalability(const TSharedPtr<FJsonObj
 	// group in-editor. Drive the Scalability system directly so the cached
 	// quality levels actually take effect, then persist them.
 	Scalability::FQualityLevels QL = Scalability::GetQualityLevels();
+	// Read the group level being replaced before writing. GetSingleQualityLevel
+	// answers -1 when the groups do not all agree, which is exactly the case
+	// this handler cannot write back: it only takes one name for all of them.
+	const int32 PreviousSingleLevel = QL.GetSingleQualityLevel();
 	QL.SetFromSingleQualityLevel(Idx);
 	Scalability::SetQualityLevels(QL, /*bForce=*/true);
 	Scalability::SaveState(GGameUserSettingsIni);
@@ -2241,12 +3214,158 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetScalability(const TSharedPtr<FJsonObj
 	Result->SetStringField(TEXT("level"), Level);
 	Result->SetNumberField(TEXT("qualityLevel"), Idx);
 	Result->SetObjectField(TEXT("appliedLevels"), Levels);
+	Result->SetNumberField(TEXT("previousQualityLevel"), PreviousSingleLevel);
+	Result->SetBoolField(TEXT("changed"), PreviousSingleLevel != Idx);
+
+	// Self-inverse: the same handler with the group level this call replaced.
+	// Only when every group agreed beforehand, because that is the only state
+	// a single `level` name can put back.
+	static const TCHAR* const LevelNames[] = { TEXT("Low"), TEXT("Medium"), TEXT("High"), TEXT("Epic"), TEXT("Cinematic") };
+	if (PreviousSingleLevel >= 0 && PreviousSingleLevel < static_cast<int32>(UE_ARRAY_COUNT(LevelNames)))
+	{
+		Result->SetStringField(TEXT("previousLevel"), LevelNames[PreviousSingleLevel]);
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("level"), LevelNames[PreviousSingleLevel]);
+		MCPSetRollback(Result, TEXT("set_scalability"), Payload);
+		Result->SetBoolField(TEXT("rollbackLossy"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Every quality group was at the same level before this call, so replaying that level restores all of them, and SaveState persists the restore the same way the write was persisted."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("The quality groups did not all sit at one level before this call (GetSingleQualityLevel reported custom), and this handler takes a single level name that writes every group. There is no value it could be given that restores the mixed state, so no rollback is offered."));
+	}
 	return MCPResult(Result);
 }
 
 // #591 bulk console-variable setter. Accepts a {name: value} object (or array
 // of {name, value}) and applies each via the console manager with SetByConsole
 // priority. Returns per-cvar old/new values so callers can confirm the write.
+// #1006: read console variables. set_cvars could write one and nothing in the
+// surface could read it back, so confirming whether r.VolumetricCloud or
+// r.Substrate was actually on meant reading DefaultEngine.ini and inferring,
+// which says what the config asked for and not what the running editor has.
+// execute_command is no help either: typing a cvar name at the console prints
+// to the log and returns nothing to the caller.
+//
+// setBy is reported alongside the value because it is usually the answer to
+// the question behind the question. A cvar sitting at its default because a
+// scalability group pinned it there and one a device profile drove to the same
+// number read identically until you can see which source last wrote it.
+namespace
+{
+	static TSharedPtr<FJsonObject> DescribeCVar(const FString& Name, IConsoleVariable* CVar)
+	{
+		TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("name"), Name);
+		Row->SetStringField(TEXT("value"), CVar->GetString());
+		const FString DefaultValue = CVar->GetDefaultValue();
+		Row->SetStringField(TEXT("defaultValue"), DefaultValue);
+		Row->SetBoolField(TEXT("isDefault"), CVar->GetString() == DefaultValue);
+		const EConsoleVariableFlags SetBy =
+			static_cast<EConsoleVariableFlags>(CVar->GetFlags() & ECVF_SetByMask);
+		Row->SetStringField(TEXT("setBy"), GetConsoleVariableSetByName(SetBy));
+		const TCHAR* Type = TEXT("string");
+		if (CVar->IsVariableBool()) Type = TEXT("bool");
+		else if (CVar->IsVariableInt()) Type = TEXT("int");
+		else if (CVar->IsVariableFloat()) Type = TEXT("float");
+		Row->SetStringField(TEXT("type"), Type);
+		Row->SetBoolField(TEXT("cheat"), CVar->TestFlags(ECVF_Cheat));
+		Row->SetBoolField(TEXT("renderThreadSafe"), CVar->TestFlags(ECVF_RenderThreadSafe));
+		if (const TCHAR* Help = CVar->GetHelp())
+		{
+			// Console help runs to paragraphs for some variables and the caller
+			// asked for a value, not a manual.
+			FString HelpText(Help);
+			HelpText.ReplaceInline(TEXT("\n"), TEXT(" "));
+			HelpText.TrimStartAndEndInline();
+			if (HelpText.Len() > 400) HelpText = HelpText.Left(400) + TEXT("...");
+			if (!HelpText.IsEmpty()) Row->SetStringField(TEXT("help"), HelpText);
+		}
+		return Row;
+	}
+}
+
+TSharedPtr<FJsonValue> FEditorHandlers::GetCVars(const TSharedPtr<FJsonObject>& Params)
+{
+	TArray<FString> Names;
+	const TArray<TSharedPtr<FJsonValue>>* NameArr = nullptr;
+	if (Params->TryGetArrayField(TEXT("names"), NameArr) && NameArr)
+	{
+		for (const TSharedPtr<FJsonValue>& Entry : *NameArr)
+		{
+			FString S;
+			if (Entry.IsValid() && Entry->TryGetString(S) && !S.IsEmpty()) Names.Add(S);
+		}
+	}
+	FString Single;
+	if (Params->TryGetStringField(TEXT("name"), Single) && !Single.IsEmpty()) Names.Add(Single);
+
+	FString Pattern;
+	Params->TryGetStringField(TEXT("pattern"), Pattern);
+	if (Names.Num() == 0 && Pattern.IsEmpty())
+	{
+		return MCPError(TEXT("Supply 'name', 'names' (array) or 'pattern' (substring match against every registered console variable)"));
+	}
+
+	IConsoleManager& CM = IConsoleManager::Get();
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	TArray<TSharedPtr<FJsonValue>> NotFound;
+
+	for (const FString& Name : Names)
+	{
+		IConsoleVariable* const CVar = CM.FindConsoleVariable(*Name);
+		if (!CVar)
+		{
+			NotFound.Add(MakeShared<FJsonValueString>(Name));
+			continue;
+		}
+		Rows.Add(MakeShared<FJsonValueObject>(DescribeCVar(Name, CVar)));
+	}
+
+	// A substring over the whole registry can match hundreds, and every row
+	// carries help text, so the cap is a real one rather than a formality. It is
+	// reported when it bites so a truncated answer never reads as a complete one.
+	int32 Limit = 100;
+	Params->TryGetNumberField(TEXT("limit"), Limit);
+	Limit = FMath::Clamp(Limit, 1, 1000);
+	int32 Matched = 0;
+	if (!Pattern.IsEmpty())
+	{
+		CM.ForEachConsoleObjectThatContains(
+			FConsoleObjectVisitor::CreateLambda([&](const TCHAR* Name, IConsoleObject* Object)
+			{
+				IConsoleVariable* const CVar = Object ? Object->AsVariable() : nullptr;
+				if (!CVar) return;
+				++Matched;
+				if (Rows.Num() >= Limit) return;
+				Rows.Add(MakeShared<FJsonValueObject>(DescribeCVar(FString(Name), CVar)));
+			}),
+			*Pattern);
+	}
+
+	auto Result = MCPSuccess();
+	Result->SetArrayField(TEXT("cvars"), Rows);
+	Result->SetNumberField(TEXT("count"), Rows.Num());
+	if (NotFound.Num() > 0) Result->SetArrayField(TEXT("notFound"), NotFound);
+	if (!Pattern.IsEmpty())
+	{
+		Result->SetNumberField(TEXT("matchedCount"), Matched);
+		Result->SetBoolField(TEXT("truncated"), Matched > Rows.Num());
+		if (Matched > Rows.Num())
+		{
+			Result->SetStringField(TEXT("truncationNote"), FString::Printf(
+				TEXT("'%s' matches %d console variables and %d are listed. Raise 'limit' or narrow the pattern."),
+				*Pattern, Matched, Rows.Num()));
+		}
+	}
+	Result->SetStringField(TEXT("valueSourceNote"),
+		TEXT("Values are read from the running editor, so they reflect every write that has landed, not what a config file asked for. 'setBy' names the priority the current value was written at, and a cvar set at a higher priority ignores later writes from lower ones."));
+	return MCPResult(Result);
+}
+
 TSharedPtr<FJsonValue> FEditorHandlers::SetCVars(const TSharedPtr<FJsonObject>& Params)
 {
 	// Collect requested (name, value) pairs from either shape.
@@ -2293,6 +3412,10 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetCVars(const TSharedPtr<FJsonObject>& 
 	IConsoleManager& CM = IConsoleManager::Get();
 	TArray<TSharedPtr<FJsonValue>> Applied;
 	TArray<TSharedPtr<FJsonValue>> NotFound;
+	// The values being replaced, in the shape this handler takes back: the
+	// inverse of a cvar write is its previous value, read before the write.
+	TArray<TSharedPtr<FJsonValue>> InversePairs;
+	int32 ValuesActuallyChanged = 0;
 	for (const TPair<FString, FString>& Req : Requests)
 	{
 		IConsoleVariable* CVar = CM.FindConsoleVariable(*Req.Key);
@@ -2303,28 +3426,76 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetCVars(const TSharedPtr<FJsonObject>& 
 		}
 		const FString OldValue = CVar->GetString();
 		CVar->Set(*Req.Value, ECVF_SetByConsole);
+		const FString NewValue = CVar->GetString();
+		if (NewValue != OldValue) ++ValuesActuallyChanged;
 		TSharedPtr<FJsonObject> Row = MakeShared<FJsonObject>();
 		Row->SetStringField(TEXT("name"), Req.Key);
 		Row->SetStringField(TEXT("oldValue"), OldValue);
-		Row->SetStringField(TEXT("newValue"), CVar->GetString());
+		Row->SetStringField(TEXT("newValue"), NewValue);
 		Applied.Add(MakeShared<FJsonValueObject>(Row));
+
+		TSharedPtr<FJsonObject> Inverse = MakeShared<FJsonObject>();
+		Inverse->SetStringField(TEXT("name"), Req.Key);
+		Inverse->SetStringField(TEXT("value"), OldValue);
+		InversePairs.Add(MakeShared<FJsonValueObject>(Inverse));
 	}
 
 	auto Result = MCPSuccess();
 	Result->SetArrayField(TEXT("applied"), Applied);
 	Result->SetNumberField(TEXT("appliedCount"), Applied.Num());
 	if (NotFound.Num() > 0) Result->SetArrayField(TEXT("notFound"), NotFound);
+	// A write of the value a cvar already held is a no-op, and a request that
+	// found no cvar wrote nothing at all.
+	Result->SetNumberField(TEXT("valuesChanged"), ValuesActuallyChanged);
+	Result->SetBoolField(TEXT("changed"), ValuesActuallyChanged > 0);
+
+	if (InversePairs.Num() > 0)
+	{
+		// Self-inverse: the same handler with each cvar's previous value, in the
+		// array form it accepts. Only the cvars that were actually found are
+		// listed; the ones in notFound were never written.
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetArrayField(TEXT("cvars"), InversePairs);
+		MCPSetRollback(Result, TEXT("set_cvars"), Payload);
+		// The value comes back; the priority it came back at does not. Both the
+		// write and the rollback go in at ECVF_SetByConsole, so a cvar that was
+		// last set by a lower-priority source (a config file, a scalability
+		// group, a device profile) keeps the console priority afterwards and
+		// stops accepting writes from that source.
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Restores each cvar's previous string value, but at SetByConsole priority rather than the priority it originally held. A variable that had been set by a config file, a scalability group or a device profile keeps the console priority afterwards and will ignore later writes from those sources until the editor restarts."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("No requested console variable exists in this build, so nothing was written and there is nothing to restore."));
+	}
 	return MCPResult(Result);
 }
 TSharedPtr<FJsonValue> FEditorHandlers::ListCrashes(const TSharedPtr<FJsonObject>& Params)
 {
 	FString CrashesDir = FPaths::ProjectSavedDir() / TEXT("Crashes");
 
-	TArray<TSharedPtr<FJsonValue>> CrashArray;
+	// T3: paged. A project that has been crashing accumulates hundreds of
+	// folders, each carrying its own file listing.
+	MCPPagination::FPageRequest Page;
+	if (auto Err = MCPPagination::ReadPageRequest(
+			Params, TEXT("list_crashes"), /*DefaultLimit*/ 50, /*MaxLimit*/ 500, Page))
+	{
+		return Err;
+	}
+
+	TArray<MCPPagination::FPageRow> Rows;
 	IFileManager& FileManager = IFileManager::Get();
 
 	TArray<FString> CrashFolders;
 	FileManager.FindFiles(CrashFolders, *(CrashesDir / TEXT("*")), false, true);
+	// FindFiles returns whatever order the filesystem enumerates in, which is
+	// not a contract, so the folders are sorted before paging. Crash folder
+	// names carry their timestamp, so this is also chronological.
+	CrashFolders.Sort();
 
 	for (const FString& Folder : CrashFolders)
 	{
@@ -2347,13 +3518,15 @@ TSharedPtr<FJsonValue> FEditorHandlers::ListCrashes(const TSharedPtr<FJsonObject
 			FileArray.Add(MakeShared<FJsonValueString>(File));
 		}
 		CrashObj->SetArrayField(TEXT("files"), FileArray);
-		CrashArray.Add(MakeShared<FJsonValueObject>(CrashObj));
+		// The folder name is the page anchor: unique within Saved/Crashes, and
+		// unchanged while the folder is on disk.
+		Rows.Add({ Folder, MakeShared<FJsonValueObject>(CrashObj) });
 	}
 
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("crashesDir"), CrashesDir);
-	Result->SetNumberField(TEXT("crashCount"), CrashArray.Num());
-	Result->SetArrayField(TEXT("crashes"), CrashArray);
+	MCPPagination::EmitPage(Page, Rows, TEXT("crashes"), Result);
+	Result->SetNumberField(TEXT("crashCount"), Result->GetNumberField(TEXT("count")));
 	return MCPResult(Result);
 }
 
@@ -2450,8 +3623,18 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScenePng(const TSharedPtr<FJsonOb
 	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
 	if (!World) return MCPError(FString::Printf(TEXT("World not available for scope '%s'"), *WorldScope));
 
-	FString OutputPath;
-	if (auto Err = RequireString(Params, TEXT("outputPath"), OutputPath)) return Err;
+	// #966: capture_screenshot names this parameter `filename` and this action
+	// named it `outputPath`, for the same thing, so passing one to the other
+	// failed on a call that was otherwise correct. Both are accepted by both.
+	FString OutputPath = OptionalString(Params, TEXT("outputPath"));
+	if (OutputPath.IsEmpty())
+	{
+		OutputPath = OptionalString(Params, TEXT("filename"));
+	}
+	if (OutputPath.IsEmpty())
+	{
+		return MCPError(TEXT("Missing 'outputPath' (also accepted as 'filename'): where to write the PNG"));
+	}
 
 	// Resolution
 	int32 Width = OptionalInt(Params, TEXT("width"), 1280);
@@ -2460,50 +3643,119 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScenePng(const TSharedPtr<FJsonOb
 	Height = FMath::Clamp(Height, 16, 8192);
 
 	const double Fov = OptionalNumber(Params, TEXT("fov"), 90.0);
+	const float CaptureFov = static_cast<float>(Fov);
+	if (!FMath::IsFinite(CaptureFov) || CaptureFov <= 0.0f || CaptureFov >= 180.0f)
+	{
+		return MCPError(TEXT("fov must be finite and between 0 and 180 degrees (exclusive)"));
+	}
 
 	FVector Location = OptionalVec3(Params, TEXT("location"));
 	FRotator Rotation = OptionalRotator(Params, TEXT("rotation"));
+	const double FocusMargin = OptionalNumber(Params, TEXT("focusMargin"), 1.5);
+	if (!FMath::IsFinite(FocusMargin) || FocusMargin <= 0.0)
+	{
+		return MCPError(TEXT("focusMargin must be finite and greater than zero"));
+	}
 
 	// #599: focusActorLabel frames the capture on a specific actor by computing
 	// a camera position from the actor's bounds and looking at its center.
 	const FString FocusLabel = OptionalString(Params, TEXT("focusActorLabel"));
-	if (!FocusLabel.IsEmpty())
+	const FString FocusPath = OptionalString(Params, TEXT("focusActorPath"));
+	TSharedPtr<FJsonObject> FocusMetadata;
+	if (!FocusLabel.IsEmpty() || !FocusPath.IsEmpty())
 	{
-		AActor* Focus = FindActorByLabelNameOrPath(World, FocusLabel);
-		if (!Focus) return MCPError(FString::Printf(TEXT("focusActorLabel not found: %s"), *FocusLabel));
+		// #983: framing on the wrong copy of a duplicated label is a capture
+		// that quietly shows somewhere else entirely.
+		FMCPActorSelector FocusSel;
+		FocusSel.LabelKey = TEXT("focusActorLabel");
+		FocusSel.PathKey = TEXT("focusActorPath");
+		FocusSel.Match = EMCPActorMatch::LabelNameOrPath;
+		TSharedPtr<FJsonValue> FocusErr;
+		AActor* Focus = MCPResolveActor(World, Params, FocusErr, FocusSel);
+		if (!Focus) return FocusErr;
 		FVector Origin, Extent;
 		Focus->GetActorBounds(false, Origin, Extent);
 		const double Radius = FMath::Max(Extent.Size(), 50.0);
 		// Distance so the bounds fill the frame at the given FOV, with margin.
-		const double Distance = (Radius / FMath::Tan(FMath::DegreesToRadians(Fov * 0.5))) * OptionalNumber(Params, TEXT("focusMargin"), 1.5);
+		const double Distance = (Radius / FMath::Tan(FMath::DegreesToRadians(Fov * 0.5))) * FocusMargin;
 		// Default framing direction (front-ish, slightly above); overridable.
 		FVector Dir = OptionalVec3(Params, TEXT("focusDirection"), FVector(-1.0, -1.0, 0.6));
+		if (Dir.ContainsNaN() || !FMath::IsFinite(Distance)) return MCPError(TEXT("Focus framing must produce finite coordinates"));
 		if (!Dir.Normalize()) Dir = FVector(-1, -1, 0.6).GetSafeNormal();
 		Location = Origin + Dir * Distance;
 		Rotation = (Origin - Location).Rotation();
+		FocusMetadata = MakeShared<FJsonObject>();
+		FocusMetadata->SetStringField(TEXT("actorPath"), Focus->GetPathName());
+		FocusMetadata->SetStringField(TEXT("actorLabel"), Focus->GetActorLabel());
+		FocusMetadata->SetObjectField(TEXT("boundsOrigin"), MCPVec3ToJsonObject(Origin));
+		FocusMetadata->SetObjectField(TEXT("boundsExtent"), MCPVec3ToJsonObject(Extent));
+		FocusMetadata->SetObjectField(TEXT("directionWorld"), MCPVec3ToJsonObject(Dir));
 	}
+	if (Location.ContainsNaN() || Rotation.ContainsNaN()) return MCPError(TEXT("Capture camera location and rotation must be finite"));
 
-	// Find or spawn the reusable capture actor.
+	// #966: the capture actor used to be spawned once and LEFT IN THE LEVEL.
+	// It is a level actor, so it was saved into the map and committed to source
+	// control as though somebody had authored it, and list_dirty_packages
+	// reported nothing while it sat there, so the usual "did I change
+	// anything" check missed it entirely. A capture must leave the level
+	// exactly as it found it.
+	//
+	// Two halves. First, sweep any debris earlier builds left behind, so a
+	// project that already has one is cleaned by the next capture rather than
+	// by hand.
 	static const FString CaptureLabel = TEXT("__ClaudeSceneCapture");
-	ASceneCapture2D* CaptureActor = nullptr;
-	for (TActorIterator<ASceneCapture2D> It(World); It; ++It)
+	int32 RemovedStrayCaptures = 0;
 	{
-		if (It->GetActorLabel() == CaptureLabel)
+		TArray<ASceneCapture2D*> Strays;
+		for (TActorIterator<ASceneCapture2D> It(World); It; ++It)
 		{
-			CaptureActor = *It;
-			break;
+			if (It->GetActorLabel() == CaptureLabel)
+			{
+				Strays.Add(*It);
+			}
+		}
+		for (ASceneCapture2D* Stray : Strays)
+		{
+			// These ones ARE in the map, so their removal is a real edit and
+			// goes through Modify(): the level has to become dirty, or the
+			// debris comes straight back on the next load.
+			if (IsValid(Stray) && World->DestroyActor(Stray))
+			{
+				++RemovedStrayCaptures;
+			}
 		}
 	}
-	if (!CaptureActor)
+
+	// Second, this capture's own actor: transient, outside the scene outliner,
+	// in no actor package of its own, and destroyed on every exit from here.
+	// The transient flag alone is not enough, because the debris that prompted
+	// this was visible in the outliner and in the map's actor list either way.
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.ObjectFlags |= RF_Transient;
+#if WITH_EDITOR
+	SpawnParams.bTemporaryEditorActor = true;
+	SpawnParams.bHideFromSceneOutliner = true;
+	SpawnParams.bCreateActorPackage = false;
+#endif
+	ASceneCapture2D* CaptureActor = World->SpawnActor<ASceneCapture2D>(ASceneCapture2D::StaticClass(), Location, Rotation, SpawnParams);
+	if (!CaptureActor) return MCPError(TEXT("Failed to spawn SceneCapture2D actor"));
+	CaptureActor->SetActorHiddenInGame(true);
+
+	ON_SCOPE_EXIT
 	{
-		FActorSpawnParameters SpawnParams;
-		SpawnParams.ObjectFlags |= RF_Transient;
-		CaptureActor = World->SpawnActor<ASceneCapture2D>(ASceneCapture2D::StaticClass(), Location, Rotation, SpawnParams);
-		if (!CaptureActor) return MCPError(TEXT("Failed to spawn SceneCapture2D actor"));
-		CaptureActor->SetActorLabel(CaptureLabel);
-		CaptureActor->SetActorHiddenInGame(true);
-	}
-	CaptureActor->SetActorLocationAndRotation(Location, Rotation);
+		if (IsValid(CaptureActor))
+		{
+			// Drop the render target first: the component holds the only
+			// reference keeping it alive past this call.
+			if (USceneCaptureComponent2D* Dying = CaptureActor->GetCaptureComponent2D())
+			{
+				Dying->TextureTarget = nullptr;
+			}
+			// bShouldModifyLevel=false: this actor was never part of the map,
+			// so removing it is not an edit and must not dirty the package.
+			World->DestroyActor(CaptureActor, /*bNetForce*/ false, /*bShouldModifyLevel*/ false);
+		}
+	};
 
 	USceneCaptureComponent2D* Comp = CaptureActor->GetCaptureComponent2D();
 	if (!Comp) return MCPError(TEXT("SceneCapture2D has no capture component"));
@@ -2544,6 +3796,10 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScenePng(const TSharedPtr<FJsonOb
 	FString OutName = FPaths::GetCleanFilename(AbsPath);
 	IFileManager::Get().MakeDirectory(*OutDir, /*Tree*/ true);
 
+	// Asked before the export, because it is the difference between creating a
+	// file and destroying whatever was at that path.
+	const bool bOverwrote = IFileManager::Get().FileExists(*AbsPath);
+
 	UKismetRenderingLibrary::ExportRenderTarget(World, RT, OutDir, OutName);
 
 	const int64 Size = IFileManager::Get().FileSize(*AbsPath);
@@ -2557,7 +3813,48 @@ TSharedPtr<FJsonValue> FEditorHandlers::CaptureScenePng(const TSharedPtr<FJsonOb
 	Result->SetNumberField(TEXT("width"), Width);
 	Result->SetNumberField(TEXT("height"), Height);
 	Result->SetNumberField(TEXT("sizeBytes"), (double)Size);
-	Result->SetStringField(TEXT("actorLabel"), CaptureLabel);
+	// Pair the image with the camera that rendered it. The editor viewport is
+	// a different camera and cannot be used to deproject this image's pixels.
+	auto CaptureMetadata = MakeShared<FJsonObject>();
+	CaptureMetadata->SetStringField(TEXT("worldPath"), World->GetPathName());
+	CaptureMetadata->SetStringField(TEXT("world"), World->IsGameWorld() ? TEXT("pie") : TEXT("editor"));
+	if (const FWorldContext* Context = GEngine->GetWorldContextFromWorld(World))
+	{
+		if (Context->WorldType == EWorldType::PIE)
+			CaptureMetadata->SetNumberField(TEXT("pieInstance"), Context->PIEInstance);
+	}
+	CaptureMetadata->SetStringField(TEXT("projection"), TEXT("perspective"));
+	CaptureMetadata->SetObjectField(TEXT("location"), MCPVec3ToJsonObject(Comp->GetComponentLocation()));
+	CaptureMetadata->SetObjectField(TEXT("rotation"), MCPRotatorToJsonObject(Comp->GetComponentRotation()));
+	CaptureMetadata->SetObjectField(TEXT("forward"), MCPVec3ToJsonObject(Comp->GetForwardVector()));
+	CaptureMetadata->SetObjectField(TEXT("right"), MCPVec3ToJsonObject(Comp->GetRightVector()));
+	CaptureMetadata->SetObjectField(TEXT("up"), MCPVec3ToJsonObject(Comp->GetUpVector()));
+	CaptureMetadata->SetNumberField(TEXT("fovDegrees"), Comp->FOVAngle);
+	CaptureMetadata->SetNumberField(TEXT("width"), RT->SizeX);
+	CaptureMetadata->SetNumberField(TEXT("height"), RT->SizeY);
+	CaptureMetadata->SetNumberField(TEXT("worldTimeSeconds"), World->GetTimeSeconds());
+	CaptureMetadata->SetBoolField(TEXT("fullyLoadTextures"), bFullyLoadTextures);
+	if (FocusMetadata) CaptureMetadata->SetObjectField(TEXT("focus"), FocusMetadata);
+	Result->SetObjectField(TEXT("captureMetadata"), CaptureMetadata);
+	// The capture actor is gone by the time this reaches the caller, so say so
+	// rather than naming an actor they could go and look for.
+	Result->SetBoolField(TEXT("captureActorRemoved"), true);
+	if (RemovedStrayCaptures > 0)
+	{
+		Result->SetNumberField(TEXT("strayCaptureActorsRemoved"), RemovedStrayCaptures);
+	}
+	Result->SetBoolField(TEXT("overwrote"), bOverwrote);
+	// A capture always renders and writes a fresh frame, so it never finds work
+	// already done and skips it.
+	Result->SetBoolField(TEXT("changed"), true);
+	// No rollback: nothing in the bridge deletes a file from disk, so a capture
+	// cannot be taken back, and when it overwrote an existing image that image
+	// is gone as well. The transient capture actor and render target it used
+	// were already torn down, so nothing else is left to undo.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"), bOverwrote
+		? TEXT("No bridge call deletes a file from disk, and this capture replaced a file that was already at that path. Neither the new file nor the one it overwrote can be restored. Capture to a fresh path when a flow may need to roll back.")
+		: TEXT("No bridge call deletes a file from disk, so the captured image cannot be removed again. The capture actor and render target were transient and are already gone."));
 	return MCPResult(Result);
 }
 
@@ -2625,12 +3922,27 @@ TSharedPtr<FJsonValue> FEditorHandlers::ListFunctionLibraries(const TSharedPtr<F
 // Headlessly run registered Automation tests whose name matches a filter and
 // report pass/fail + errors. Uses FAutomationTestFramework's synchronous
 // StartTestByName/StopTest, which fully runs non-latent tests. Latent tests
-// (that enqueue cross-frame commands) have their queued commands flushed on a
-// best-effort tick loop with a timeout.
+// (that enqueue cross-frame commands) get a bounded drain, and one that has not
+// finished when the budget runs out is abandoned and reported, never stopped
+// mid-queue.
+//
+// #993: StopTest asserts on LatentCommands.IsEmpty() inside InternalStopTest,
+// and this handler used to call it unconditionally after a drain loop that gave
+// up after a fixed iteration count. A CQTest test that starts multi-client PIE
+// still had commands queued at that point, so the assert fired and took the
+// editor down: the caller saw a WebSocket close 1006, not a test result. A
+// handler must never take the editor down.
 TSharedPtr<FJsonValue> FEditorHandlers::RunAutomationTests(const TSharedPtr<FJsonObject>& Params)
 {
 	const FString NameFilter = OptionalString(Params, TEXT("filter"));
 	const int32 MaxTests = OptionalInt(Params, TEXT("maxTests"), 50);
+	// How long one test's latent queue may take. The handler occupies the game
+	// thread for its whole run, so this is deliberately small by default: a
+	// latent command that needs real frames (PIE, anything waiting on a world
+	// tick) cannot make progress from in here however long it is given, and
+	// waiting longer only holds the editor still for longer.
+	const double LatentBudgetSeconds = FMath::Clamp(
+		OptionalNumber(Params, TEXT("latentTimeoutSeconds"), 5.0), 0.0, 120.0);
 
 	// #765: this handler runs tests SYNCHRONOUSLY via StartTestByName inside a
 	// single tick, so it never depended on the interactive-frame-rate gate that
@@ -2663,7 +3975,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunAutomationTests(const TSharedPtr<FJso
 	Framework.GetValidTestNames(AllTests);
 
 	TArray<TSharedPtr<FJsonValue>> Results;
-	int32 Ran = 0, Passed = 0, Failed = 0;
+	int32 Ran = 0, Passed = 0, Failed = 0, Abandoned = 0;
 	for (const FAutomationTestInfo& Info : AllTests)
 	{
 		const FString TestName = Info.GetTestName();
@@ -2677,21 +3989,57 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunAutomationTests(const TSharedPtr<FJso
 
 		Framework.StartTestByName(TestName, /*RoleIndex*/ 0);
 
-		// Flush latent commands (best effort, bounded) so latent tests finish.
-		int32 Guard = 0;
-		while (!Framework.ExecuteLatentCommands() && Guard++ < 1000)
+		// Drain the latent queue, bounded by wall clock rather than by a fixed
+		// iteration count. The old bound was 1000 iterations of a zero-length
+		// sleep, which elapses in no time at all and gave a command that polls
+		// for a condition no real chance to reach one. Network commands are
+		// pumped alongside, because the framework's own per-frame path does and
+		// a latent queue behind an undelivered network command never empties.
+		const double DrainStartedAt = FPlatformTime::Seconds();
+		while (!Framework.ExecuteLatentCommands()
+			&& (FPlatformTime::Seconds() - DrainStartedAt) < LatentBudgetSeconds)
 		{
-			FPlatformProcess::Sleep(0.0f);
+			Framework.ExecuteNetworkCommands();
+			FPlatformProcess::Sleep(0.001f);
+		}
+
+		// #993: StopTest asserts that the latent queue is empty. Anything still
+		// queued here needs frames this handler cannot give it, because the
+		// handler owns the game thread for its whole run and the engine loop
+		// only advances once it returns. Clear the queue and record the test as
+		// abandoned; calling StopTest with commands outstanding is what took
+		// the editor down.
+		const bool bAbandoned = !Framework.IsLatentCommandQueueEmpty();
+		if (bAbandoned)
+		{
+			Framework.DequeueAllCommands();
 		}
 
 		FAutomationTestExecutionInfo ExecInfo;
-		const bool bPassed = Framework.StopTest(ExecInfo);
+		const bool bStopReportedPass = Framework.StopTest(ExecInfo);
+		const bool bPassed = bStopReportedPass && !bAbandoned;
 		++Ran;
-		if (bPassed) ++Passed; else ++Failed;
+		if (bAbandoned) ++Abandoned;
+		else if (bPassed) ++Passed;
+		else ++Failed;
+
+		// An abandoned test may have left PIE running, and leaving it up would
+		// silently change what every later call in this session sees.
+		if (bAbandoned && GEditor && (GEditor->PlayWorld != nullptr || GEditor->bIsSimulatingInEditor))
+		{
+			GEditor->RequestEndPlayMap();
+		}
 
 		TSharedPtr<FJsonObject> R = MakeShared<FJsonObject>();
 		R->SetStringField(TEXT("test"), DisplayName.IsEmpty() ? TestName : DisplayName);
 		R->SetBoolField(TEXT("passed"), bPassed);
+		R->SetBoolField(TEXT("abandoned"), bAbandoned);
+		if (bAbandoned)
+		{
+			R->SetStringField(TEXT("abandonedReason"), FString::Printf(
+				TEXT("Latent commands were still queued after %.1fs. They need engine frames, which cannot happen while this handler holds the game thread, so the test was abandoned rather than stopped mid-queue (stopping mid-queue asserts and terminates the editor). Run this one from the editor's Automation window, or with -ExecCmds=\"Automation RunTests %s\" at launch."),
+				LatentBudgetSeconds, *TestName));
+		}
 		R->SetNumberField(TEXT("errors"), ExecInfo.GetErrorTotal());
 		R->SetNumberField(TEXT("warnings"), ExecInfo.GetWarningTotal());
 		if (ExecInfo.GetErrorTotal() > 0)
@@ -2715,6 +4063,24 @@ TSharedPtr<FJsonValue> FEditorHandlers::RunAutomationTests(const TSharedPtr<FJso
 	Result->SetNumberField(TEXT("ran"), Ran);
 	Result->SetNumberField(TEXT("passed"), Passed);
 	Result->SetNumberField(TEXT("failed"), Failed);
+	Result->SetNumberField(TEXT("abandoned"), Abandoned);
+	Result->SetNumberField(TEXT("latentTimeoutSeconds"), LatentBudgetSeconds);
+	if (Abandoned > 0)
+	{
+		Result->SetStringField(TEXT("warning"), FString::Printf(
+			TEXT("%d test(s) were abandoned with latent commands still queued. They need engine frames, and this handler holds the game thread for its whole run, so it cannot supply any. Raising latentTimeoutSeconds helps a test that only polls; a test that starts PIE needs the editor's Automation window or -ExecCmds=\"Automation RunTests <name>\" at launch. Nothing was stopped mid-queue, which is what used to terminate the editor (#993)."),
+			Abandoned));
+	}
 	Result->SetArrayField(TEXT("results"), Results);
+	// A filter that matched nothing ran no test code at all. Past that, what a
+	// test wrote is the test's business: this handler observes pass/fail, not
+	// a diff of the project.
+	Result->SetBoolField(TEXT("changed"), Ran > 0);
+	// No rollback. A test can spawn actors, write assets, start PIE and leave
+	// state behind (an abandoned one demonstrably does), and none of that was
+	// captured before the run. Re-running is not an inverse.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("Automation tests run arbitrary engine and project code, nothing was captured before the run, and re-running them is not an inverse. A test that leaves state behind has to clean up after itself; abandoned tests are reported so that case is visible."));
 	return MCPResult(Result);
 }

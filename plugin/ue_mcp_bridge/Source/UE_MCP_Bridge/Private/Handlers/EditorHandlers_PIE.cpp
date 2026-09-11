@@ -9,6 +9,7 @@
 #include "HandlerUtils.h"
 
 #include "UObject/GCObjectScopeGuard.h"
+#include "HandlerFunctionCall.h"
 #include "HandlerJsonProperty.h"
 #include "JsonSerializer.h"
 #include "Containers/Ticker.h"
@@ -212,12 +213,32 @@ TSharedPtr<FJsonValue> FEditorHandlers::PieControl(const TSharedPtr<FJsonObject>
 		bool bIsPlaying = (GEditor->PlayWorld != nullptr);
 		Result->SetBoolField(TEXT("isPlaying"), bIsPlaying);
 		Result->SetStringField(TEXT("action"), Action);
+		// action=status only reads. Stated rather than left blank, because the
+		// same handler mutates under the other two actions.
+		Result->SetBoolField(TEXT("changed"), false);
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
 	}
 	else if (Action == TEXT("start"))
 	{
 		if (GEditor->PlayWorld != nullptr)
 		{
-			return MCPError(TEXT("PIE session already active"));
+			// No session was started, so the verdict is false. `alreadyRunning`
+			// is the reason as a field rather than as prose: a caller has to
+			// tell "there was nothing to start" from "the launch broke", and
+			// that is the whole job the marker does. It does not turn the
+			// answer into a yes. A flow step that expects this outcome says so
+			// on itself with ignore_failure: true, which is the flow's decision
+			// to make and not this handler's to hide.
+			TSharedPtr<FJsonObject> Already = MakeShared<FJsonObject>();
+			Already->SetBoolField(TEXT("success"), false);
+			Already->SetStringField(TEXT("error"),
+				TEXT("PIE session already active, so none was started. This call changed nothing; stop the session with pie_control(action=stop) before starting a different one."));
+			Already->SetBoolField(TEXT("alreadyRunning"), true);
+			Already->SetBoolField(TEXT("isPlaying"), true);
+			Already->SetStringField(TEXT("action"), Action);
+			Already->SetBoolField(TEXT("changed"), false);
+			Already->SetBoolField(TEXT("rollbackPossible"), false);
+			return MCPResult(Already);
 		}
 
 		// AssetRegistry must be done with its initial scan before PIE can start.
@@ -350,19 +371,82 @@ TSharedPtr<FJsonValue> FEditorHandlers::PieControl(const TSharedPtr<FJsonObject>
 			RestoreIgnoreBlueprintErrorsState();
 		}
 
+		// Read before requesting. The guard above tests PlayWorld only, and the
+		// request is deferred, so two starts in the same tick both pass it and
+		// the second silently overwrites PlaySessionRequest. This is the signal
+		// that makes the answer below true rather than assumed.
+		const bool bAlreadyQueued = GEditor->IsPlaySessionRequestQueued();
+
 		FRequestPlaySessionParams SessionParams;
 		GEditor->RequestPlaySession(SessionParams);
 		Result->SetStringField(TEXT("action"), Action);
+		// A REQUEST: UEditorEngine::RequestPlaySession stores the params to be
+		// acted on next tick, so PIE is not running yet and isPlaying still
+		// answers false. Queuing over a request that was already queued
+		// replaces it and starts nothing extra, which is a no-op worth saying.
+		Result->SetBoolField(TEXT("changed"), !bAlreadyQueued);
+		Result->SetBoolField(TEXT("alreadyQueued"), bAlreadyQueued);
+		Result->SetBoolField(TEXT("isPlaying"), false);
+		Result->SetBoolField(TEXT("playSessionRequested"), true);
+		Result->SetStringField(TEXT("startNote"), bAlreadyQueued
+			? TEXT("A play session was already queued and this call replaced that request rather than adding one. It begins on a later editor tick; poll pie_control(action=status) until isPlaying is true before doing anything that needs the PIE world.")
+			: TEXT("The play session is queued and begins on a later editor tick. Poll pie_control(action=status) until isPlaying is true before doing anything that needs the PIE world."));
+
+		// No rollback, and stopping is not one. The request is deferred, so at
+		// the moment a rollback would run PlayWorld is still null and
+		// pie_control(action=stop) reports alreadyStopped on exactly that - and
+		// PIE then starts anyway a tick later, leaving the editor in play after
+		// a rollback that reported it had finished. An inverse that can leave
+		// the thing it was meant to undo running is worse than none, and the
+		// idempotent report makes that reading MORE convincing, not less: the
+		// undo would come back clean while play carried on.
+		//
+		// The queued request IS cancellable: UEditorEngine has
+		// CancelRequestPlaySession, which drops it before the tick acts on it.
+		// The bridge exposes no action that calls it, so there is no method
+		// name to put in a rollback record. That is a one-line gap in the
+		// surface, not an engine limitation.
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Starting play is a deferred request. pie_control(action=stop) is not its inverse: at rollback time there is no session yet, so it reports alreadyStopped while the queued one starts regardless. The engine can drop a queued request through CancelRequestPlaySession, but no bridge action calls it, so no rollback can name one. Stop it deliberately once pie_control(action=status) reports isPlaying."));
 	}
 	else if (Action == TEXT("stop"))
 	{
 		if (GEditor->PlayWorld == nullptr)
 		{
-			return MCPError(TEXT("No PIE session active"));
+			// The mirror of the start above: nothing was ended, so the verdict
+			// is false, and `alreadyStopped` says the reason was an absent
+			// session rather than a stop that failed to take.
+			TSharedPtr<FJsonObject> Already = MakeShared<FJsonObject>();
+			Already->SetBoolField(TEXT("success"), false);
+			Already->SetStringField(TEXT("error"),
+				TEXT("No PIE session active, so nothing was asked to end. Play is already stopped."));
+			Already->SetBoolField(TEXT("alreadyStopped"), true);
+			Already->SetBoolField(TEXT("isPlaying"), false);
+			Already->SetStringField(TEXT("action"), Action);
+			Already->SetBoolField(TEXT("changed"), false);
+			Already->SetBoolField(TEXT("rollbackPossible"), false);
+			return MCPResult(Already);
 		}
 
 		GEditor->RequestEndPlayMap();
 		Result->SetStringField(TEXT("action"), Action);
+		// Stopping is refused above when no PlayWorld exists, so reaching here
+		// always requested the end of a session that was running. Like the
+		// start, this is queued: RequestEndPlayMap flags the tick loop and the
+		// worlds are torn down on a later tick.
+		Result->SetBoolField(TEXT("changed"), true);
+		Result->SetBoolField(TEXT("endPlayRequested"), true);
+		Result->SetStringField(TEXT("stopNote"),
+			TEXT("The session ends on a later editor tick. Poll pie_control(action=status) until isPlaying is false before doing anything that needs the PIE world gone."));
+		// No rollback. Starting PIE again is not the inverse of stopping it: it
+		// is a fresh session from the map's saved state, with none of the world
+		// the stop tore down. A rollback here would also run after play had
+		// already ended, which is the point at which restarting is a new action
+		// rather than an undo.
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"),
+			TEXT("Ending play destroys the PIE worlds and everything spawned in them. pie_control(action=start) launches a NEW session from the saved map rather than restoring this one."));
 	}
 	else
 	{
@@ -386,6 +470,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::PieGetRuntimeValue(const TSharedPtr<FJso
 		return MCPError(TEXT("PIE is not active. Start a PIE session first."));
 	}
 
+	// This action shipped before #983 with 'actorPath' as a label|name|path
+	// token, not a strict path, and with 'actorLabel' as its fallback spelling.
+	// The shared resolver treats a path as precise, so the loose reading is
+	// kept here explicitly rather than silently dropped: a caller who has been
+	// passing a label in 'actorPath' for two releases must not start getting
+	// "no actor at that path".
 	FString ActorPath;
 	if (!Params->TryGetStringField(TEXT("actorPath"), ActorPath))
 	{
@@ -401,8 +491,25 @@ TSharedPtr<FJsonValue> FEditorHandlers::PieGetRuntimeValue(const TSharedPtr<FJso
 
 	// Search for the actor in the PIE world (accept label, name, or full path).
 	// #778: honour pieInstance so a client world is reachable.
+	// #983: through the shared resolver, so actorPath wins over actorLabel and
+	// a duplicated label is refused rather than read off one of the copies.
 	UWorld* PIEWorld = ResolveWorldFromParams(Params, TEXT("pie"));
-	AActor* TargetActor = FindActorByLabelNameOrPath(PIEWorld, ActorPath);
+	FMCPActorSelector PieSel;
+	PieSel.Match = EMCPActorMatch::LabelNameOrPath;
+	PieSel.WorldLabel = TEXT("PIE");
+	TSharedPtr<FJsonValue> PieActorErr;
+	AActor* TargetActor = MCPResolveActor(PIEWorld, Params, PieActorErr, PieSel);
+	if (!TargetActor && MCPIsAmbiguousActorError(PieActorErr)) return PieActorErr;
+
+	// The legacy tolerance: retry the value of 'actorPath' as a label / name
+	// token. Ambiguity is still refused, so the loose reading cannot bring the
+	// silent wrong pick back with it.
+	if (!TargetActor && !ActorPath.IsEmpty())
+	{
+		TSharedPtr<FJsonValue> LegacyErr;
+		TargetActor = MCPResolveActorToken(PIEWorld, ActorPath, LegacyErr, PieSel);
+		if (!TargetActor && MCPIsAmbiguousActorError(LegacyErr)) return LegacyErr;
+	}
 
 	if (!TargetActor)
 	{
@@ -656,19 +763,127 @@ namespace
 				Out->SetObjectField(Field, O); return true;
 			}
 		}
+		// #885: a container is real JSON here too. The export-text fallback
+		// below renders a TArray<FString> as an empty string, so a path whose
+		// leaf is an array read back as though it held nothing.
+		if (MCPFunctionCall::IsContainerProperty(Prop))
+		{
+			Out->SetField(Field, MCPFunctionCall::ValueToJson(Prop, ValuePtr, nullptr));
+			return true;
+		}
 		FString Exported;
 		Prop->ExportTextItem_Direct(Exported, ValuePtr, nullptr, nullptr, PPF_None);
 		Out->SetStringField(Field, Exported);
 		return true;
 	}
 
+	/**
+	 * #969: evaluate a path segment that resolved to a UFUNCTION, binding the
+	 * literal arguments the segment carried.
+	 *
+	 * A read-only accessor keyed by an id (a tally by option id, a balance by
+	 * currency id, an attribute by tag) is a very common shape and used to be
+	 * unreachable here: anything taking a parameter was refused, and the
+	 * workaround was one invoke_object_function per key with an exact
+	 * objectPath, which loses the multi-instance table this action exists for.
+	 *
+	 * The literals are coerced by MCPJsonProperty::SetJsonOnProperty, the same
+	 * setter invoke_object_function's `args` go through. There is deliberately
+	 * no second coercion: a string reads into an FName, an FString, an integer,
+	 * a float, a bool or an enum there already, so a keyed accessor behaves the
+	 * same whichever action reaches it.
+	 */
+	static bool CallPathGetter(
+		UObject* Target,
+		UFunction* Fn,
+		const TArray<FString>& ArgLiterals,
+		TSharedPtr<FJsonObject> Out,
+		const TCHAR* FieldKey,
+		FString& OutErr)
+	{
+		FProperty* RetProp = Fn->GetReturnProperty();
+		if (!RetProp)
+		{
+			OutErr = FString::Printf(TEXT("UFUNCTION '%s' has no return value"), *Fn->GetName());
+			return false;
+		}
+
+		// Inputs are the parameters a caller can supply: not the return, and not
+		// a plain out param, which the function writes rather than reads.
+		TArray<FProperty*> Inputs;
+		for (TFieldIterator<FProperty> It(Fn); It && (It->PropertyFlags & CPF_Parm); ++It)
+		{
+			FProperty* Parm = *It;
+			if (Parm->PropertyFlags & CPF_ReturnParm) continue;
+			if ((Parm->PropertyFlags & CPF_OutParm) && !(Parm->PropertyFlags & CPF_ReferenceParm)) continue;
+			Inputs.Add(Parm);
+		}
+
+		if (ArgLiterals.Num() != Inputs.Num())
+		{
+			TArray<FString> Signature;
+			for (FProperty* Parm : Inputs)
+			{
+				Signature.Add(FString::Printf(TEXT("%s %s"), *Parm->GetCPPType(), *Parm->GetName()));
+			}
+			OutErr = FString::Printf(
+				TEXT("UFUNCTION '%s' takes %d argument(s) (%s) but the path supplied %d. Write them into the path, e.g. '%s(key)'."),
+				*Fn->GetName(), Inputs.Num(), *FString::Join(Signature, TEXT(", ")), ArgLiterals.Num(), *Fn->GetName());
+			return false;
+		}
+
+		// ParmsSize, not PropertiesSize: a Blueprint function's locals live past
+		// the parameter block and initialising them would run off the frame.
+		TArray<uint8> Frame;
+		Frame.SetNumZeroed(Fn->ParmsSize);
+		for (TFieldIterator<FProperty> It(Fn); It && (It->PropertyFlags & CPF_Parm); ++It)
+		{
+			It->InitializeValue_InContainer(Frame.GetData());
+		}
+
+		bool bBound = true;
+		for (int32 ArgIndex = 0; ArgIndex < Inputs.Num(); ++ArgIndex)
+		{
+			FProperty* Parm = Inputs[ArgIndex];
+			const TSharedPtr<FJsonValue> AsJson = MakeShared<FJsonValueString>(ArgLiterals[ArgIndex]);
+			FString BindErr;
+			if (!MCPJsonProperty::SetJsonOnProperty(
+					Parm, Parm->ContainerPtrToValuePtr<void>(Frame.GetData()), AsJson, BindErr))
+			{
+				OutErr = FString::Printf(
+					TEXT("UFUNCTION '%s' argument '%s': %s"), *Fn->GetName(), *Parm->GetName(), *BindErr);
+				bBound = false;
+				break;
+			}
+		}
+
+		if (bBound)
+		{
+			{
+				// #806: without this guard an actor getter called against the
+				// editor world is skipped and the zeroed frame reads back as a
+				// real value.
+				FEditorScriptExecutionGuard ScriptGuard;
+				Target->ProcessEvent(Fn, Frame.GetData());
+			}
+			WritePropertyValue(Out, FieldKey, RetProp, RetProp->ContainerPtrToValuePtr<void>(Frame.GetData()));
+		}
+
+		MCPFunctionCall::DestroyFrame(Fn, Frame.GetData());
+		return bBound;
+	}
+
 	// Walk one dotted path starting at Root. Per segment: property hop, sub-object
-	// hop, or - at the leaf - a zero-arg UFUNCTION call. Writes the result onto Out.
+	// hop, or - at the leaf - a UFUNCTION call, which may carry literal arguments
+	// as 'GetTallyWeight(overclock)'. Writes the result onto Out.
 	static void ResolvePath(UObject* Root, const FString& Path, TSharedPtr<FJsonObject> Out, const TCHAR* FieldKey, FString& OutErr)
 	{
 		if (!Root) { OutErr = TEXT("null root"); return; }
 		TArray<FString> Parts;
-		Path.ParseIntoArray(Parts, TEXT("."));
+		// Split on dots that separate segments, not on a dot inside an argument
+		// list: 'GetWeightAt(1.5)' is one segment, and splitting it would look
+		// up a property named 'GetWeightAt(1'.
+		MCPFunctionCall::SplitPathSegments(Path, Parts);
 		if (Parts.Num() == 0) { OutErr = TEXT("empty path"); return; }
 
 		UStruct* CurStruct = Root->GetClass();
@@ -677,9 +892,24 @@ namespace
 
 		for (int32 i = 0; i < Parts.Num(); ++i)
 		{
-			const FString& Seg = Parts[i];
+			const FString& RawSeg = Parts[i];
 			const bool bLast = (i == Parts.Num() - 1);
-			FProperty* Prop = CurStruct->FindPropertyByName(FName(*Seg));
+
+			// A segment may be 'Name' or 'Name(literal, literal)'. Reading the
+			// argument list off the front makes the rest of this loop the same
+			// as it always was.
+			FString Seg;
+			TArray<FString> CallArgs;
+			bool bHasArgList = false;
+			if (!MCPFunctionCall::ParseCallSegment(RawSeg, Seg, CallArgs, bHasArgList, OutErr))
+			{
+				return;
+			}
+
+			// An argument list says "call this", so no property or component of
+			// that name is considered: silently reading a property while the
+			// caller asked for a call would answer a question nobody asked.
+			FProperty* Prop = bHasArgList ? nullptr : CurStruct->FindPropertyByName(FName(*Seg));
 
 			if (bLast && Prop)
 			{
@@ -711,9 +941,9 @@ namespace
 
 			// No property by that name. At the head of the path, try matching an
 			// actor component by name (mirrors get_runtime_value behavior). At
-			// any later segment OR the leaf, try a zero-arg UFUNCTION call - that
-			// covers GetRequired() / IsPowered() etc.
-			if (i == 0)
+			// any later segment OR the leaf, try a UFUNCTION call - that covers
+			// GetRequired() / IsPowered() and, since #969, GetTally(overclock).
+			if (i == 0 && !bHasArgList)
 			{
 				if (AActor* AsActor = Cast<AActor>(CurObject))
 				{
@@ -730,53 +960,21 @@ namespace
 				}
 			}
 
-			// UFUNCTION zero-arg getter at this segment.
+			// UFUNCTION getter at this segment, with or without arguments.
 			if (UFunction* Fn = CurObject ? CurObject->FindFunction(FName(*Seg)) : nullptr)
 			{
-				if (Fn->NumParms == 1 && Fn->ReturnValueOffset != MAX_uint16)
+				if (!bLast)
 				{
-					uint8* Frame = (uint8*)FMemory_Alloca(Fn->ParmsSize);
-					FMemory::Memzero(Frame, Fn->ParmsSize);
-					for (TFieldIterator<FProperty> It(Fn); It; ++It)
-					{
-						It->InitializeValue_InContainer(Frame);
-					}
-					{
-						// #806: without this guard an actor getter called against
-						// the editor world is skipped and the zeroed frame reads
-						// back as a real value.
-						FEditorScriptExecutionGuard ScriptGuard;
-						CurObject->ProcessEvent(Fn, Frame);
-					}
-					FProperty* RetProp = Fn->GetReturnProperty();
-					if (RetProp)
-					{
-						if (bLast)
-						{
-							void* RetVal = RetProp->ContainerPtrToValuePtr<void>(Frame);
-							WritePropertyValue(Out, FieldKey, RetProp, RetVal);
-						}
-						else
-						{
-							OutErr = FString::Printf(TEXT("UFUNCTION '%s' must be the leaf segment - cannot descend into its return"), *Seg);
-						}
-					}
-					else
-					{
-						OutErr = FString::Printf(TEXT("UFUNCTION '%s' has no return value"), *Seg);
-					}
-					for (TFieldIterator<FProperty> It(Fn); It; ++It)
-					{
-						It->DestroyValue_InContainer(Frame);
-					}
+					OutErr = FString::Printf(TEXT("UFUNCTION '%s' must be the leaf segment - cannot descend into its return"), *Seg);
 					return;
 				}
-				OutErr = FString::Printf(TEXT("UFUNCTION '%s' must be zero-arg with a return"), *Seg);
+				CallPathGetter(CurObject, Fn, CallArgs, Out, FieldKey, OutErr);
 				return;
 			}
 
-			OutErr = FString::Printf(TEXT("Segment '%s' is neither a property, component, nor a zero-arg UFUNCTION on %s"),
-				*Seg, *CurStruct->GetName());
+			OutErr = FString::Printf(
+				TEXT("Segment '%s' is neither a property, component, nor a UFUNCTION on %s. A UFUNCTION that takes arguments is written '%s(value)'."),
+				*Seg, *CurStruct->GetName(), *Seg);
 			return;
 
 		NextSegment:;
@@ -905,6 +1103,12 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetPieTimeScale(const TSharedPtr<FJsonOb
 		return MCPError(TEXT("WorldSettings not available on PIE world"));
 	}
 
+	// Read the dilation that is about to be replaced. This is the only value an
+	// inverse call could restore, and it is unreadable once the write lands.
+	const float PreviousFactor = UGameplayStatics::GetGlobalTimeDilation(World);
+	const float PreviousMaxCap = WS->MaxGlobalTimeDilation;
+	const float PreviousMinCap = WS->MinGlobalTimeDilation;
+
 	// Raise dilation caps so Factor isn't clamped.
 	const float CapHigh = FMath::Max(1000.0f, (float)Factor * 2.0f);
 	WS->MaxGlobalTimeDilation = FMath::Max(WS->MaxGlobalTimeDilation, CapHigh);
@@ -917,6 +1121,42 @@ TSharedPtr<FJsonValue> FEditorHandlers::SetPieTimeScale(const TSharedPtr<FJsonOb
 	Result->SetNumberField(TEXT("maxCap"), WS->MaxGlobalTimeDilation);
 	Result->SetNumberField(TEXT("minCap"), WS->MinGlobalTimeDilation);
 	Result->SetStringField(TEXT("world"), World->GetName());
+	Result->SetNumberField(TEXT("previousFactor"), PreviousFactor);
+	// SetGlobalTimeDilation clamps, so compare what the world holds now against
+	// what it held before rather than against what was asked for.
+	const float AppliedFactor = UGameplayStatics::GetGlobalTimeDilation(World);
+	Result->SetNumberField(TEXT("appliedFactor"), AppliedFactor);
+	const bool bChanged = !FMath::IsNearlyEqual(AppliedFactor, PreviousFactor)
+		|| !FMath::IsNearlyEqual(PreviousMaxCap, WS->MaxGlobalTimeDilation)
+		|| !FMath::IsNearlyEqual(PreviousMinCap, WS->MinGlobalTimeDilation);
+	Result->SetBoolField(TEXT("changed"), bChanged);
+	if (bChanged) MCPSetUpdated(Result);
+
+	// Self-inverse: the same handler with the dilation this call replaced. Only
+	// when that value is one this handler would accept back - it refuses a
+	// non-positive factor, so a world already sitting at zero has no inverse
+	// call rather than a rollback that would be rejected when replayed.
+	if (PreviousFactor > 0.0f)
+	{
+		TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetNumberField(TEXT("factor"), PreviousFactor);
+		MCPSetRollback(Result, TEXT("set_pie_time_scale"), Payload);
+		// The caps are not part of the inverse: this handler only ever widens
+		// them, and it takes no parameter that would narrow them back.
+		const bool bCapsWidened = !FMath::IsNearlyEqual(PreviousMaxCap, WS->MaxGlobalTimeDilation)
+			|| !FMath::IsNearlyEqual(PreviousMinCap, WS->MinGlobalTimeDilation);
+		Result->SetBoolField(TEXT("rollbackLossy"), true);
+		Result->SetStringField(TEXT("rollbackNote"), bCapsWidened
+			? TEXT("Restores the previous time dilation only. The Min/Max GlobalTimeDilation caps this call widened on WorldSettings stay widened, because this handler has no parameter that narrows them. The rollback also needs the same PIE session to still be running: once play ends the world it would target is gone and the call reports that instead.")
+			: TEXT("Restores the previous time dilation only. The rollback needs the same PIE session to still be running: once play ends the world it would target is gone and the call reports that instead."));
+	}
+	else
+	{
+		Result->SetBoolField(TEXT("rollbackPossible"), false);
+		Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+			TEXT("The world's time dilation before this call was %g, and this handler refuses a factor that is not greater than zero. Replaying it with that value would be rejected, so no rollback is offered."),
+			PreviousFactor));
+	}
 	return MCPResult(Result);
 }
 
@@ -983,7 +1223,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 	FString FunctionName;
 	if (auto Err = RequireString(Params, TEXT("functionName"), FunctionName)) return Err;
 	FString ActorLabel;
-	if (auto Err = RequireString(Params, TEXT("actorLabel"), ActorLabel)) return Err;
+	if (auto Err = RequireStringAlt(Params, TEXT("actorLabel"), TEXT("actorPath"), ActorLabel)) return Err;
 
 	// #778: this used GEditor->GetPIEWorldContext(), which is always the
 	// primary (server) context, so 'pieInstance' could never reach it and a
@@ -1008,11 +1248,14 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 	// fixed label -> name -> path order, and a miss is an error. There is no
 	// class-default fallback here and there must never be one: a default object
 	// answers every call with default state, which reads as success.
-	AActor* Target = FindActorByLabelNameOrPath(World, ActorLabel);
-	if (!Target)
-	{
-		return MCPError(MCPDescribeActorLookupMiss(World, ActorLabel, WorldLabel));
-	}
+	// #983: actorPath wins when given, and a label that names more than one
+	// actor is refused rather than invoked on whichever came first.
+	FMCPActorSelector TargetSel;
+	TargetSel.Match = EMCPActorMatch::LabelNameOrPath;
+	TargetSel.WorldLabel = *WorldLabel;
+	TSharedPtr<FJsonValue> TargetErr;
+	AActor* Target = MCPResolveActor(World, Params, TargetErr, TargetSel);
+	if (!Target) return TargetErr;
 	// Defensive: the lookup iterates placed actors, so neither of these can fire
 	// today. They exist so that a future change which lets an archetype or an
 	// actor from another world through fails loudly instead of quietly
@@ -1125,7 +1368,22 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 				continue;
 			}
 
-			AActor* RefActor = FindActorByLabel(World, ActorArgLabel);
+			// #983: an actor argument is an actor selector like any other, so a
+			// duplicated label is refused rather than passed as whichever copy
+			// the iterator reached first.
+			TArray<AActor*> ArgMatches;
+			MCPCollectActorsByToken(World, ActorArgLabel, EMCPActorMatch::LabelNameOrPath, ArgMatches);
+			if (ArgMatches.Num() > 1)
+			{
+				for (TFieldIterator<FProperty> CleanupIt(Func); CleanupIt && (CleanupIt->PropertyFlags & CPF_Parm); ++CleanupIt)
+				{
+					CleanupIt->DestroyValue_InContainer(ParamBuf.GetData());
+				}
+				return MCPAmbiguousActorError(
+					ActorArgLabel, TEXT("actorArgs"), TEXT("actorPath"),
+					MCPDescribeActorMatchTier(ActorArgLabel, ArgMatches[0]), ArgMatches);
+			}
+			AActor* RefActor = ArgMatches.Num() == 1 ? ArgMatches[0] : nullptr;
 			if (!RefActor)
 			{
 				for (TFieldIterator<FProperty> CleanupIt(Func); CleanupIt && (CleanupIt->PropertyFlags & CPF_Parm); ++CleanupIt)
@@ -1169,6 +1427,80 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 	// ProcessEvent can run arbitrary game code, including code that tears down
 	// the world and collects garbage, and CallTarget is read again below.
 	FGCObjectScopeGuard CallTargetGuard(CallTarget);
+
+	// #973: read the callspace BEFORE the guard opens. That is the only moment
+	// it is observable: inside the guard GAllowActorScriptExecutionInEditor
+	// makes AActor::GetFunctionCallspace answer Local in its first branch, so a
+	// UFUNCTION(Server) runs its implementation on this copy instead of being
+	// sent, and the result used to say nothing about it.
+	FString NaturalCallspace;
+	const bool bCallspaceForcedLocal =
+		MCPFunctionCall::WouldForceNetCallspaceLocal(CallTarget, Func, NaturalCallspace);
+
+	auto Result = MCPSuccess();
+	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
+	// #806: report the instance that ran the call. The reported defect was a
+	// call that looked successful while answering from somewhere other than the
+	// placed actor, and there was nothing in the response to see that with.
+	Result->SetStringField(TEXT("resolvedActorLabel"), ResolvedActorLabel);
+	Result->SetStringField(TEXT("resolvedActorPath"), ResolvedActorPath);
+	Result->SetStringField(TEXT("world"), WorldLabel);
+	if (!ComponentName.IsEmpty()) Result->SetStringField(TEXT("component"), ComponentName);
+	Result->SetStringField(TEXT("functionName"), FunctionName);
+
+	// Whether the call CAN have written anything is answerable, so answer it
+	// rather than asserting a change. A pure or const UFUNCTION is declared to
+	// have no side effects, and a deferred call against an editor world is one
+	// this handler has already worked out will be skipped outright - the
+	// warning below says exactly that, and claiming changed=true beside it
+	// would be a marker contradicting its own response.
+	const bool bDeferToNextTick = OptionalBool(Params, TEXT("deferToNextTick"), false);
+	const bool bPureFunction = Func->HasAnyFunctionFlags(FUNC_BlueprintPure | FUNC_Const);
+	const bool bWillBeSkipped = bDeferToNextTick && WorldLabel == TEXT("editor");
+	Result->SetBoolField(TEXT("pure"), bPureFunction);
+	Result->SetBoolField(TEXT("changed"), !bPureFunction && !bWillBeSkipped);
+	if (bPureFunction)
+	{
+		Result->SetStringField(TEXT("idempotencyNote"),
+			TEXT("The function is declared BlueprintPure or const, so it is a query: it reports a value and writes nothing. Calling it again returns the same answer for the same state."));
+	}
+	// Past purity the effect is opaque: a non-pure UFUNCTION is not required to
+	// write anything, and nothing here compares before against after.
+	Result->SetBoolField(TEXT("changeDetected"), false);
+	// No rollback. What an arbitrary UFUNCTION did is opaque from here: nothing
+	// was captured before the call, no inverse function is known, and a great
+	// many of them (spawns, damage, sound, RPCs) have none. Inventing one would
+	// hand the flow engine a call that could do anything.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"), bPureFunction
+		? TEXT("A pure or const function writes nothing, so there is nothing to undo.")
+		: TEXT("A UFUNCTION call has no known inverse. Wrap the sequence in editor(begin_editor_transaction) and roll back with editor(cancel_editor_transaction) when the effects are transactional, or undo the effect with whatever call your project treats as its opposite."));
+
+	// #973: the opt-in escape from the override above. Queued for the next
+	// engine tick, the send happens after the guard's scope has ended and the
+	// call routes the way it would from game code.
+	if (bDeferToNextTick)
+	{
+		Result->SetBoolField(TEXT("deferred"), true);
+		if (!NaturalCallspace.IsEmpty())
+		{
+			Result->SetStringField(TEXT("netCallspace"), NaturalCallspace);
+		}
+		Result->SetStringField(TEXT("note"), TEXT(
+			"Queued for the next engine tick, outside the editor script-execution guard, so a replicated function "
+			"routes through GetFunctionCallspace normally instead of being forced to Local. Return and out parameters "
+			"are not reported: the response is written before the call runs. Read the effect back afterwards with "
+			"editor(get_runtime_values) or editor(get_object_properties)."));
+		if (WorldLabel == TEXT("editor"))
+		{
+			Result->SetStringField(TEXT("warning"), TEXT(
+				"The target is in the editor world, whose actors were never initialised for play. Outside the guard "
+				"AActor::ProcessEvent will skip the call entirely. deferToNextTick is for a live PIE session."));
+		}
+		MCPFunctionCall::DeferProcessEventToNextTick(CallTarget, Func, MoveTemp(ParamBuf));
+		return MCPResult(Result);
+	}
+
 	// #806: AActor::ProcessEvent refuses to run script in a world whose actors
 	// were never initialised for play, which is every editor world, unless the
 	// function is marked CallInEditor. The refusal is silent: the parameter
@@ -1182,47 +1514,22 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeFunction(const TSharedPtr<FJsonObj
 		CallTarget->ProcessEvent(Func, ParamBuf.GetData());
 	}
 
-	auto Result = MCPSuccess();
-	Result->SetStringField(TEXT("actorLabel"), ActorLabel);
-	// #806: report the instance that ran the call. The reported defect was a
-	// call that looked successful while answering from somewhere other than the
-	// placed actor, and there was nothing in the response to see that with.
-	Result->SetStringField(TEXT("resolvedActorLabel"), ResolvedActorLabel);
-	Result->SetStringField(TEXT("resolvedActorPath"), ResolvedActorPath);
-	Result->SetStringField(TEXT("world"), WorldLabel);
-	if (!ComponentName.IsEmpty()) Result->SetStringField(TEXT("component"), ComponentName);
-	Result->SetStringField(TEXT("functionName"), FunctionName);
-
-	TSharedPtr<FJsonObject> OutVals = MakeShared<FJsonObject>();
-	for (TFieldIterator<FProperty> It(Func); It && (It->PropertyFlags & CPF_Parm); ++It)
+	if (bCallspaceForcedLocal)
 	{
-		FProperty* P = *It;
-		if (P->PropertyFlags & (CPF_ReturnParm | CPF_OutParm))
-		{
-			// ParamBuf is raw bytes and invisible to GC, so an object out-param
-			// the call destroyed would be dereferenced by ExportTextItem_Direct.
-			// The scope guard above covers the target, not the results.
-			if (FObjectPropertyBase* OP = CastField<FObjectPropertyBase>(P))
-			{
-				UObject* Out = OP->GetObjectPropertyValue(OP->ContainerPtrToValuePtr<void>(ParamBuf.GetData()));
-				if (!Out) { OutVals->SetStringField(P->GetName(), TEXT("None")); continue; }
-				if (!IsValid(Out))
-				{
-					OutVals->SetStringField(P->GetName(), TEXT("(collected during the call)"));
-					continue;
-				}
-			}
-			FString S;
-			P->ExportTextItem_Direct(S, P->ContainerPtrToValuePtr<void>(ParamBuf.GetData()), nullptr, CallTarget, PPF_None);
-			OutVals->SetStringField(P->GetName(), S);
-		}
+		Result->SetStringField(TEXT("netCallspace"), NaturalCallspace);
+		Result->SetBoolField(TEXT("callspaceForcedLocal"), true);
+		Result->SetStringField(TEXT("warning"),
+			MCPFunctionCall::DescribeForcedLocalCallspace(FunctionName, NaturalCallspace));
 	}
+
+	// #885: containers come back as real JSON. Export text renders a
+	// TArray<FString> return as an empty string, which made every
+	// array-returning accessor unreadable through the bridge.
+	TSharedPtr<FJsonObject> OutVals = MakeShared<FJsonObject>();
+	MCPFunctionCall::WriteOutputs(OutVals, Func, ParamBuf.GetData(), CallTarget);
 	Result->SetObjectField(TEXT("returnValues"), OutVals);
 
-	for (TFieldIterator<FProperty> It(Func); It && (It->PropertyFlags & CPF_Parm); ++It)
-	{
-		It->DestroyValue_InContainer(ParamBuf.GetData());
-	}
+	MCPFunctionCall::DestroyFrame(Func, ParamBuf.GetData());
 	return MCPResult(Result);
 }
 
@@ -1245,18 +1552,23 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeStaticFunction(const TSharedPtr<FJ
 	FString FunctionName;
 	if (auto Err = RequireString(Params, TEXT("functionName"), FunctionName)) return Err;
 
+	// #971: route through the shared resolver, so world=editor|pie|game|auto
+	// and pieInstance select here exactly as they do for invoke_function. The
+	// old code special-cased the literal string "pie" and sent everything else
+	// to the editor world, which has no GameInstance: a server-authoritative
+	// entry point implemented as a static that looks a UGameInstanceSubsystem up
+	// off its world context could not be exercised in PIE at all.
 	const FString WorldScope = OptionalString(Params, TEXT("world"), TEXT("editor")).ToLower();
-	UWorld* World = nullptr;
-	if (WorldScope == TEXT("pie"))
+	UWorld* World = ResolveWorldFromParams(Params, *WorldScope);
+	if (!World)
 	{
-		World = ResolveWorldFromParams(Params, TEXT("pie"));
-		if (!World) return MCPError(TEXT("PIE not running - cannot invoke against PIE world"));
+		return MCPError(WorldScope == TEXT("pie") || WorldScope == TEXT("game")
+			? TEXT("PIE not running (or no such pieInstance) - cannot invoke against a PIE world. See editor(list_pie_instances).")
+			: TEXT("No editor world available"));
 	}
-	else
-	{
-		World = GEditor ? GEditor->GetEditorWorldContext().World() : nullptr;
-		if (!World) return MCPError(TEXT("No editor world available"));
-	}
+	// Describe the world that was actually resolved, not the requested scope:
+	// world="auto" resolves to PIE when a session is running.
+	const FString WorldLabel = World->IsPlayInEditor() ? TEXT("PIE") : TEXT("editor");
 
 	// Resolve the function-library class: a /Script/Module.Class path, or a bare
 	// class name (with or without the leading U).
@@ -1332,11 +1644,22 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeStaticFunction(const TSharedPtr<FJ
 			if (!OP) continue;
 			FString ActorArgLabel;
 			if (!(*ActorArgObj)->TryGetStringField(P->GetName(), ActorArgLabel) || ActorArgLabel.IsEmpty()) continue;
-			AActor* RefActor = FindActorByLabel(World, ActorArgLabel);
+			// #983: refuse a duplicated label rather than passing whichever
+			// copy the actor iterator reached first.
+			TArray<AActor*> ArgMatches;
+			MCPCollectActorsByToken(World, ActorArgLabel, EMCPActorMatch::LabelNameOrPath, ArgMatches);
+			if (ArgMatches.Num() > 1)
+			{
+				Cleanup();
+				return MCPAmbiguousActorError(
+					ActorArgLabel, TEXT("actorArgs"), TEXT("actorPath"),
+					MCPDescribeActorMatchTier(ActorArgLabel, ArgMatches[0]), ArgMatches);
+			}
+			AActor* RefActor = ArgMatches.Num() == 1 ? ArgMatches[0] : nullptr;
 			if (!RefActor)
 			{
 				Cleanup();
-				return MCPError(FString::Printf(TEXT("actorArgs[%s]: actor '%s' not found in %s world"), *P->GetName(), *ActorArgLabel, WorldScope == TEXT("pie") ? TEXT("PIE") : TEXT("editor")));
+				return MCPError(FString::Printf(TEXT("actorArgs[%s]: actor '%s' not found in %s world"), *P->GetName(), *ActorArgLabel, *WorldLabel));
 			}
 			if (!RefActor->IsA(OP->PropertyClass))
 			{
@@ -1362,8 +1685,22 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeStaticFunction(const TSharedPtr<FJ
 
 	// World-context injection: static library functions commonly take a UObject*
 	// WorldContextObject. Fill any unset object param matching worldContextParam
-	// (or named WorldContextObject) with the resolved world.
+	// (or the name the function's own WorldContext metadata gives, or a name
+	// containing WorldContext) with the world resolved above.
+	//
+	// #971: worldContextParam only ever chose WHICH parameter to fill. What goes
+	// into it is the selected world, so the parameter that decides PIE versus
+	// editor is `world`, and the metadata lookup means a library that names its
+	// context parameter something else is still recognised.
 	const FString WcParam = OptionalString(Params, TEXT("worldContextParam"), TEXT(""));
+	FString MetaWcParam;
+#if WITH_METADATA
+	if (const FString* Declared = Func->FindMetaData(TEXT("WorldContext")))
+	{
+		MetaWcParam = *Declared;
+	}
+#endif
+	FString FilledWcParam;
 	for (TFieldIterator<FProperty> It(Func); It && (It->PropertyFlags & CPF_Parm); ++It)
 	{
 		FProperty* P = *It;
@@ -1371,13 +1708,17 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeStaticFunction(const TSharedPtr<FJ
 		FObjectProperty* OP = CastField<FObjectProperty>(P);
 		if (!OP) continue;
 		const FString PName = P->GetName();
-		const bool bIsWc = (!WcParam.IsEmpty() && PName == WcParam) || PName.Contains(TEXT("WorldContext"));
+		const bool bIsWc =
+			(!WcParam.IsEmpty() && PName == WcParam) ||
+			(!MetaWcParam.IsEmpty() && PName == MetaWcParam) ||
+			PName.Contains(TEXT("WorldContext"));
 		if (!bIsWc) continue;
 		void* Addr = P->ContainerPtrToValuePtr<void>(ParamBuf.GetData());
 		if (OP->GetObjectPropertyValue(Addr) != nullptr) continue;
 		if (World->IsA(OP->PropertyClass) || OP->PropertyClass == UObject::StaticClass())
 		{
 			OP->SetObjectPropertyValue(Addr, World);
+			FilledWcParam = PName;
 		}
 	}
 
@@ -1387,32 +1728,45 @@ TSharedPtr<FJsonValue> FEditorHandlers::InvokeStaticFunction(const TSharedPtr<FJ
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("className"), LibClass->GetName());
 	Result->SetStringField(TEXT("functionName"), FunctionName);
-
-	TSharedPtr<FJsonObject> OutVals = MakeShared<FJsonObject>();
-	for (TFieldIterator<FProperty> It(Func); It && (It->PropertyFlags & CPF_Parm); ++It)
+	// #971: say which world the call actually ran against and which parameter
+	// carried it. "subsystem unavailable" from a static that looks a
+	// GameInstance subsystem up off its context is unreadable without this.
+	Result->SetStringField(TEXT("world"), WorldLabel);
+	Result->SetStringField(TEXT("worldPath"), World->GetPathName());
+	Result->SetStringField(TEXT("netMode"), DescribePIENetMode(World));
+	if (!FilledWcParam.IsEmpty())
 	{
-		FProperty* P = *It;
-		if (P->PropertyFlags & (CPF_ReturnParm | CPF_OutParm))
-		{
-			// ParamBuf is raw bytes and invisible to GC, so an object out-param
-			// the call destroyed would be dereferenced by ExportTextItem_Direct.
-			// The scope guard above covers the CDO, not the results.
-			if (FObjectPropertyBase* OP = CastField<FObjectPropertyBase>(P))
-			{
-				UObject* Out = OP->GetObjectPropertyValue(OP->ContainerPtrToValuePtr<void>(ParamBuf.GetData()));
-				if (!Out) { OutVals->SetStringField(P->GetName(), TEXT("None")); continue; }
-				if (!IsValid(Out))
-				{
-					OutVals->SetStringField(P->GetName(), TEXT("(collected during the call)"));
-					continue;
-				}
-			}
-			FString S;
-			P->ExportTextItem_Direct(S, P->ContainerPtrToValuePtr<void>(ParamBuf.GetData()), nullptr, CDO, PPF_None);
-			OutVals->SetStringField(P->GetName(), S);
-		}
+		Result->SetStringField(TEXT("worldContextParam"), FilledWcParam);
 	}
+
+	// #885: containers come back as real JSON, scalars and structs keep their
+	// export-text spelling. See MCPFunctionCall::OutputToJson.
+	TSharedPtr<FJsonObject> OutVals = MakeShared<FJsonObject>();
+	MCPFunctionCall::WriteOutputs(OutVals, Func, ParamBuf.GetData(), CDO);
 	Result->SetObjectField(TEXT("returnValues"), OutVals);
+
+	// Whether the call CAN have written anything is answerable, so answer it.
+	// Most of what these libraries expose (Kismet math, GeometryScript queries)
+	// is declared BlueprintPure or const, which means it reports a value and
+	// writes nothing.
+	const bool bPureFunction = Func->HasAnyFunctionFlags(FUNC_BlueprintPure | FUNC_Const);
+	Result->SetBoolField(TEXT("pure"), bPureFunction);
+	Result->SetBoolField(TEXT("changed"), !bPureFunction);
+	if (bPureFunction)
+	{
+		Result->SetStringField(TEXT("idempotencyNote"),
+			TEXT("The function is declared BlueprintPure or const, so it is a query: it reports a value and writes nothing. Calling it again returns the same answer for the same state."));
+	}
+	// Past purity the effect is opaque: nothing here compares before to after.
+	Result->SetBoolField(TEXT("changeDetected"), false);
+	// No rollback. What an arbitrary static library function did is opaque from
+	// here: nothing was captured before the call and no inverse function is
+	// known, and the non-pure ones (GeometryScript edits, file writes, spawns)
+	// have no opposite call at all.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"), bPureFunction
+		? TEXT("A pure or const function writes nothing, so there is nothing to undo.")
+		: TEXT("A static library call has no known inverse. Wrap the sequence in editor(begin_editor_transaction) and roll back with editor(cancel_editor_transaction) when the effects are transactional."));
 
 	Cleanup();
 	return MCPResult(Result);
@@ -1427,6 +1781,16 @@ TSharedPtr<FJsonValue> FEditorHandlers::ConfigurePie(const TSharedPtr<FJsonObjec
 {
 	ULevelEditorPlaySettings* Settings = GetPlaySettingsForRW();
 	if (!Settings) return MCPError(TEXT("LevelEditorPlaySettings CDO not available"));
+
+	// Read every field this handler can write before writing any of them. These
+	// are the only values an inverse call could restore, and SaveConfig below
+	// persists the new ones over them.
+	const int32 PrevNumClients = GetIntPropOn(Settings, TEXT("PlayNumberOfClients"), 1);
+	const FString PrevNetMode = NetModeNameFromValue(GetEnumPropOn(Settings, TEXT("PlayNetMode")));
+	const bool bPrevRunUnderOneProcess = GetBoolPropOn(Settings, TEXT("RunUnderOneProcess"), true);
+	const bool bPrevLaunchSeparateServer = GetBoolPropOn(Settings, TEXT("bLaunchSeparateServer"), false);
+	const int32 PrevNewWindowWidth = GetIntPropOn(Settings, TEXT("NewWindowWidth"), 0);
+	const int32 PrevNewWindowHeight = GetIntPropOn(Settings, TEXT("NewWindowHeight"), 0);
 
 	bool bAny = false;
 	int32 NumClients = 0;
@@ -1499,6 +1863,47 @@ TSharedPtr<FJsonValue> FEditorHandlers::ConfigurePie(const TSharedPtr<FJsonObjec
 	Result->SetBoolField(TEXT("launchSeparateServer"), GetBoolPropOn(Settings, TEXT("bLaunchSeparateServer"), false));
 	Result->SetNumberField(TEXT("newWindowWidth"), GetIntPropOn(Settings, TEXT("NewWindowWidth"), 0));
 	Result->SetNumberField(TEXT("newWindowHeight"), GetIntPropOn(Settings, TEXT("NewWindowHeight"), 0));
+
+	Result->SetNumberField(TEXT("previousNumClients"), PrevNumClients);
+	Result->SetStringField(TEXT("previousNetMode"), PrevNetMode);
+	Result->SetBoolField(TEXT("previousRunUnderOneProcess"), bPrevRunUnderOneProcess);
+	Result->SetBoolField(TEXT("previousLaunchSeparateServer"), bPrevLaunchSeparateServer);
+	Result->SetNumberField(TEXT("previousNewWindowWidth"), PrevNewWindowWidth);
+	Result->SetNumberField(TEXT("previousNewWindowHeight"), PrevNewWindowHeight);
+	const bool bChanged =
+		GetIntPropOn(Settings, TEXT("PlayNumberOfClients"), 1) != PrevNumClients
+		|| PrevNetMode != NetModeNameFromValue(GetEnumPropOn(Settings, TEXT("PlayNetMode")))
+		|| GetBoolPropOn(Settings, TEXT("RunUnderOneProcess"), true) != bPrevRunUnderOneProcess
+		|| GetBoolPropOn(Settings, TEXT("bLaunchSeparateServer"), false) != bPrevLaunchSeparateServer
+		|| GetIntPropOn(Settings, TEXT("NewWindowWidth"), 0) != PrevNewWindowWidth
+		|| GetIntPropOn(Settings, TEXT("NewWindowHeight"), 0) != PrevNewWindowHeight;
+	Result->SetBoolField(TEXT("changed"), bChanged);
+
+	// Self-inverse: the same handler with every field's previous value. The
+	// net-mode spelling NetModeNameFromValue produces is one this handler
+	// parses back (Standalone / ListenServer / Client all lowercase-match).
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetNumberField(TEXT("numClients"), PrevNumClients);
+	Payload->SetStringField(TEXT("netMode"), PrevNetMode);
+	Payload->SetBoolField(TEXT("runUnderOneProcess"), bPrevRunUnderOneProcess);
+	Payload->SetBoolField(TEXT("launchSeparateServer"), bPrevLaunchSeparateServer);
+	Payload->SetNumberField(TEXT("newWindowWidth"), PrevNewWindowWidth);
+	Payload->SetNumberField(TEXT("newWindowHeight"), PrevNewWindowHeight);
+	MCPSetRollback(Result, TEXT("configure_pie"), Payload);
+	// This handler ignores a non-positive numClients / newWindowWidth /
+	// newWindowHeight, so a previous value of zero cannot be written back and
+	// that field keeps whatever this call left in it.
+	TArray<FString> Unrestorable;
+	if (PrevNumClients <= 0) Unrestorable.Add(TEXT("numClients"));
+	if (PrevNewWindowWidth <= 0) Unrestorable.Add(TEXT("newWindowWidth"));
+	if (PrevNewWindowHeight <= 0) Unrestorable.Add(TEXT("newWindowHeight"));
+	Result->SetBoolField(TEXT("rollbackLossy"), Unrestorable.Num() > 0);
+	if (Unrestorable.Num() > 0)
+	{
+		Result->SetStringField(TEXT("rollbackNote"), FString::Printf(
+			TEXT("Restores every field except %s, which was zero or negative before this call. This handler only applies those three when they are greater than zero, so replaying the previous value is a no-op for them and they keep the value written here."),
+			*FString::Join(Unrestorable, TEXT(", "))));
+	}
 	return MCPResult(Result);
 }
 
@@ -1512,7 +1917,8 @@ TSharedPtr<FJsonValue> FEditorHandlers::PieSetPlayerView(const TSharedPtr<FJsonO
 	APlayerController* PC = World->GetFirstPlayerController();
 	if (!PC) return MCPError(TEXT("No PIE player controller"));
 
-	FRotator Rot = PC->GetControlRotation();
+	const FRotator PreviousRot = PC->GetControlRotation();
+	FRotator Rot = PreviousRot;
 	double Tmp;
 	if (Params->TryGetNumberField(TEXT("pitch"), Tmp)) Rot.Pitch = Tmp;
 	if (Params->TryGetNumberField(TEXT("yaw"), Tmp))   Rot.Yaw = Tmp;
@@ -1521,6 +1927,20 @@ TSharedPtr<FJsonValue> FEditorHandlers::PieSetPlayerView(const TSharedPtr<FJsonO
 
 	auto Result = MCPSuccess();
 	Result->SetObjectField(TEXT("controlRotation"), MCPRotatorToJsonObject(Rot));
+	Result->SetObjectField(TEXT("previousControlRotation"), MCPRotatorToJsonObject(PreviousRot));
+	Result->SetBoolField(TEXT("changed"), !Rot.Equals(PreviousRot));
+
+	// Self-inverse: the same handler with the control rotation this call
+	// replaced. All three axes are sent, so a partial write still restores the
+	// whole rotation.
+	TSharedPtr<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetNumberField(TEXT("pitch"), PreviousRot.Pitch);
+	Payload->SetNumberField(TEXT("yaw"), PreviousRot.Yaw);
+	Payload->SetNumberField(TEXT("roll"), PreviousRot.Roll);
+	MCPSetRollback(Result, TEXT("pie_set_player_view"), Payload);
+	Result->SetBoolField(TEXT("rollbackLossy"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("The rollback needs the same PIE session and player controller to still exist. Once play ends it reports that PIE is not running rather than restoring anything, and a live controller keeps turning under player or AI input after the write either way."));
 	return MCPResult(Result);
 }
 
@@ -1534,6 +1954,7 @@ TSharedPtr<FJsonValue> FEditorHandlers::StageGameInput(const TSharedPtr<FJsonObj
 	APlayerController* PC = World->GetFirstPlayerController();
 	if (!PC) return MCPError(TEXT("No PIE player controller"));
 
+	const bool bPreviousShowMouseCursor = PC->bShowMouseCursor != 0;
 	const FString Mode = OptionalString(Params, TEXT("inputMode"), TEXT("gameOnly")).ToLower();
 	if (Mode == TEXT("uionly"))
 	{
@@ -1556,6 +1977,20 @@ TSharedPtr<FJsonValue> FEditorHandlers::StageGameInput(const TSharedPtr<FJsonObj
 	auto Result = MCPSuccess();
 	Result->SetStringField(TEXT("inputMode"), Mode);
 	Result->SetBoolField(TEXT("showMouseCursor"), bShowCursor);
+	Result->SetBoolField(TEXT("previousShowMouseCursor"), bPreviousShowMouseCursor);
+	// Half the write is comparable and half is not: the cursor flag is readable,
+	// the active input mode is not, so the mode is always re-applied. Reporting
+	// changed unconditionally rather than from the cursor flag alone avoids
+	// claiming a no-op for a call that did reset input routing.
+	Result->SetBoolField(TEXT("changed"), true);
+	// No rollback. APlayerController exposes no getter for the input mode it is
+	// currently in - SetInputMode writes into the viewport client and keeps no
+	// readable record - so the mode this call replaced was never captured.
+	// Restoring only showMouseCursor would put the cursor back while leaving
+	// input routed the way this call left it, which is worse than not trying.
+	Result->SetBoolField(TEXT("rollbackPossible"), false);
+	Result->SetStringField(TEXT("rollbackNote"),
+		TEXT("The previous input mode is unreadable: Unreal keeps no accessor for the mode a player controller is in, so there is nothing to restore it to. previousShowMouseCursor is reported for the cursor half; call stage_game_input again with the mode the game expects to put input routing back deliberately."));
 	return MCPResult(Result);
 }
 
